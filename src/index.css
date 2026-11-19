@@ -1,0 +1,45 @@
+@import "tailwindcss";
+
+@layer base {
+  html,
+  body,
+  #root {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    background-color: #0d0a08;
+    font-family: 'Oswald', system-ui, -apple-system, sans-serif;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+    touch-action: none;
+  }
+}
+
+.font-display {
+  font-family: 'Bebas Neue', 'Oswald', Impact, sans-serif;
+}
+
+.font-hud {
+  font-family: 'Oswald', 'Rajdhani', sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+
+.font-tech {
+  font-family: 'Rajdhani', 'Oswald', sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+
+.hud-stroke {
+  paint-order: stroke fill;
+  -webkit-text-stroke: 3px rgba(8, 7, 6, 0.92);
+  text-shadow: 0 2px 6px rgba(0, 0, 0, 0.85);
+}
+
+.hud-stroke-sm {
+  paint-order: stroke fill;
+  -webkit-text-stroke: 1.5px rgba(8, 7, 6, 0.9);
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.85);
+}

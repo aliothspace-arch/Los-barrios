@@ -1,0 +1,6 @@
+{
+  "name": "San Andreas: Los Santos 3D",
+  "description": "Hyperrealistic open-world Three.js tribute to Los Santos featuring advanced 4-wheel vehicle physics, dynamic global illumination, procedural weather with wet PBR shaders, live traffic & police chases, and landscape mobile touch controls.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

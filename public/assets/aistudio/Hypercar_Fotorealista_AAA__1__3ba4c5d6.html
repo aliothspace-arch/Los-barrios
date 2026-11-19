@@ -1,0 +1,3809 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Hypercar Fotorealista AAA</title>
+    <style>
+        /* Lienzo puro a pantalla completa sobre vacío estudio obsidiana (#050507) */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #050507;
+            touch-action: none;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            outline: none;
+        }
+        /* Capa de diagnóstico invisible salvo fallo fatal de WebGL/JS */
+        #webgl-error {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(5, 5, 7, 0.94);
+            color: #e2e8f0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            padding: 24px;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            z-index: 9999;
+        }
+        #webgl-error .box {
+            max-width: 420px;
+            background: #11131a;
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 14px;
+            padding: 20px;
+            font-size: 13px;
+            line-height: 1.5;
+            color: #cbd5e1;
+        }
+    </style>
+
+    <!-- Import Map fijado exactamente a Three.js 0.168.0 -->
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.168.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.168.0/examples/jsm/"
+        }
+    }
+    </script>
+</head>
+<body>
+<div id="webgl-error"><div class="box" id="webgl-error-msg"></div></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+/**
+ * ============================================================================
+ * HYPERCAR MID-ENGINE V12 — MOTOR GEOMÉTRICO CLASE-A & PBR AAA (MOBILE-SAFE)
+ * ============================================================================
+ * Arquitectura blindada para Android/iOS WebView y escritorio:
+ * - Cero primitivas simples (superficies paramétricas, lofts, tubos y lathes).
+ * - Pintura tricapa Rosso Fuoco nativa con MeshPhysicalMaterial (sheen + iridescence).
+ * - EffectComposer estándar con fallback automático a renderizado directo.
+ * - Coreografía continua + interacción directa por toque/clic en puertas, capó y ruedas.
+ */
+
+function showFatalError(msg) {
+    const el = document.getElementById('webgl-error');
+    const txt = document.getElementById('webgl-error-msg');
+    if (el && txt) {
+        txt.textContent = String(msg || 'Error de inicialización WebGL');
+        el.style.display = 'flex';
+    }
+}
+
+// ============================================================================
+// 1. UTILIDADES MATEMÁTICAS Y MOTOR DE SUPERFICIES PARAMÉTRICAS CLASE-A
+// ============================================================================
+
+const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const safeNum = (v, fallback = 0) => (Number.isFinite(v) ? v : fallback);
+const smoothstep = (e0, e1, x) => {
+    const d = e1 - e0;
+    if (Math.abs(d) < 1e-8) return x < e0 ? 0 : 1;
+    const t = clamp((x - e0) / d, 0, 1);
+    return t * t * (3 - 2 * t);
+};
+const smootherstep = (e0, e1, x) => {
+    const d = e1 - e0;
+    if (Math.abs(d) < 1e-8) return x < e0 ? 0 : 1;
+    const t = clamp((x - e0) / d, 0, 1);
+    return t * t * t * (t * (t * 6 - 15) + 10);
+};
+const gauss = (x, mu, sigma) => {
+    const s = Math.max(Math.abs(sigma), 1e-5);
+    return Math.exp(-0.5 * Math.pow((x - mu) / s, 2));
+};
+
+// Dimensiones maestras del hiperdeportivo (~4.58 m x 2.04 m x 1.13 m, batalla 2.72 m)
+const SPEC = {
+    fZ: 1.38,
+    fR: 0.345,
+    fW: 0.275,
+    fOuterX: 0.965,
+    fTrack: 0.965 - 0.275 * 0.5,
+    fArchR: 0.382,
+
+    rZ: -1.34,
+    rR: 0.365,
+    rW: 0.345,
+    rOuterX: 1.005,
+    rTrack: 1.005 - 0.345 * 0.5,
+    rArchR: 0.405
+};
+
+/**
+ * Construye una BufferGeometry paramétrica Clase-A con salvaguarda NaN y costuras suaves.
+ */
+function buildParametricSurface(uSegs, vSegs, evalFn, options = {}) {
+    const {
+        uvScaleU = 1.0,
+        uvScaleV = 1.0,
+        worldUV = false,
+        flipWinding = false,
+        closedU = false,
+        closedV = false,
+        forceSymmetrySeamX0 = false
+    } = options;
+
+    const uCount = uSegs + 1;
+    const vCount = vSegs + 1;
+    const positions = new Float32Array(uCount * vCount * 3);
+    const uvs = new Float32Array(uCount * vCount * 2);
+
+    let pIdx = 0;
+    let uvIdx = 0;
+    for (let iu = 0; iu <= uSegs; iu++) {
+        const u = iu / uSegs;
+        for (let iv = 0; iv <= vSegs; iv++) {
+            const v = iv / vSegs;
+            const p = evalFn(u, v);
+            const px = safeNum(p[0], 0);
+            const py = safeNum(p[1], 0);
+            const pz = safeNum(p[2], 0);
+            positions[pIdx++] = px;
+            positions[pIdx++] = py;
+            positions[pIdx++] = pz;
+
+            if (worldUV) {
+                uvs[uvIdx++] = (pz * 0.90 + py * 0.42) * uvScaleU;
+                uvs[uvIdx++] = (px * 0.90 + py * 0.46) * uvScaleV;
+            } else {
+                uvs[uvIdx++] = u * uvScaleU;
+                uvs[uvIdx++] = v * uvScaleV;
+            }
+        }
+    }
+
+    const indices = [];
+    for (let iu = 0; iu < uSegs; iu++) {
+        for (let iv = 0; iv < vSegs; iv++) {
+            const a = iu * vCount + iv;
+            const b = (iu + 1) * vCount + iv;
+            const c = (iu + 1) * vCount + (iv + 1);
+            const d = iu * vCount + (iv + 1);
+            if (flipWinding) {
+                indices.push(a, c, b, a, d, c);
+            } else {
+                indices.push(a, b, c, a, c, d);
+            }
+        }
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+    geo.setIndex(indices);
+    geo.computeVertexNormals();
+
+    const normals = geo.attributes.normal;
+    const pos = geo.attributes.position;
+
+    if (closedV) {
+        for (let iu = 0; iu <= uSegs; iu++) {
+            const i0 = iu * vCount;
+            const i1 = iu * vCount + vSegs;
+            const nx = normals.getX(i0) + normals.getX(i1);
+            const ny = normals.getY(i0) + normals.getY(i1);
+            const nz = normals.getZ(i0) + normals.getZ(i1);
+            const l = Math.hypot(nx, ny, nz) || 1;
+            normals.setXYZ(i0, nx / l, ny / l, nz / l);
+            normals.setXYZ(i1, nx / l, ny / l, nz / l);
+        }
+    }
+    if (closedU) {
+        for (let iv = 0; iv <= vSegs; iv++) {
+            const i0 = iv;
+            const i1 = uSegs * vCount + iv;
+            const nx = normals.getX(i0) + normals.getX(i1);
+            const ny = normals.getY(i0) + normals.getY(i1);
+            const nz = normals.getZ(i0) + normals.getZ(i1);
+            const l = Math.hypot(nx, ny, nz) || 1;
+            normals.setXYZ(i0, nx / l, ny / l, nz / l);
+            normals.setXYZ(i1, nx / l, ny / l, nz / l);
+        }
+    }
+    if (forceSymmetrySeamX0) {
+        for (let i = 0; i < pos.count; i++) {
+            if (Math.abs(pos.getX(i)) < 1e-4) {
+                const ny = normals.getY(i);
+                const nz = normals.getZ(i);
+                const l = Math.hypot(ny, nz) || 1;
+                normals.setXYZ(i, 0, ny / l, nz / l);
+            }
+        }
+    }
+    normals.needsUpdate = true;
+    return geo;
+}
+
+/**
+ * Filtra puntos duplicados consecutivos para blindar CatmullRomCurve3 contra NaN.
+ */
+function sanitizeCurvePoints(points, closed = false) {
+    const out = [];
+    for (let i = 0; i < points.length; i++) {
+        const p = points[i];
+        const v = (p instanceof THREE.Vector3)
+            ? p.clone()
+            : new THREE.Vector3(safeNum(p[0]), safeNum(p[1]), safeNum(p[2]));
+        if (out.length === 0 || out[out.length - 1].distanceToSquared(v) > 1e-8) {
+            out.push(v);
+        }
+    }
+    if (closed && out.length > 2 && out[0].distanceToSquared(out[out.length - 1]) < 1e-8) {
+        out.pop();
+    }
+    if (out.length < 2) {
+        const base = out[0] || new THREE.Vector3();
+        out.push(base.clone().add(new THREE.Vector3(0, 0, 0.001)));
+    }
+    return out;
+}
+
+/**
+ * Loft suave multi-estación interpolado por Catmull-Rom centrípeto.
+ */
+function buildSplineLoft(stations, uSegs, vSegs, options = {}) {
+    const {
+        closedV = false,
+        worldUV = true,
+        uvScaleU = 1.0,
+        uvScaleV = 1.0,
+        flipWinding = false
+    } = options;
+
+    const sampled = stations.map(pts => {
+        const vecs = sanitizeCurvePoints(pts, closedV);
+        const curve = new THREE.CatmullRomCurve3(vecs, closedV, 'centripetal', 0.5);
+        const row = [];
+        for (let iv = 0; iv <= vSegs; iv++) {
+            row.push(curve.getPoint(iv / vSegs));
+        }
+        return row;
+    });
+
+    const longCurves = [];
+    for (let iv = 0; iv <= vSegs; iv++) {
+        const col = sanitizeCurvePoints(sampled.map(r => r[iv]), false);
+        longCurves.push(new THREE.CatmullRomCurve3(col, false, 'centripetal', 0.5));
+    }
+
+    const tmp = new THREE.Vector3();
+    return buildParametricSurface(uSegs, vSegs, (u, v) => {
+        const iv = clamp(Math.round(v * vSegs), 0, vSegs);
+        longCurves[iv].getPoint(clamp(u, 0, 1), tmp);
+        return [tmp.x, tmp.y, tmp.z];
+    }, { closedV, worldUV, uvScaleU, uvScaleV, flipWinding });
+}
+
+/**
+ * Tubo esculpido de sección elíptica variable con tapas redondeadas a lo largo de un spline 3D.
+ */
+function buildVariableTube(points, radiusFn, tubularSegs = 32, radialSegs = 12, options = {}) {
+    const {
+        closed = false,
+        capStart = true,
+        capEnd = true,
+        aspectY = 1.0,
+        worldUV = false,
+        uvScaleU = 2.0,
+        uvScaleV = 1.0
+    } = options;
+
+    const vecs = sanitizeCurvePoints(points, closed);
+    const curve = new THREE.CatmullRomCurve3(vecs, closed, 'centripetal', 0.5);
+    const frames = curve.computeFrenetFrames(tubularSegs, closed);
+
+    const extraStart = (!closed && capStart) ? 2 : 0;
+    const extraEnd = (!closed && capEnd) ? 2 : 0;
+    const totalU = tubularSegs + extraStart + extraEnd;
+
+    const pt = new THREE.Vector3();
+    const normal = new THREE.Vector3();
+    const binormal = new THREE.Vector3();
+    const tangent = new THREE.Vector3();
+
+    return buildParametricSurface(totalU, radialSegs, (uRaw, v) => {
+        const idxF = uRaw * totalU;
+        let t = 0;
+        let capScale = 1.0;
+        let capPush = 0.0;
+
+        if (idxF < extraStart) {
+            t = 0;
+            const ang = (idxF / extraStart) * Math.PI * 0.5;
+            capScale = Math.sin(ang);
+            capPush = -Math.cos(ang);
+        } else if (idxF > extraStart + tubularSegs) {
+            t = 1;
+            const ang = ((idxF - extraStart - tubularSegs) / extraEnd) * Math.PI * 0.5;
+            capScale = Math.cos(ang);
+            capPush = Math.sin(ang);
+        } else {
+            t = (idxF - extraStart) / tubularSegs;
+        }
+
+        const fIdx = clamp(Math.round(t * tubularSegs), 0, tubularSegs);
+        curve.getPointAt(clamp(t, 0, 1), pt);
+        normal.copy(frames.normals[fIdx]);
+        binormal.copy(frames.binormals[fIdx]);
+        tangent.copy(frames.tangents[fIdx]);
+
+        const radRes = typeof radiusFn === 'function' ? radiusFn(t) : radiusFn;
+        const rx = Math.max(1e-5, (Array.isArray(radRes) ? radRes[0] : radRes) * capScale);
+        const ry = Math.max(1e-5, (Array.isArray(radRes) ? radRes[1] : radRes * aspectY) * capScale);
+        const pushR = (Array.isArray(radRes) ? Math.min(radRes[0], radRes[1]) : radRes) * 0.6;
+
+        const theta = v * Math.PI * 2;
+        const cosT = Math.cos(theta);
+        const sinT = Math.sin(theta);
+
+        return [
+            pt.x + (normal.x * cosT * rx + binormal.x * sinT * ry) + tangent.x * capPush * pushR,
+            pt.y + (normal.y * cosT * rx + binormal.y * sinT * ry) + tangent.y * capPush * pushR,
+            pt.z + (normal.z * cosT * rx + binormal.z * sinT * ry) + tangent.z * capPush * pushR
+        ];
+    }, { closedV: true, closedU: closed, worldUV, uvScaleU, uvScaleV });
+}
+
+/**
+ * Perfil aerodinámico NACA combado con espesor real.
+ */
+function buildSculptedAirfoil(uSegs, vSegs, specFn) {
+    return buildParametricSurface(uSegs, vSegs, (u, v) => {
+        const s = specFn(u);
+        const theta = v * Math.PI * 2;
+        const xc = 0.5 * (1 + Math.cos(theta));
+        const sign = Math.sin(theta) >= 0 ? 1 : -1;
+
+        const yt = 5 * s.thickness * (
+            0.2969 * Math.sqrt(Math.max(xc, 1e-6)) -
+            0.1260 * xc -
+            0.3516 * xc * xc +
+            0.2843 * xc * xc * xc -
+            0.1015 * xc * xc * xc * xc
+        );
+        const yc = (s.camber || 0) * 4 * xc * (1 - xc);
+
+        const localZ = (0.35 - xc) * s.chord;
+        const localY = (yc + sign * yt) * s.chord;
+
+        const cosP = Math.cos(s.pitch || 0);
+        const sinP = Math.sin(s.pitch || 0);
+        const rotZ = localZ * cosP - localY * sinP;
+        const rotY = localZ * sinP + localY * cosP;
+
+        const cosR = Math.cos(s.roll || 0);
+        const sinR = Math.sin(s.roll || 0);
+
+        return [
+            s.x - rotY * sinR,
+            s.y + rotY * cosR,
+            s.z + rotZ
+        ];
+    }, { closedV: true, worldUV: true, uvScaleU: 1.5, uvScaleV: 1.5 });
+}
+
+/**
+ * Espejado exacto sobre X = 0 invirtiendo winding y espejando normales.
+ */
+function mirrorGeometryX(sourceGeo) {
+    const geo = sourceGeo.clone();
+    const pos = geo.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+        pos.setX(i, -pos.getX(i));
+    }
+    pos.needsUpdate = true;
+
+    const idx = geo.index;
+    if (idx) {
+        for (let i = 0; i < idx.count; i += 3) {
+            const b = idx.getX(i + 1);
+            const c = idx.getX(i + 2);
+            idx.setX(i + 1, c);
+            idx.setX(i + 2, b);
+        }
+        idx.needsUpdate = true;
+    } else {
+        for (let i = 0; i < pos.count; i += 3) {
+            const x1 = pos.getX(i + 1), y1 = pos.getY(i + 1), z1 = pos.getZ(i + 1);
+            pos.setXYZ(i + 1, pos.getX(i + 2), pos.getY(i + 2), pos.getZ(i + 2));
+            pos.setXYZ(i + 2, x1, y1, z1);
+        }
+        pos.needsUpdate = true;
+    }
+
+    const norm = geo.attributes.normal;
+    if (norm) {
+        for (let i = 0; i < norm.count; i++) {
+            norm.setX(i, -norm.getX(i));
+        }
+        norm.needsUpdate = true;
+    } else {
+        geo.computeVertexNormals();
+    }
+    return geo;
+}
+
+function addMirroredMesh(parent, geo, material, castShadow = true, receiveShadow = true) {
+    const mR = new THREE.Mesh(geo, material);
+    mR.castShadow = castShadow;
+    mR.receiveShadow = receiveShadow;
+    parent.add(mR);
+
+    const mL = new THREE.Mesh(mirrorGeometryX(geo), material);
+    mL.castShadow = castShadow;
+    mL.receiveShadow = receiveShadow;
+    parent.add(mL);
+
+    return [mR, mL];
+}
+
+// ============================================================================
+// 2. TEXTURAS PBR PROCEDURALES (<= 512x512 MOBILE-SAFE) Y MATERIALES NATIVOS
+// ============================================================================
+
+function createProceduralTextures(maxAnisotropy) {
+    const tex = {};
+    const aniso = Math.min(maxAnisotropy || 4, 8);
+
+    // A. Micro-Flakes Metálicos (Normal + Roughness) para Rosso Fuoco
+    {
+        const size = 256;
+        const nC = document.createElement('canvas');
+        const rC = document.createElement('canvas');
+        nC.width = nC.height = rC.width = rC.height = size;
+        const nCtx = nC.getContext('2d');
+        const rCtx = rC.getContext('2d');
+        const nImg = nCtx.createImageData(size, size);
+        const rImg = rCtx.createImageData(size, size);
+
+        let seed = 48271;
+        const rand = () => { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; };
+
+        for (let i = 0; i < size * size; i++) {
+            const p = i * 4;
+            const isFlake = rand() > 0.62;
+            const spark = isFlake ? (rand() * 2 - 1) * 0.22 : (rand() * 2 - 1) * 0.05;
+            const ang = rand() * Math.PI * 2;
+            const nx = Math.cos(ang) * spark;
+            const ny = Math.sin(ang) * spark;
+            const nz = Math.sqrt(Math.max(0.2, 1 - nx * nx - ny * ny));
+            nImg.data[p] = Math.round((nx * 0.5 + 0.5) * 255);
+            nImg.data[p + 1] = Math.round((ny * 0.5 + 0.5) * 255);
+            nImg.data[p + 2] = Math.round((nz * 0.5 + 0.5) * 255);
+            nImg.data[p + 3] = 255;
+
+            const rv = isFlake ? Math.round(28 + rand() * 22) : Math.round(42 + rand() * 16);
+            rImg.data[p] = rImg.data[p + 1] = rImg.data[p + 2] = rv;
+            rImg.data[p + 3] = 255;
+        }
+        nCtx.putImageData(nImg, 0, 0);
+        rCtx.putImageData(rImg, 0, 0);
+
+        tex.flakeNormal = new THREE.CanvasTexture(nC);
+        tex.flakeNormal.wrapS = tex.flakeNormal.wrapT = THREE.RepeatWrapping;
+        tex.flakeNormal.repeat.set(18, 18);
+        tex.flakeNormal.anisotropy = aniso;
+
+        tex.flakeRough = new THREE.CanvasTexture(rC);
+        tex.flakeRough.wrapS = tex.flakeRough.wrapT = THREE.RepeatWrapping;
+        tex.flakeRough.repeat.set(18, 18);
+        tex.flakeRough.anisotropy = aniso;
+    }
+
+    // B. Fibra de Carbono 2x2 Twill de Autoclave (512x512)
+    {
+        const size = 512;
+        const aC = document.createElement('canvas');
+        const nC = document.createElement('canvas');
+        const rC = document.createElement('canvas');
+        aC.width = aC.height = nC.width = nC.height = rC.width = rC.height = size;
+        const aCtx = aC.getContext('2d');
+        const nCtx = nC.getContext('2d');
+        const rCtx = rC.getContext('2d');
+        const aImg = aCtx.createImageData(size, size);
+        const nImg = nCtx.createImageData(size, size);
+        const rImg = rCtx.createImageData(size, size);
+
+        const cells = 32;
+        const cellSize = size / cells;
+
+        for (let y = 0; y < size; y++) {
+            for (let x = 0; x < size; x++) {
+                const cx = Math.floor(x / cellSize);
+                const cy = Math.floor(y / cellSize);
+                const lx = (x % cellSize) / cellSize;
+                const ly = (y % cellSize) / cellSize;
+
+                const isWarp = ((cx + cy) % 4) < 2;
+                const u = isWarp ? lx : ly;
+                const v = isWarp ? ly : lx;
+
+                const arch = Math.sin(u * Math.PI);
+                const along = 0.72 + 0.28 * Math.sin(v * Math.PI);
+                const strand = 0.92 + 0.08 * Math.sin(u * Math.PI * 6);
+
+                const base = isWarp ? 28 : 13;
+                const val = clamp(Math.round((base + arch * along * (isWarp ? 34 : 18)) * strand), 9, 72);
+
+                const p = (y * size + x) * 4;
+                aImg.data[p] = val;
+                aImg.data[p + 1] = Math.round(val * 1.02);
+                aImg.data[p + 2] = Math.round(val * 1.06);
+                aImg.data[p + 3] = 255;
+
+                const sU = Math.cos(u * Math.PI) * 0.34;
+                const sV = Math.cos(v * Math.PI) * 0.14;
+                const nx = isWarp ? sU : sV;
+                const ny = isWarp ? sV : sU;
+                const nz = Math.sqrt(Math.max(0.2, 1 - nx * nx - ny * ny));
+                nImg.data[p] = Math.round((nx * 0.5 + 0.5) * 255);
+                nImg.data[p + 1] = Math.round((ny * 0.5 + 0.5) * 255);
+                nImg.data[p + 2] = Math.round((nz * 0.5 + 0.5) * 255);
+                nImg.data[p + 3] = 255;
+
+                const rough = clamp(Math.round((isWarp ? 0.22 : 0.42) * 255 - arch * 18), 38, 150);
+                rImg.data[p] = rImg.data[p + 1] = rImg.data[p + 2] = rough;
+                rImg.data[p + 3] = 255;
+            }
+        }
+        aCtx.putImageData(aImg, 0, 0);
+        nCtx.putImageData(nImg, 0, 0);
+        rCtx.putImageData(rImg, 0, 0);
+
+        tex.carbonMap = new THREE.CanvasTexture(aC);
+        tex.carbonMap.colorSpace = THREE.SRGBColorSpace;
+        tex.carbonMap.wrapS = tex.carbonMap.wrapT = THREE.RepeatWrapping;
+        tex.carbonMap.repeat.set(9, 9);
+        tex.carbonMap.anisotropy = aniso;
+
+        tex.carbonNormal = new THREE.CanvasTexture(nC);
+        tex.carbonNormal.wrapS = tex.carbonNormal.wrapT = THREE.RepeatWrapping;
+        tex.carbonNormal.repeat.set(9, 9);
+        tex.carbonNormal.anisotropy = aniso;
+
+        tex.carbonRough = new THREE.CanvasTexture(rC);
+        tex.carbonRough.wrapS = tex.carbonRough.wrapT = THREE.RepeatWrapping;
+        tex.carbonRough.repeat.set(9, 9);
+        tex.carbonRough.anisotropy = aniso;
+    }
+
+    // C. Titanio Templado por Calor (256x256)
+    {
+        const w = 256, h = 256;
+        const c = document.createElement('canvas');
+        c.width = w; c.height = h;
+        const ctx = c.getContext('2d');
+        const g = ctx.createLinearGradient(0, 0, 0, h);
+        g.addColorStop(0.00, '#726d66');
+        g.addColorStop(0.24, '#9b9182');
+        g.addColorStop(0.44, '#c49854');
+        g.addColorStop(0.56, '#874c56');
+        g.addColorStop(0.66, '#4f3b92');
+        g.addColorStop(0.75, '#1d53b8');
+        g.addColorStop(0.83, '#22242c');
+        g.addColorStop(1.00, '#050507');
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, w, h);
+
+        tex.titaniumMap = new THREE.CanvasTexture(c);
+        tex.titaniumMap.colorSpace = THREE.SRGBColorSpace;
+        tex.titaniumMap.wrapS = THREE.RepeatWrapping;
+        tex.titaniumMap.wrapT = THREE.ClampToEdgeWrapping;
+    }
+
+    // D. Rejilla Hexagonal Fotograbada (256x256)
+    {
+        const size = 256;
+        const cC = document.createElement('canvas');
+        const bC = document.createElement('canvas');
+        cC.width = cC.height = bC.width = bC.height = size;
+        const cCtx = cC.getContext('2d');
+        const bCtx = bC.getContext('2d');
+
+        cCtx.fillStyle = '#1e2128';
+        cCtx.fillRect(0, 0, size, size);
+        bCtx.fillStyle = '#ffffff';
+        bCtx.fillRect(0, 0, size, size);
+
+        const r = 13;
+        const dx = r * 1.5;
+        const dy = r * Math.sqrt(3);
+        const hexPath = (ctx, cx, cy, rad) => {
+            ctx.beginPath();
+            for (let i = 0; i < 6; i++) {
+                const a = (i * Math.PI) / 3;
+                const px = cx + Math.cos(a) * rad;
+                const py = cy + Math.sin(a) * rad;
+                if (i === 0) ctx.moveTo(px, py);
+                else ctx.lineTo(px, py);
+            }
+            ctx.closePath();
+        };
+
+        for (let col = -1; col < size / dx + 2; col++) {
+            for (let row = -1; row < size / dy + 2; row++) {
+                const cx = col * dx;
+                const cy = row * dy + (col % 2 === 0 ? 0 : dy * 0.5);
+                hexPath(bCtx, cx, cy, r * 0.78);
+                bCtx.fillStyle = '#060606';
+                bCtx.fill();
+
+                hexPath(cCtx, cx, cy, r * 0.86);
+                cCtx.strokeStyle = '#383d48';
+                cCtx.lineWidth = 1.6;
+                cCtx.stroke();
+
+                hexPath(cCtx, cx, cy, r * 0.78);
+                cCtx.fillStyle = '#040507';
+                cCtx.fill();
+            }
+        }
+
+        tex.hexMap = new THREE.CanvasTexture(cC);
+        tex.hexMap.colorSpace = THREE.SRGBColorSpace;
+        tex.hexMap.wrapS = tex.hexMap.wrapT = THREE.RepeatWrapping;
+        tex.hexMap.repeat.set(9, 4);
+        tex.hexMap.anisotropy = aniso;
+
+        tex.hexBump = new THREE.CanvasTexture(bC);
+        tex.hexBump.wrapS = tex.hexBump.wrapT = THREE.RepeatWrapping;
+        tex.hexBump.repeat.set(9, 4);
+    }
+
+    // E. Disco de Freno Carbono-Cerámico Perforado (512x512)
+    {
+        const size = 512;
+        const cC = document.createElement('canvas');
+        const bC = document.createElement('canvas');
+        cC.width = cC.height = bC.width = bC.height = size;
+        const cCtx = cC.getContext('2d');
+        const bCtx = bC.getContext('2d');
+        const half = size / 2;
+
+        cCtx.fillStyle = '#52565e';
+        cCtx.fillRect(0, 0, size, size);
+        bCtx.fillStyle = '#cccccc';
+        bCtx.fillRect(0, 0, size, size);
+
+        let seed = 8831;
+        const rand = () => { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; };
+
+        for (let i = 0; i < 7000; i++) {
+            const ang = rand() * Math.PI * 2;
+            const rad = (0.48 + rand() * 0.50) * half;
+            const px = half + Math.cos(ang) * rad;
+            const py = half + Math.sin(ang) * rad;
+            const s = Math.round(62 + rand() * 64);
+            cCtx.fillStyle = `rgb(${s},${s + 2},${s + 5})`;
+            cCtx.fillRect(px, py, 2, 2);
+        }
+
+        for (let r = half * 0.51; r < half * 0.96; r += 2.0) {
+            const a = 0.05 + rand() * 0.08;
+            cCtx.beginPath();
+            cCtx.arc(half, half, r, 0, Math.PI * 2);
+            cCtx.strokeStyle = rand() > 0.5 ? `rgba(225,230,240,${a})` : `rgba(24,26,30,${a})`;
+            cCtx.lineWidth = 1.0;
+            cCtx.stroke();
+        }
+
+        const groups = 12;
+        for (let g = 0; g < groups; g++) {
+            const baseA = (g / groups) * Math.PI * 2;
+            for (let k = 0; k < 4; k++) {
+                const rad = half * (0.57 + k * 0.098);
+                const ang = baseA + k * 0.075;
+                const hx = half + Math.cos(ang) * rad;
+                const hy = half + Math.sin(ang) * rad;
+
+                cCtx.beginPath();
+                cCtx.arc(hx, hy, 4.4, 0, Math.PI * 2);
+                cCtx.fillStyle = '#32363d';
+                cCtx.fill();
+
+                cCtx.beginPath();
+                cCtx.arc(hx, hy, 3.1, 0, Math.PI * 2);
+                cCtx.fillStyle = '#060709';
+                cCtx.fill();
+
+                bCtx.beginPath();
+                bCtx.arc(hx, hy, 3.8, 0, Math.PI * 2);
+                bCtx.fillStyle = '#000000';
+                bCtx.fill();
+            }
+
+            const sA = baseA + Math.PI / groups;
+            cCtx.beginPath();
+            cCtx.moveTo(half + Math.cos(sA) * half * 0.58, half + Math.sin(sA) * half * 0.58);
+            cCtx.quadraticCurveTo(
+                half + Math.cos(sA + 0.06) * half * 0.77,
+                half + Math.sin(sA + 0.06) * half * 0.77,
+                half + Math.cos(sA + 0.14) * half * 0.92,
+                half + Math.sin(sA + 0.14) * half * 0.92
+            );
+            cCtx.strokeStyle = '#111318';
+            cCtx.lineWidth = 2.6;
+            cCtx.lineCap = 'round';
+            cCtx.stroke();
+
+            bCtx.beginPath();
+            bCtx.moveTo(half + Math.cos(sA) * half * 0.58, half + Math.sin(sA) * half * 0.58);
+            bCtx.quadraticCurveTo(
+                half + Math.cos(sA + 0.06) * half * 0.77,
+                half + Math.sin(sA + 0.06) * half * 0.77,
+                half + Math.cos(sA + 0.14) * half * 0.92,
+                half + Math.sin(sA + 0.14) * half * 0.92
+            );
+            bCtx.strokeStyle = '#121212';
+            bCtx.lineWidth = 3.0;
+            bCtx.lineCap = 'round';
+            bCtx.stroke();
+        }
+
+        tex.rotorMap = new THREE.CanvasTexture(cC);
+        tex.rotorMap.colorSpace = THREE.SRGBColorSpace;
+        tex.rotorMap.anisotropy = aniso;
+
+        tex.rotorBump = new THREE.CanvasTexture(bC);
+        tex.rotorBump.anisotropy = aniso;
+    }
+
+    // F. Neumático Semi-Slick de Competición (512x512)
+    {
+        const w = 512, h = 512;
+        const cC = document.createElement('canvas');
+        const bC = document.createElement('canvas');
+        const rC = document.createElement('canvas');
+        cC.width = bC.width = rC.width = w;
+        cC.height = bC.height = rC.height = h;
+        const cCtx = cC.getContext('2d');
+        const bCtx = bC.getContext('2d');
+        const rCtx = rC.getContext('2d');
+
+        cCtx.fillStyle = '#202328';
+        cCtx.fillRect(0, 0, w, h);
+        bCtx.fillStyle = '#888888';
+        bCtx.fillRect(0, 0, w, h);
+        rCtx.fillStyle = '#a4a4a4';
+        rCtx.fillRect(0, 0, w, h);
+
+        let seed = 3191;
+        const rand = () => { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; };
+        for (let i = 0; i < 6000; i++) {
+            const v = Math.round(26 + rand() * 14);
+            cCtx.fillStyle = `rgb(${v},${v + 1},${v + 3})`;
+            cCtx.fillRect(rand() * w, rand() * h, 2, 2);
+        }
+
+        const drawSidewall = (y0, y1) => {
+            const ym = (y0 + y1) * 0.5;
+            bCtx.strokeStyle = '#d4d4d4';
+            bCtx.lineWidth = 3.0;
+            bCtx.beginPath(); bCtx.moveTo(0, ym - 14); bCtx.lineTo(w, ym - 14); bCtx.stroke();
+            bCtx.beginPath(); bCtx.moveTo(0, ym + 14); bCtx.lineTo(w, ym + 14); bCtx.stroke();
+
+            for (let i = 0; i < 64; i++) {
+                const x = (i / 64) * w;
+                if (i % 16 < 10) {
+                    bCtx.fillStyle = '#b4b4b4';
+                    bCtx.fillRect(x, ym - 10, w / 128, 20);
+                    rCtx.fillStyle = '#7e7e7e';
+                    rCtx.fillRect(x, ym - 10, w / 128, 20);
+                    cCtx.fillStyle = '#181a1f';
+                    cCtx.fillRect(x, ym - 10, w / 128, 20);
+                }
+            }
+        };
+        drawSidewall(h * 0.05, h * 0.24);
+        drawSidewall(h * 0.76, h * 0.95);
+
+        cCtx.fillStyle = '#24272d';
+        cCtx.fillRect(0, h * 0.27, w, h * 0.46);
+        rCtx.fillStyle = '#b4b4b4';
+        rCtx.fillRect(0, h * 0.27, w, h * 0.46);
+
+        [[h * 0.39, 8], [h * 0.51, 10], [h * 0.62, 8]].forEach(([gy, gw]) => {
+            cCtx.fillStyle = '#090a0d';
+            cCtx.fillRect(0, gy - gw / 2, w, gw);
+            bCtx.fillStyle = '#080808';
+            bCtx.fillRect(0, gy - gw / 2, w, gw);
+            rCtx.fillStyle = '#dedede';
+            rCtx.fillRect(0, gy - gw / 2, w, gw);
+        });
+
+        const pitches = 36;
+        const step = w / pitches;
+        for (let i = 0; i < pitches; i++) {
+            const x0 = i * step;
+            [
+                [h * 0.27, h * 0.38, 1.35],
+                [h * 0.63, h * 0.73, -1.25],
+                [h * 0.40, h * 0.50, 0.90],
+                [h * 0.52, h * 0.61, -0.85]
+            ].forEach(([ya, yb, slant]) => {
+                for (let wrap = -1; wrap <= 1; wrap++) {
+                    const ox = x0 + wrap * w;
+                    cCtx.beginPath();
+                    cCtx.moveTo(ox, ya);
+                    cCtx.quadraticCurveTo(ox + step * slant * 0.5, (ya + yb) * 0.5, ox + step * slant, yb);
+                    cCtx.strokeStyle = '#0a0b0e';
+                    cCtx.lineWidth = 3.2;
+                    cCtx.stroke();
+
+                    bCtx.beginPath();
+                    bCtx.moveTo(ox, ya);
+                    bCtx.quadraticCurveTo(ox + step * slant * 0.5, (ya + yb) * 0.5, ox + step * slant, yb);
+                    bCtx.strokeStyle = '#121212';
+                    bCtx.lineWidth = 3.8;
+                    bCtx.stroke();
+                }
+            });
+        }
+
+        tex.tireMap = new THREE.CanvasTexture(cC);
+        tex.tireMap.colorSpace = THREE.SRGBColorSpace;
+        tex.tireMap.wrapS = THREE.RepeatWrapping;
+        tex.tireMap.wrapT = THREE.ClampToEdgeWrapping;
+        tex.tireMap.anisotropy = aniso;
+
+        tex.tireBump = new THREE.CanvasTexture(bC);
+        tex.tireBump.wrapS = THREE.RepeatWrapping;
+        tex.tireBump.wrapT = THREE.ClampToEdgeWrapping;
+        tex.tireBump.anisotropy = aniso;
+
+        tex.tireRough = new THREE.CanvasTexture(rC);
+        tex.tireRough.wrapS = THREE.RepeatWrapping;
+        tex.tireRough.wrapT = THREE.ClampToEdgeWrapping;
+    }
+
+    // G. Textura "Rosso Crinkle" (V12) y Lámina Térmica de Oro 24K (256x256)
+    {
+        const size = 256;
+        const crC = document.createElement('canvas');
+        const gfC = document.createElement('canvas');
+        crC.width = crC.height = gfC.width = gfC.height = size;
+        const crCtx = crC.getContext('2d');
+        const gfCtx = gfC.getContext('2d');
+
+        const crImg = crCtx.createImageData(size, size);
+        let seed = 6619;
+        const rand = () => { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; };
+        for (let i = 0; i < size * size; i++) {
+            const v = Math.round(75 + rand() * 140);
+            const p = i * 4;
+            crImg.data[p] = crImg.data[p + 1] = crImg.data[p + 2] = v;
+            crImg.data[p + 3] = 255;
+        }
+        crCtx.putImageData(crImg, 0, 0);
+
+        gfCtx.fillStyle = '#808080';
+        gfCtx.fillRect(0, 0, size, size);
+        for (let i = 0; i < 360; i++) {
+            const x = rand() * size;
+            const y = rand() * size;
+            const r = 6 + rand() * 16;
+            gfCtx.beginPath();
+            gfCtx.moveTo(x, y);
+            gfCtx.lineTo(x + (rand() - 0.5) * r * 2, y + (rand() - 0.5) * r * 2);
+            gfCtx.lineTo(x + (rand() - 0.5) * r * 2, y + (rand() - 0.5) * r * 2);
+            gfCtx.closePath();
+            const v = Math.round(50 + rand() * 175);
+            gfCtx.fillStyle = `rgb(${v},${v},${v})`;
+            gfCtx.fill();
+        }
+
+        tex.crinkleBump = new THREE.CanvasTexture(crC);
+        tex.crinkleBump.wrapS = tex.crinkleBump.wrapT = THREE.RepeatWrapping;
+        tex.crinkleBump.repeat.set(8, 8);
+
+        tex.goldFoilBump = new THREE.CanvasTexture(gfC);
+        tex.goldFoilBump.wrapS = tex.goldFoilBump.wrapT = THREE.RepeatWrapping;
+        tex.goldFoilBump.repeat.set(5, 5);
+    }
+
+    // H. Cuadro Digital OLED Curvo (Cabina, 512x256)
+    {
+        const w = 512, h = 256;
+        const c = document.createElement('canvas');
+        c.width = w; c.height = h;
+        const ctx = c.getContext('2d');
+        ctx.fillStyle = '#050609';
+        ctx.fillRect(0, 0, w, h);
+
+        ctx.beginPath();
+        ctx.arc(w * 0.5, h * 0.64, 82, Math.PI * 1.08, Math.PI * 1.92);
+        ctx.strokeStyle = '#ff2236';
+        ctx.lineWidth = 8;
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.arc(w * 0.5, h * 0.64, 66, Math.PI * 1.15, Math.PI * 1.82);
+        ctx.strokeStyle = '#d8e8ff';
+        ctx.lineWidth = 3.5;
+        ctx.stroke();
+
+        for (let i = 0; i < 6; i++) {
+            ctx.fillStyle = i > 3 ? '#ff2436' : '#36baff';
+            ctx.fillRect(58, 172 - i * 18, 40, 7);
+            ctx.fillRect(w - 98, 172 - i * 18, 40, 7);
+        }
+
+        tex.clusterMap = new THREE.CanvasTexture(c);
+        tex.clusterMap.colorSpace = THREE.SRGBColorSpace;
+    }
+
+    // I. Sombra Radial Multicapa en el Suelo (512x512)
+    {
+        const size = 512;
+        const c = document.createElement('canvas');
+        c.width = c.height = size;
+        const ctx = c.getContext('2d');
+        ctx.clearRect(0, 0, size, size);
+
+        const drawEllipse = (cx, cy, rx, ry, alpha) => {
+            ctx.save();
+            ctx.translate(cx, cy);
+            ctx.scale(rx, ry);
+            const g = ctx.createRadialGradient(0, 0, 0.05, 0, 0, 1.0);
+            g.addColorStop(0.0, `rgba(0,0,0,${alpha})`);
+            g.addColorStop(0.45, `rgba(0,0,0,${(alpha * 0.70).toFixed(3)})`);
+            g.addColorStop(0.76, `rgba(0,0,0,${(alpha * 0.20).toFixed(3)})`);
+            g.addColorStop(1.0, 'rgba(0,0,0,0.0)');
+            ctx.fillStyle = g;
+            ctx.beginPath();
+            ctx.arc(0, 0, 1, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+        };
+
+        drawEllipse(256, 256, 162, 218, 0.86);
+        drawEllipse(256, 256, 118, 176, 0.92);
+        drawEllipse(256 - 72, 256 + 104, 36, 48, 0.96);
+        drawEllipse(256 + 72, 256 + 104, 36, 48, 0.96);
+        drawEllipse(256 - 76, 256 - 102, 42, 52, 0.96);
+        drawEllipse(256 + 76, 256 - 102, 42, 52, 0.96);
+
+        tex.shadowMap = new THREE.CanvasTexture(c);
+    }
+
+    return tex;
+}
+
+function createMaterials(tex) {
+    // Pintura Tricapa Rosso Fuoco 100% nativa (sin onBeforeCompile, máxima estabilidad móvil)
+    const paintMat = new THREE.MeshPhysicalMaterial({
+        color: new THREE.Color(0x8f0912),
+        metalness: 0.84,
+        roughness: 0.14,
+        roughnessMap: tex.flakeRough,
+        normalMap: tex.flakeNormal,
+        normalScale: new THREE.Vector2(0.036, 0.036),
+        clearcoat: 1.0,
+        clearcoatRoughness: 0.04,
+        sheen: 0.55,
+        sheenColor: new THREE.Color(0xff3b1f),
+        sheenRoughness: 0.30,
+        iridescence: 0.16,
+        iridescenceIOR: 1.45,
+        ior: 1.52,
+        envMapIntensity: 1.32
+    });
+
+    return {
+        paint: paintMat,
+
+        carbon: new THREE.MeshPhysicalMaterial({
+            color: new THREE.Color('#dfe4ec'),
+            map: tex.carbonMap,
+            normalMap: tex.carbonNormal,
+            normalScale: new THREE.Vector2(0.28, 0.28),
+            roughnessMap: tex.carbonRough,
+            roughness: 0.36,
+            metalness: 0.15,
+            clearcoat: 1.0,
+            clearcoatRoughness: 0.045,
+            envMapIntensity: 1.18
+        }),
+
+        matteCarbon: new THREE.MeshStandardMaterial({
+            color: new THREE.Color('#101216'),
+            roughness: 0.78,
+            metalness: 0.14,
+            envMapIntensity: 0.55
+        }),
+
+        voidBlack: new THREE.MeshStandardMaterial({
+            color: new THREE.Color('#050608'),
+            roughness: 0.90,
+            metalness: 0.05,
+            envMapIntensity: 0.22
+        }),
+
+        glass: new THREE.MeshPhysicalMaterial({
+            color: new THREE.Color('#0a0e14'),
+            roughness: 0.03,
+            metalness: 0.08,
+            clearcoat: 1.0,
+            clearcoatRoughness: 0.02,
+            transparent: true,
+            opacity: 0.54,
+            depthWrite: false,
+            envMapIntensity: 1.65,
+            side: THREE.DoubleSide
+        }),
+
+        engineGlass: new THREE.MeshPhysicalMaterial({
+            color: new THREE.Color('#10151d'),
+            roughness: 0.025,
+            metalness: 0.06,
+            clearcoat: 1.0,
+            clearcoatRoughness: 0.02,
+            transparent: true,
+            opacity: 0.34,
+            depthWrite: false,
+            envMapIntensity: 1.55,
+            side: THREE.DoubleSide
+        }),
+
+        headlightLens: new THREE.MeshPhysicalMaterial({
+            color: new THREE.Color('#e8f2ff'),
+            roughness: 0.02,
+            metalness: 0.04,
+            clearcoat: 1.0,
+            clearcoatRoughness: 0.015,
+            transparent: true,
+            opacity: 0.28,
+            depthWrite: false,
+            envMapIntensity: 1.75
+        }),
+
+        opticGunmetal: new THREE.MeshPhysicalMaterial({
+            color: new THREE.Color('#181c22'),
+            metalness: 0.72,
+            roughness: 0.26,
+            clearcoat: 0.4,
+            envMapIntensity: 1.0
+        }),
+
+        wheelAlloy: new THREE.MeshPhysicalMaterial({
+            color: new THREE.Color('#5c6370'),
+            metalness: 0.90,
+            roughness: 0.26,
+            clearcoat: 0.28,
+            clearcoatRoughness: 0.16,
+            envMapIntensity: 1.35
+        }),
+
+        machinedAlu: new THREE.MeshPhysicalMaterial({
+            color: new THREE.Color('#ccd3de'),
+            metalness: 0.95,
+            roughness: 0.16,
+            clearcoat: 0.22,
+            envMapIntensity: 1.38
+        }),
+
+        caliperGold: new THREE.MeshPhysicalMaterial({
+            color: new THREE.Color('#e6a80a'),
+            metalness: 0.56,
+            roughness: 0.22,
+            clearcoat: 1.0,
+            clearcoatRoughness: 0.045,
+            envMapIntensity: 1.30
+        }),
+
+        anodizedRed: new THREE.MeshPhysicalMaterial({
+            color: new THREE.Color('#b8121f'),
+            metalness: 0.74,
+            roughness: 0.24,
+            clearcoat: 0.50,
+            envMapIntensity: 1.25
+        }),
+
+        crinkleRed: new THREE.MeshStandardMaterial({
+            color: new THREE.Color('#ad121e'),
+            bumpMap: tex.crinkleBump,
+            bumpScale: 0.008,
+            roughness: 0.52,
+            metalness: 0.22,
+            envMapIntensity: 1.05
+        }),
+
+        titanium: new THREE.MeshPhysicalMaterial({
+            map: tex.titaniumMap,
+            metalness: 0.88,
+            roughness: 0.22,
+            clearcoat: 0.22,
+            clearcoatRoughness: 0.14,
+            envMapIntensity: 1.28
+        }),
+
+        hexMesh: new THREE.MeshStandardMaterial({
+            map: tex.hexMap,
+            bumpMap: tex.hexBump,
+            bumpScale: 0.012,
+            metalness: 0.55,
+            roughness: 0.46,
+            envMapIntensity: 0.80,
+            side: THREE.DoubleSide
+        }),
+
+        ceramicRotor: new THREE.MeshPhysicalMaterial({
+            map: tex.rotorMap,
+            bumpMap: tex.rotorBump,
+            bumpScale: 0.008,
+            metalness: 0.48,
+            roughness: 0.36,
+            clearcoat: 0.12,
+            envMapIntensity: 1.15
+        }),
+
+        tire: new THREE.MeshStandardMaterial({
+            color: new THREE.Color('#d8dce4'),
+            map: tex.tireMap,
+            bumpMap: tex.tireBump,
+            bumpScale: 0.014,
+            roughnessMap: tex.tireRough,
+            roughness: 0.64,
+            metalness: 0.04,
+            envMapIntensity: 0.72
+        }),
+
+        alcantara: new THREE.MeshStandardMaterial({
+            color: new THREE.Color('#191b20'),
+            roughness: 0.84,
+            metalness: 0.02,
+            envMapIntensity: 0.40
+        }),
+
+        seatTrimRed: new THREE.MeshStandardMaterial({
+            color: new THREE.Color('#96111c'),
+            roughness: 0.76,
+            metalness: 0.05,
+            envMapIntensity: 0.45
+        }),
+
+        goldFoil: new THREE.MeshPhysicalMaterial({
+            color: new THREE.Color('#dfb032'),
+            bumpMap: tex.goldFoilBump,
+            bumpScale: 0.014,
+            metalness: 0.92,
+            roughness: 0.26,
+            envMapIntensity: 1.25
+        }),
+
+        mirrorChrome: new THREE.MeshPhysicalMaterial({
+            color: new THREE.Color('#d5dce6'),
+            metalness: 1.0,
+            roughness: 0.02,
+            envMapIntensity: 1.5
+        }),
+
+        ledWhite: new THREE.MeshStandardMaterial({
+            color: new THREE.Color('#ffffff'),
+            emissive: new THREE.Color('#e2f0ff'),
+            emissiveIntensity: 2.35,
+            roughness: 0.12,
+            metalness: 0.0,
+            toneMapped: false
+        }),
+
+        ledRed: new THREE.MeshStandardMaterial({
+            color: new THREE.Color('#ff182a'),
+            emissive: new THREE.Color('#ff1426'),
+            emissiveIntensity: 2.45,
+            roughness: 0.12,
+            metalness: 0.0,
+            toneMapped: false
+        }),
+
+        rubyLens: new THREE.MeshPhysicalMaterial({
+            color: new THREE.Color('#4a040b'),
+            emissive: new THREE.Color('#380006'),
+            emissiveIntensity: 0.30,
+            metalness: 0.05,
+            roughness: 0.05,
+            transparent: true,
+            opacity: 0.56,
+            depthWrite: false,
+            clearcoat: 1.0,
+            envMapIntensity: 1.2
+        }),
+
+        clusterOLED: new THREE.MeshStandardMaterial({
+            map: tex.clusterMap,
+            emissiveMap: tex.clusterMap,
+            emissive: new THREE.Color('#ffffff'),
+            emissiveIntensity: 1.55,
+            roughness: 0.15,
+            toneMapped: false
+        }),
+
+        contactShadow: new THREE.MeshBasicMaterial({
+            map: tex.shadowMap,
+            transparent: true,
+            opacity: 0.96,
+            depthWrite: false
+        })
+    };
+}
+
+// ============================================================================
+// 3. ENTORNO FOTOGRÁFICO HDR DE SOFTBOXES GAUSSIANOS (PMREM ANTI-QUEMADO)
+// ============================================================================
+
+function createGaussianSoftboxTexture(coreHex, edgeHex) {
+    const w = 256, h = 128;
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    const ctx = c.getContext('2d');
+    const img = ctx.createImageData(w, h);
+
+    const core = new THREE.Color(coreHex);
+    const edge = new THREE.Color(edgeHex);
+
+    for (let y = 0; y < h; y++) {
+        const ny = (y / (h - 1)) * 2 - 1;
+        const fy = Math.exp(-3.2 * ny * ny) * Math.pow(Math.cos(ny * Math.PI * 0.5), 1.2);
+        for (let x = 0; x < w; x++) {
+            const nx = (x / (w - 1)) * 2 - 1;
+            const fx = Math.pow(Math.cos(nx * Math.PI * 0.5), 0.85);
+            const f = clamp(fx * fy, 0, 1);
+
+            const r = lerp(edge.r, core.r, f) * f;
+            const g = lerp(edge.g, core.g, f) * f;
+            const b = lerp(edge.b, core.b, f) * f;
+
+            const p = (y * w + x) * 4;
+            img.data[p] = clamp(Math.round(r * 255), 0, 255);
+            img.data[p + 1] = clamp(Math.round(g * 255), 0, 255);
+            img.data[p + 2] = clamp(Math.round(b * 255), 0, 255);
+            img.data[p + 3] = 255;
+        }
+    }
+    ctx.putImageData(img, 0, 0);
+    const t = new THREE.CanvasTexture(c);
+    t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+}
+
+function createAutomotiveStudioEnv(renderer) {
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    pmrem.compileEquirectangularShader();
+
+    const envScene = new THREE.Scene();
+    envScene.background = new THREE.Color('#050608');
+
+    const warmTex = createGaussianSoftboxTexture('#fff8f0', '#3c3632');
+    const neutralTex = createGaussianSoftboxTexture('#f7faff', '#303642');
+    const coolTex = createGaussianSoftboxTexture('#d4e6ff', '#25344b');
+
+    const addSoftbox = (evalFn, texture, intensity, uSegs = 20, vSegs = 6) => {
+        const geo = buildParametricSurface(uSegs, vSegs, evalFn);
+        const mat = new THREE.MeshBasicMaterial({
+            map: texture,
+            color: new THREE.Color(intensity, intensity, intensity),
+            side: THREE.DoubleSide
+        });
+        envScene.add(new THREE.Mesh(geo, mat));
+    };
+
+    // Softbox cenital principal
+    addSoftbox((u, v) => {
+        const z = lerp(-12, 12, u);
+        const x = lerp(-2.2, 2.8, v);
+        const y = 8.6 - 0.016 * z * z;
+        return [x, y, z];
+    }, neutralTex, 2.05);
+
+    // Bandas laterales de línea de cintura
+    [-1, 1].forEach(side => {
+        addSoftbox((u, v) => {
+            const z = lerp(-12, 12, u);
+            const y = lerp(0.75, 1.95, v);
+            const x = side * (9.6 - 0.012 * z * z);
+            return [x, y, z];
+        }, side > 0 ? warmTex : coolTex, 1.42);
+    });
+
+    // Arcos de hombro 45°
+    [-1, 1].forEach(side => {
+        addSoftbox((u, v) => {
+            const z = lerp(-11, 11, u);
+            const ang = lerp(0.54, 0.90, v) * side;
+            const r = 8.8;
+            return [Math.sin(ang) * r, Math.cos(ang) * r, z];
+        }, side > 0 ? warmTex : neutralTex, 1.48);
+    });
+
+    // Softbox frontal y trasero suaves
+    addSoftbox((u, v) => {
+        const ang = lerp(-0.95, 1.15, u);
+        const y = lerp(2.0, 5.6, v);
+        const r = 9.5;
+        return [Math.sin(ang) * r, y, Math.cos(ang) * r];
+    }, warmTex, 1.38);
+
+    addSoftbox((u, v) => {
+        const ang = lerp(-1.10, 1.05, u);
+        const y = lerp(2.0, 5.4, v);
+        const r = 9.2;
+        return [Math.sin(ang) * r, y, -Math.cos(ang) * r];
+    }, coolTex, 1.22);
+
+    // Anillo rasante sutil para definir neumáticos y difusor
+    addSoftbox((u, v) => {
+        const a = u * Math.PI * 2;
+        const y = lerp(-0.4, 0.55, v);
+        const r = 10.5;
+        return [Math.cos(a) * r, y, Math.sin(a) * r];
+    }, neutralTex, 0.45, 32, 4);
+
+    const envRT = pmrem.fromScene(envScene, 0.032);
+    pmrem.dispose();
+    return envRT.texture;
+}
+
+// ============================================================================
+// 4. ARQUITECTURA CLASE-A CONTINUA DEL HYPERCAR + ACTUADORES HIDRÁULICOS
+// ============================================================================
+
+/**
+ * Evaluador matemático continuo C2 del frontal (morro, capó, aletas estilizadas y S-duct).
+ */
+function createFrontSurfaceEvaluator() {
+    const TH_START = Math.PI + 0.5359;
+    const TH_END = -0.5419;
+    const U_ARCH_0 = 0.17;
+    const U_ARCH_1 = 0.73;
+
+    const U_FRUNK_0 = 0.170;
+    const U_FRUNK_1 = 0.750;
+    const vFrunkSeam = (u) => {
+        const t = clamp((u - U_FRUNK_0) / (U_FRUNK_1 - U_FRUNK_0), 0, 1);
+        return lerp(0.435, 0.365, smoothstep(0, 1, t));
+    };
+
+    const evalHoodCenterY = (z) => {
+        const tBack = clamp((2.32 - z) / (2.32 - 0.68), 0, 1);
+        return 0.295 + 0.448 * (1.0 - Math.pow(1.0 - tBack, 3.10));
+    };
+
+    const headlightMask = (u, v) => {
+        const du = (u - 0.850) / 0.072;
+        const dv = (v - 0.540) / 0.112;
+        const rx = du * 0.86 + dv * 0.51;
+        const ry = -du * 0.51 + dv * 0.86;
+        const d = Math.hypot(rx * 0.88, ry * 1.48);
+        return 1.0 - smootherstep(0.58, 1.0, d);
+    };
+
+    const evalBase = (u, v, includeHeadlightPocket = true) => {
+        const zCenter = lerp(0.68, 2.32, u);
+
+        let zLip, yLip, xLip;
+        if (u < U_ARCH_0) {
+            const k = u / U_ARCH_0;
+            const zBackBot = SPEC.fZ + Math.cos(TH_START) * SPEC.fArchR;
+            zLip = lerp(0.68, zBackBot, k);
+            yLip = lerp(0.155, 0.150, k);
+            xLip = lerp(0.895, 0.985, smoothstep(0.0, 1.0, k));
+        } else if (u <= U_ARCH_1) {
+            const k = (u - U_ARCH_0) / (U_ARCH_1 - U_ARCH_0);
+            const th = lerp(TH_START, TH_END, k);
+            const cosT = Math.cos(th);
+            const sinT = Math.sin(th);
+            zLip = SPEC.fZ + cosT * SPEC.fArchR;
+            yLip = SPEC.fR + sinT * SPEC.fArchR;
+            xLip = 1.006 - 0.024 * Math.pow(Math.abs(cosT), 1.7) - 0.012 * Math.max(0, -sinT);
+        } else {
+            const k = (u - U_ARCH_1) / (1.0 - U_ARCH_1);
+            const zFrontBot = SPEC.fZ + Math.cos(TH_END) * SPEC.fArchR;
+            const bow = Math.sin(k * Math.PI * 0.5);
+            zLip = lerp(zFrontBot, 2.315, Math.pow(k, 0.88));
+            xLip = lerp(0.982, 0.0, Math.pow(k, 1.55)) * (1.0 - 0.06 * bow);
+            yLip = lerp(0.148, 0.256, smoothstep(0.05, 1.0, k)) + 0.014 * Math.sin(k * Math.PI);
+        }
+
+        const vNorm = Math.min(v / 0.90, 1.0);
+        const z = lerp(zCenter, zLip, smootherstep(0.32, 0.92, vNorm));
+        const yCenter = evalHoodCenterY(z);
+
+        const archInfluence = gauss(z, SPEC.fZ, 0.44);
+        const noseTaper = 1.0 - Math.pow(smoothstep(1.68, 2.32, z), 1.80);
+        const xShoulder = Math.max(xLip, (0.945 + 0.062 * archInfluence) * (0.04 + 0.96 * noseTaper));
+
+        let x, y;
+        if (v <= 0.72) {
+            const s = v / 0.72;
+            x = Math.min(xLip, xShoulder) * Math.pow(s, 0.96);
+            if (u > U_ARCH_1) {
+                const kNose = (u - U_ARCH_1) / (1.0 - U_ARCH_1);
+                x = lerp(x, xLip * s, smoothstep(0.55, 1.0, kNose));
+            }
+
+            // Aletas bajas, tensas y aerodinámicas sobre el paso de rueda (sin protuberancias)
+            const wheelSwell = 0.062 * gauss(z, SPEC.fZ - 0.02, 0.56) * smoothstep(2.28, 1.84, z) * smoothstep(0.66, 0.98, z);
+            const shoulderLead = 0.014 * smoothstep(0.68, 0.86, z) * smoothstep(1.55, 0.92, z);
+            const yFenderBase = yCenter + wheelSwell + shoulderLead;
+            const yShoulder = Math.max(yLip + 0.048, yFenderBase);
+
+            const hoodCrown = 0.016 * (1.0 - s * s) * smoothstep(2.30, 1.95, z);
+            const centerSpine = 0.005 * gauss(s, 0.0, 0.15) * smoothstep(0.75, 1.25, z) * smoothstep(2.28, 1.98, z);
+            const subtleFenderCrown = 0.010 * Math.sin(smoothstep(0.32, 1.0, s) * Math.PI) * gauss(z, SPEC.fZ, 0.48) * smoothstep(2.24, 1.78, z);
+
+            y = lerp(yCenter + hoodCrown + centerSpine, yShoulder, smootherstep(0.18, 0.94, s)) + subtleFenderCrown;
+
+            const sdZ = smootherstep(1.38, 1.50, z) * (1.0 - smootherstep(1.74, 1.85, z));
+            const sdX = 1.0 - smootherstep(0.14, 0.25, x);
+            const sDuctDrop = -0.046 * sdZ * sdX;
+            const sDuctRim = 0.006 * sdZ * gauss(x, 0.24, 0.050);
+            y += sDuctDrop + sDuctRim;
+
+            const noseRoll = -0.026 * Math.pow(smoothstep(0.91, 1.0, u), 2.0);
+            y += noseRoll;
+        } else if (v <= 0.90) {
+            const st = (v - 0.72) / 0.18;
+            const topP = evalBase(u, 0.72, false);
+            const bulge = Math.sin(st * Math.PI) * 0.022 * smoothstep(0.98, 0.76, u);
+            x = lerp(topP[0], xLip, smootherstep(0.0, 1.0, st)) + bulge;
+            y = lerp(topP[1], yLip, Math.pow(st, 1.08));
+
+            if (u < U_ARCH_0) {
+                const bk = 1.0 - smoothstep(0.0, U_ARCH_0, u);
+                const midV = Math.sin(st * Math.PI);
+                x -= 0.052 * bk * midV;
+            }
+        } else {
+            const lt = (v - 0.90) / 0.10;
+            const lipP = evalBase(u, 0.90, false);
+            const rollIn = 0.036 * smootherstep(0, 1, lt);
+            let dzRoll = 0, dyRoll = -0.006 * lt;
+            if (u >= U_ARCH_0 && u <= U_ARCH_1) {
+                const k = (u - U_ARCH_0) / (U_ARCH_1 - U_ARCH_0);
+                const th = lerp(TH_START, TH_END, k);
+                dzRoll = -Math.cos(th) * 0.005 * lt;
+                dyRoll = -Math.sin(th) * 0.005 * lt;
+            }
+            x = Math.max(0.0, lipP[0] - rollIn);
+            y = lipP[1] + dyRoll;
+            return [x, y, lipP[2] + dzRoll];
+        }
+
+        if (includeHeadlightPocket && v < 0.76 && u > 0.72 && u < 0.96) {
+            const hm = headlightMask(u, v);
+            if (hm > 0.001) {
+                y -= 0.030 * hm;
+            }
+        }
+
+        return [Math.max(0.0, x), y, z];
+    };
+
+    const evalNormal = (u, v, includeHeadlightPocket = false) => {
+        const eps = 0.003;
+        const u0 = clamp(u - eps, 0, 1), u1 = clamp(u + eps, 0, 1);
+        const v0 = clamp(v - eps, 0, 0.995), v1 = clamp(v + eps, 0, 0.995);
+        const pu0 = evalBase(u0, v, includeHeadlightPocket);
+        const pu1 = evalBase(u1, v, includeHeadlightPocket);
+        const pv0 = evalBase(u, v0, includeHeadlightPocket);
+        const pv1 = evalBase(u, v1, includeHeadlightPocket);
+        const du = new THREE.Vector3(pu1[0] - pu0[0], pu1[1] - pu0[1], pu1[2] - pu0[2]);
+        const dv = new THREE.Vector3(pv1[0] - pv0[0], pv1[1] - pv0[1], pv1[2] - pv0[2]);
+        const n = du.cross(dv);
+        if (n.lengthSq() < 1e-10) return new THREE.Vector3(0, 1, 0);
+        n.normalize();
+        if (v < 0.002) {
+            n.x = 0;
+            if (n.lengthSq() > 1e-10) n.normalize();
+            else n.set(0, 1, 0);
+        }
+        return n;
+    };
+
+    const evalFlushNormal = (u, v) => evalNormal(u, v, false);
+
+    return {
+        evalBase,
+        evalNormal,
+        evalFlushNormal,
+        evalHoodCenterY,
+        headlightMask,
+        U_FRUNK_0,
+        U_FRUNK_1,
+        vFrunkSeam
+    };
+}
+
+/**
+ * Amortiguador hidráulico telescópico de dos piezas con salvaguarda de orientación anti-NaN.
+ */
+function createHydraulicStrut(parentGroup, mat, cylLen, rodLen, cylR = 0.009, rodR = 0.0045) {
+    const upAxis = new THREE.Vector3(0, 1, 0);
+
+    const cylGeo = new THREE.LatheGeometry([
+        new THREE.Vector2(0.0005, 0.000),
+        new THREE.Vector2(cylR * 0.85, 0.006),
+        new THREE.Vector2(cylR * 0.72, 0.016),
+        new THREE.Vector2(cylR, 0.024),
+        new THREE.Vector2(cylR, cylLen - 0.014),
+        new THREE.Vector2(cylR * 0.82, cylLen - 0.004),
+        new THREE.Vector2(rodR * 1.18, cylLen),
+        new THREE.Vector2(rodR * 1.05, cylLen - 0.005)
+    ], 14);
+    const cylMesh = new THREE.Mesh(cylGeo, mat.matteCarbon);
+
+    const collarGeo = new THREE.LatheGeometry([
+        new THREE.Vector2(rodR * 1.08, cylLen - 0.012),
+        new THREE.Vector2(cylR * 1.05, cylLen - 0.010),
+        new THREE.Vector2(cylR * 1.02, cylLen + 0.003),
+        new THREE.Vector2(rodR * 1.12, cylLen + 0.004)
+    ], 14);
+    cylMesh.add(new THREE.Mesh(collarGeo, mat.machinedAlu));
+
+    const rodGeo = new THREE.LatheGeometry([
+        new THREE.Vector2(0.0005, 0.000),
+        new THREE.Vector2(cylR * 0.78, 0.006),
+        new THREE.Vector2(rodR * 1.15, 0.016),
+        new THREE.Vector2(rodR, 0.024),
+        new THREE.Vector2(rodR, rodLen),
+        new THREE.Vector2(0.0005, rodLen + 0.003)
+    ], 12);
+    const rodMesh = new THREE.Mesh(rodGeo, mat.machinedAlu);
+
+    parentGroup.add(cylMesh);
+    parentGroup.add(rodMesh);
+
+    const pA = new THREE.Vector3();
+    const pB = new THREE.Vector3();
+    const dir = new THREE.Vector3();
+    const negDir = new THREE.Vector3();
+
+    const safeAlign = (mesh, v) => {
+        const dot = clamp(upAxis.dot(v), -1, 1);
+        if (dot < -0.9999) {
+            mesh.quaternion.setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI);
+        } else {
+            mesh.quaternion.setFromUnitVectors(upAxis, v);
+        }
+    };
+
+    return {
+        cylMesh,
+        rodMesh,
+        update(anchorObjA, anchorObjB, spaceParent) {
+            anchorObjA.getWorldPosition(pA);
+            anchorObjB.getWorldPosition(pB);
+            spaceParent.worldToLocal(pA);
+            spaceParent.worldToLocal(pB);
+
+            dir.subVectors(pB, pA);
+            const len = dir.length();
+            if (!Number.isFinite(len) || len < 1e-4) return;
+            dir.divideScalar(len);
+            negDir.copy(dir).negate();
+
+            cylMesh.position.copy(pA);
+            safeAlign(cylMesh, dir);
+
+            rodMesh.position.copy(pB);
+            safeAlign(rodMesh, negDir);
+        }
+    };
+}
+
+function tagInteractive(obj, partName) {
+    obj.traverse(child => {
+        if (child.isMesh) {
+            child.userData.interactivePart = partName;
+        }
+    });
+}
+
+/**
+ * 4.1 Monocasco Interno, Fondo Plano Venturi y Pasos de Rueda Retranqueados
+ */
+function buildChassisAndWheelWells(car, mat) {
+    const group = new THREE.Group();
+
+    const floorGeo = buildParametricSurface(44, 20, (u, v) => {
+        const z = lerp(-2.22, 2.24, u);
+        const s = (v - 0.5) * 2;
+        let halfW = 0.82;
+        if (z > 0.86) halfW = lerp(0.82, 0.52, smoothstep(0.86, 2.24, z));
+        if (z < -0.82) halfW = lerp(0.82, 0.64, smoothstep(-0.82, -2.22, z));
+
+        const fCut = gauss(z, SPEC.fZ, 0.34) * 0.24;
+        const rCut = gauss(z, SPEC.rZ, 0.38) * 0.22;
+        halfW = Math.max(0.52, halfW - fCut - rCut);
+
+        let y = 0.118;
+        if (z < -1.46) {
+            const rt = smoothstep(-1.46, -2.22, z);
+            y = 0.118 + rt * rt * 0.24 * (1 - 0.2 * s * s);
+        }
+        return [s * halfW, y, z];
+    }, { worldUV: true, uvScaleU: 1.5, uvScaleV: 1.5, flipWinding: true });
+    const floorMesh = new THREE.Mesh(floorGeo, mat.carbon);
+    floorMesh.receiveShadow = true;
+    group.add(floorMesh);
+
+    const coreGeo = buildParametricSurface(38, 18, (u, v) => {
+        const z = lerp(-2.06, 2.02, u);
+        const ang = v * Math.PI;
+        const cosA = Math.cos(ang);
+        const sinA = Math.sin(ang);
+
+        let rx = 0.58;
+        if (z > 0.80) rx = lerp(0.58, 0.38, smoothstep(0.80, 2.02, z));
+        else if (z < -0.80) rx = lerp(0.58, 0.54, smoothstep(-0.80, -2.06, z));
+
+        let topY = 0.50;
+        if (z > 0.80) topY = lerp(0.52, 0.24, smoothstep(0.80, 2.02, z));
+        else if (z < -0.68) topY = lerp(0.68, 0.58, smoothstep(-0.68, -2.06, z));
+
+        const frunkDip = smootherstep(0.88, 1.00, z) * (1.0 - smootherstep(1.86, 1.98, z));
+        topY = lerp(topY, 0.215, frunkDip);
+
+        return [cosA * rx, lerp(0.13, topY, Math.pow(sinA, 0.85)), z];
+    }, { flipWinding: false });
+    group.add(new THREE.Mesh(coreGeo, mat.voidBlack));
+
+    const makeRecessedWheelWell = (axleZ, centerY, archR, innerX, outerX) => {
+        const linerR = archR - 0.015;
+        const archGeo = buildParametricSurface(32, 8, (u, v) => {
+            const th = lerp(Math.PI + 0.42, -0.42, u);
+            const x = lerp(innerX, outerX, v);
+            const r = linerR - 0.004 * v;
+            const z = axleZ + Math.cos(th) * r;
+            const y = Math.max(0.12, centerY + Math.sin(th) * r);
+            return [x, y, z];
+        }, { flipWinding: false });
+        addMirroredMesh(group, archGeo, mat.matteCarbon, false, true);
+
+        const backGeo = buildParametricSurface(24, 6, (u, v) => {
+            const th = lerp(Math.PI + 0.42, -0.42, u);
+            const r = lerp(0.04, linerR, v);
+            return [innerX, Math.max(0.12, centerY + Math.sin(th) * r), axleZ + Math.cos(th) * r];
+        }, { flipWinding: true });
+        addMirroredMesh(group, backGeo, mat.voidBlack, false, true);
+    };
+
+    makeRecessedWheelWell(SPEC.fZ, SPEC.fR, SPEC.fArchR, 0.59, 0.958);
+    makeRecessedWheelWell(SPEC.rZ, SPEC.rR, SPEC.rArchR, 0.59, 0.985);
+
+    car.add(group);
+}
+
+/**
+ * 4.2 Frontal Clase-A, Maletero Abatible (Frunk) con Bolsa y Doble Pistón, Faros y Splitter
+ */
+function buildFrontClipAndAero(car, mat) {
+    const group = new THREE.Group();
+    const frontEval = createFrontSurfaceEvaluator();
+    const { U_FRUNK_0, U_FRUNK_1, vFrunkSeam } = frontEval;
+
+    const buildFrontSubPatch = (uSegs, vSegs, uvMapFn, includePocket, forceSeamX0 = false) => {
+        const geo = buildParametricSurface(uSegs, vSegs, (u, v) => {
+            const [uu, vv] = uvMapFn(u, v);
+            return frontEval.evalBase(uu, vv, includePocket);
+        }, {
+            worldUV: true,
+            uvScaleU: 1.0,
+            uvScaleV: 1.0,
+            flipWinding: false,
+            forceSymmetrySeamX0: forceSeamX0
+        });
+
+        const norm = geo.attributes.normal;
+        const vCount = vSegs + 1;
+        for (let iu = 0; iu <= uSegs; iu++) {
+            const u = iu / uSegs;
+            for (let iv = 0; iv <= vSegs; iv++) {
+                const v = iv / vSegs;
+                const [uu, vv] = uvMapFn(u, v);
+                const n = frontEval.evalNormal(uu, vv, includePocket);
+                const idx = iu * vCount + iv;
+                norm.setXYZ(idx, n.x, n.y, n.z);
+            }
+        }
+        norm.needsUpdate = true;
+        return geo;
+    };
+
+    const gapU = 0.0022;
+    const gapV = 0.0040;
+
+    // 1. Torpedo trasero fijo
+    const cowlStripGeo = buildFrontSubPatch(14, 40, (u, v) => [
+        lerp(0.0, U_FRUNK_0 - gapU, u),
+        v
+    ], false, true);
+    addMirroredMesh(group, cowlStripGeo, mat.paint, true, true);
+
+    // 2. Morro delantero fijo con cavidades de faros
+    const noseCapGeo = buildFrontSubPatch(22, 42, (u, v) => [
+        lerp(U_FRUNK_1 + gapU, 1.0, u),
+        v
+    ], true, true);
+    addMirroredMesh(group, noseCapGeo, mat.paint, true, true);
+
+    // 3. Aletas exteriores fijas
+    const outerFenderGeo = buildFrontSubPatch(38, 30, (u, v) => {
+        const uu = lerp(U_FRUNK_0 - gapU, U_FRUNK_1 + gapU, u);
+        const vv = lerp(vFrunkSeam(uu) + gapV, 1.0, v);
+        return [uu, vv];
+    }, false, false);
+    addMirroredMesh(group, outerFenderGeo, mat.paint, true, true);
+
+    // Junta de goma perimetral del maletero
+    const gutterPts = [];
+    for (let i = 0; i <= 14; i++) {
+        const uu = lerp(U_FRUNK_0, U_FRUNK_1, i / 14);
+        const p = frontEval.evalBase(uu, vFrunkSeam(uu), false);
+        gutterPts.push([p[0] - 0.004, p[1] - 0.011, p[2]]);
+    }
+    addMirroredMesh(group, buildVariableTube(gutterPts, [0.010, 0.007], 24, 10), mat.voidBlack, false, true);
+
+    // B. TAPA ABATIBLE DEL MALETERO DELANTERO (FRUNK)
+    const zHinge = lerp(0.68, 2.32, U_FRUNK_0);
+    const yHinge = frontEval.evalHoodCenterY(zHinge) - 0.014;
+
+    const frunkPivot = new THREE.Group();
+    frunkPivot.position.set(0, yHinge, zHinge);
+    group.add(frunkPivot);
+
+    const frunkContent = new THREE.Group();
+    frunkContent.position.set(0, -yHinge, -zHinge);
+    frunkPivot.add(frunkContent);
+
+    const frunkOuterGeo = buildFrontSubPatch(36, 22, (u, v) => {
+        const uu = lerp(U_FRUNK_0 + gapU, U_FRUNK_1 - gapU, u);
+        const vv = lerp(0.0, vFrunkSeam(uu) - gapV, v);
+        return [uu, vv];
+    }, false, true);
+    addMirroredMesh(frunkContent, frunkOuterGeo, mat.paint, true, true);
+
+    const frunkInnerGeo = buildParametricSurface(24, 16, (u, v) => {
+        const uu = lerp(U_FRUNK_0 + gapU + 0.01, U_FRUNK_1 - gapU - 0.01, u);
+        const vv = lerp(0.0, vFrunkSeam(uu) - gapV - 0.015, v);
+        const p = frontEval.evalBase(uu, vv, false);
+        const n = frontEval.evalNormal(uu, vv, false);
+        const edgeFade = smoothstep(0.0, 0.14, u) * smoothstep(1.0, 0.86, u) * smoothstep(1.0, 0.84, v);
+        const thick = lerp(0.007, 0.018, edgeFade);
+        return [p[0] - n.x * thick, p[1] - n.y * thick, p[2] - n.z * thick];
+    }, { worldUV: true, flipWinding: true, forceSymmetrySeamX0: true });
+    addMirroredMesh(frunkContent, frunkInnerGeo, mat.carbon, false, true);
+
+    const lidRibPts = [];
+    for (let i = 0; i <= 10; i++) {
+        const t = i / 10;
+        const uu = lerp(U_FRUNK_0 + 0.04, U_FRUNK_1 - 0.04, t);
+        const vv = lerp(0.04, vFrunkSeam(uu) - 0.05, t);
+        const p = frontEval.evalBase(uu, vv, false);
+        lidRibPts.push([p[0], p[1] - 0.021, p[2]]);
+    }
+    addMirroredMesh(frunkContent, buildVariableTube(lidRibPts, [0.012, 0.007], 18, 10, { worldUV: true }), mat.carbon, false, true);
+
+    const frontLatchY = frontEval.evalHoodCenterY(1.86) - 0.018;
+    frunkContent.add(new THREE.Mesh(buildVariableTube([
+        [-0.022, frontLatchY, 1.855],
+        [-0.016, frontLatchY - 0.026, 1.865],
+        [0.016, frontLatchY - 0.026, 1.865],
+        [0.022, frontLatchY, 1.855]
+    ], 0.0042, 14, 8), mat.machinedAlu));
+
+    // S-Duct integrado en la tapa del maletero
+    const sdFramePts = [
+        [0.00, frontEval.evalHoodCenterY(1.83) + 0.003, 1.83],
+        [0.13, frontEval.evalHoodCenterY(1.81) + 0.001, 1.81],
+        [0.19, frontEval.evalHoodCenterY(1.68) - 0.002, 1.68],
+        [0.20, frontEval.evalHoodCenterY(1.48) + 0.002, 1.48],
+        [0.13, frontEval.evalHoodCenterY(1.41) + 0.006, 1.41],
+        [0.00, frontEval.evalHoodCenterY(1.40) + 0.009, 1.40]
+    ];
+    addMirroredMesh(frunkContent, buildVariableTube(sdFramePts, [0.009, 0.006], 24, 10, { worldUV: true }), mat.carbon);
+
+    const sdVaneY = frontEval.evalHoodCenterY(1.64) - 0.019;
+    const sdVaneGeo = buildSculptedAirfoil(18, 10, u => {
+        const s = (u - 0.5) * 2;
+        return {
+            x: s * 0.17,
+            y: sdVaneY + 0.006 * (1 - s * s),
+            z: 1.64 - 0.016 * s * s,
+            chord: 0.068,
+            thickness: 0.13,
+            camber: 0.03,
+            pitch: 0.16,
+            roll: 0
+        };
+    });
+    frunkContent.add(new THREE.Mesh(sdVaneGeo, mat.carbon));
+
+    const frunkLidAnchorL = new THREE.Object3D();
+    frunkLidAnchorL.position.set(0.41, frontEval.evalHoodCenterY(1.24) - 0.022, 1.24);
+    frunkContent.add(frunkLidAnchorL);
+
+    const frunkLidAnchorR = new THREE.Object3D();
+    frunkLidAnchorR.position.set(-0.41, frontEval.evalHoodCenterY(1.24) - 0.022, 1.24);
+    frunkContent.add(frunkLidAnchorR);
+
+    tagInteractive(frunkPivot, 'frunk');
+
+    // C. COMPARTIMENTO DE EQUIPAJE DELANTERO (CARBONO + ALCANTARA + BOLSA WEEKENDER)
+    const frunkBay = new THREE.Group();
+
+    const tubWallGeo = buildParametricSurface(24, 14, (u, v) => {
+        const a = u * Math.PI * 2;
+        const cosA = Math.cos(a);
+        const sinA = Math.sin(a);
+        const sx = Math.sign(cosA) * Math.pow(Math.abs(cosA), 0.72);
+        const sz = Math.sign(sinA) * Math.pow(Math.abs(sinA), 0.72);
+        const z = 1.43 + sz * 0.42;
+        const topW = lerp(0.47, 0.37, smoothstep(1.00, 1.86, z));
+        const botW = topW - 0.08;
+        const x = sx * lerp(topW, botW, v);
+        const yTop = frontEval.evalHoodCenterY(z) - 0.022;
+        const yBot = 0.242;
+        const y = lerp(yTop, yBot, Math.pow(v, 0.88));
+        return [x, y, z];
+    }, { closedU: true, worldUV: true, flipWinding: true });
+    frunkBay.add(new THREE.Mesh(tubWallGeo, mat.carbon));
+
+    const bayFloorGeo = buildParametricSurface(14, 14, (u, v) => {
+        const s = (v - 0.5) * 2;
+        const z = lerp(1.07, 1.79, u);
+        const halfW = lerp(0.37, 0.28, u);
+        const edgeCurve = Math.sin(u * Math.PI);
+        return [s * halfW * (0.82 + 0.18 * edgeCurve), 0.245, z];
+    }, { flipWinding: false });
+    frunkBay.add(new THREE.Mesh(bayFloorGeo, mat.alcantara));
+
+    const stitchPts = [];
+    for (let i = 0; i < 24; i++) {
+        const a = (i / 24) * Math.PI * 2;
+        const sx = Math.sign(Math.cos(a)) * Math.pow(Math.abs(Math.cos(a)), 0.75);
+        const sz = Math.sign(Math.sin(a)) * Math.pow(Math.abs(Math.sin(a)), 0.75);
+        const z = 1.43 + sz * 0.34;
+        const halfW = lerp(0.34, 0.26, smoothstep(1.08, 1.78, z));
+        stitchPts.push([sx * halfW, 0.249, z]);
+    }
+    frunkBay.add(new THREE.Mesh(buildVariableTube(stitchPts, 0.0028, 32, 8, { closed: true }), mat.seatTrimRed));
+
+    // Copelas CNC de suspensión y barra de torretas en carbono
+    const strutCapGeo = new THREE.LatheGeometry([
+        new THREE.Vector2(0.001, 0.000),
+        new THREE.Vector2(0.056, 0.000),
+        new THREE.Vector2(0.056, 0.012),
+        new THREE.Vector2(0.044, 0.018),
+        new THREE.Vector2(0.022, 0.020),
+        new THREE.Vector2(0.018, 0.030),
+        new THREE.Vector2(0.001, 0.031)
+    ], 20);
+    [-1, 1].forEach(side => {
+        const cap = new THREE.Mesh(strutCapGeo, mat.machinedAlu);
+        cap.position.set(side * 0.42, 0.56, 1.38);
+        frunkBay.add(cap);
+
+        const nut = new THREE.Mesh(new THREE.LatheGeometry([
+            new THREE.Vector2(0.001, 0.030),
+            new THREE.Vector2(0.012, 0.030),
+            new THREE.Vector2(0.011, 0.039),
+            new THREE.Vector2(0.001, 0.040)
+        ], 12), mat.anodizedRed);
+        nut.position.set(side * 0.42, 0.56, 1.38);
+        frunkBay.add(nut);
+    });
+
+    frunkBay.add(new THREE.Mesh(buildVariableTube([
+        [-0.44, 0.595, 1.05],
+        [-0.22, 0.612, 1.03],
+        [0.00, 0.618, 1.025],
+        [0.22, 0.612, 1.03],
+        [0.44, 0.595, 1.05]
+    ], [0.014, 0.011], 22, 10, { worldUV: true }), mat.carbon));
+
+    // Bolsa Weekender esculpida en Alcantara, fibra de carbono y asas rojas
+    const duffelGroup = new THREE.Group();
+    const duffelStations = [];
+    for (let i = 0; i <= 8; i++) {
+        const t = i / 8;
+        const x = lerp(-0.245, 0.245, t);
+        const endRound = Math.max(0.08, Math.pow(Math.sin(t * Math.PI), 0.34));
+        const halfZ = 0.145 * endRound;
+        const h = 0.165 * endRound;
+        const pts = [];
+        for (let k = 0; k < 12; k++) {
+            const a = (k / 12) * Math.PI * 2;
+            const cz = Math.cos(a);
+            const sy = Math.sin(a);
+            const pz = 1.48 + cz * halfZ * (1.0 - 0.14 * Math.max(0, sy));
+            const py = 0.252 + (sy * 0.5 + 0.5) * h + 0.010 * (1 - cz * cz) * Math.max(0, sy);
+            pts.push([x, py, pz]);
+        }
+        duffelStations.push(pts);
+    }
+    const duffelMesh = new THREE.Mesh(buildSplineLoft(duffelStations, 24, 18, { closedV: true, worldUV: true }), mat.alcantara);
+    duffelMesh.castShadow = true;
+    duffelGroup.add(duffelMesh);
+
+    [-0.13, 0.13].forEach(bx => {
+        const strapPts = [];
+        for (let k = 0; k < 18; k++) {
+            const a = (k / 18) * Math.PI * 2;
+            const cz = Math.cos(a);
+            const sy = Math.sin(a);
+            strapPts.push([bx, 0.252 + (sy * 0.5 + 0.5) * 0.168, 1.48 + cz * 0.146 * (1.0 - 0.14 * Math.max(0, sy))]);
+        }
+        duffelGroup.add(new THREE.Mesh(buildVariableTube(strapPts, [0.014, 0.0045], 24, 8, { closed: true, worldUV: true }), mat.carbon));
+    });
+
+    duffelGroup.add(new THREE.Mesh(buildVariableTube([
+        [-0.20, 0.416, 1.48], [0, 0.424, 1.48], [0.20, 0.416, 1.48]
+    ], [0.004, 0.003], 12, 8), mat.machinedAlu));
+
+    [-1, 1].forEach(side => {
+        duffelGroup.add(new THREE.Mesh(buildVariableTube([
+            [-0.10, 0.405, 1.48 + side * 0.055],
+            [-0.06, 0.468, 1.48 + side * 0.042],
+            [0.00, 0.482, 1.48 + side * 0.036],
+            [0.06, 0.468, 1.48 + side * 0.042],
+            [0.10, 0.405, 1.48 + side * 0.055]
+        ], 0.0065, 18, 8), mat.seatTrimRed));
+    });
+    frunkBay.add(duffelGroup);
+
+    const frunkLedMat = new THREE.MeshStandardMaterial({
+        color: new THREE.Color('#fff5e6'),
+        emissive: new THREE.Color('#ffeed4'),
+        emissiveIntensity: 0.0,
+        roughness: 0.2,
+        toneMapped: false
+    });
+    frunkBay.add(new THREE.Mesh(buildVariableTube([
+        [-0.22, 0.565, 1.07],
+        [0.00, 0.575, 1.06],
+        [0.22, 0.565, 1.07]
+    ], [0.004, 0.003], 14, 8), frunkLedMat));
+
+    const frunkLight = new THREE.PointLight(0xffedd2, 0.0, 1.35, 2.0);
+    frunkLight.position.set(0, 0.56, 1.38);
+    frunkBay.add(frunkLight);
+
+    const frunkChassisAnchorL = new THREE.Object3D();
+    frunkChassisAnchorL.position.set(0.43, 0.54, 1.44);
+    frunkBay.add(frunkChassisAnchorL);
+
+    const frunkChassisAnchorR = new THREE.Object3D();
+    frunkChassisAnchorR.position.set(-0.43, 0.54, 1.44);
+    frunkBay.add(frunkChassisAnchorR);
+
+    group.add(frunkBay);
+
+    const frunkStrutL = createHydraulicStrut(group, mat, 0.215, 0.220, 0.0085, 0.0042);
+    const frunkStrutR = createHydraulicStrut(group, mat, 0.215, 0.220, 0.0085, 0.0042);
+
+    // D. FAROS EMPOTRADOS CONFORMALES A LA ALETA
+    const buildConformalHeadlights = () => {
+        const almondUV = (a, r) => {
+            const cx = Math.cos(a) * r / 0.88;
+            const cy = Math.sin(a) * r / 1.48;
+            const du = (cx * 0.86 - cy * 0.51) * 0.072;
+            const dv = (cx * 0.51 + cy * 0.86) * 0.112;
+            return [0.850 + du, 0.540 + dv];
+        };
+
+        const bowlGeo = buildParametricSurface(28, 10, (ua, vr) => {
+            const a = ua * Math.PI * 2;
+            const r = lerp(0.02, 0.90, vr);
+            const [fu, fv] = almondUV(a, r);
+            const p = frontEval.evalBase(fu, fv, false);
+            const n = frontEval.evalFlushNormal(fu, fv);
+            const depth = 0.029 * (1.0 - 0.55 * vr * vr);
+            return [p[0] - n.x * depth, p[1] - n.y * depth, p[2] - n.z * depth];
+        }, { closedU: true, flipWinding: true });
+        addMirroredMesh(group, bowlGeo, mat.opticGunmetal, false, true);
+
+        const rimPts = [];
+        for (let i = 0; i < 32; i++) {
+            const a = (i / 32) * Math.PI * 2;
+            const [fu, fv] = almondUV(a, 0.94);
+            const p = frontEval.evalBase(fu, fv, false);
+            const n = frontEval.evalFlushNormal(fu, fv);
+            rimPts.push([p[0] - n.x * 0.002, p[1] - n.y * 0.002, p[2] - n.z * 0.002]);
+        }
+        addMirroredMesh(group, buildVariableTube(rimPts, [0.0048, 0.0042], 40, 8, { closed: true, worldUV: true }), mat.carbon, false, true);
+
+        const shroudGeo = new THREE.LatheGeometry([
+            new THREE.Vector2(0.019, 0.000),
+            new THREE.Vector2(0.024, 0.012),
+            new THREE.Vector2(0.022, 0.026),
+            new THREE.Vector2(0.017, 0.026),
+            new THREE.Vector2(0.015, 0.004)
+        ], 20);
+        shroudGeo.rotateX(Math.PI * 0.5);
+
+        const lensPts = [];
+        for (let i = 0; i <= 8; i++) {
+            const a = (i / 8) * Math.PI * 0.5;
+            lensPts.push(new THREE.Vector2(Math.sin(a) * 0.018, Math.cos(a) * 0.013));
+        }
+        const projGlassGeo = new THREE.LatheGeometry(lensPts, 18);
+        projGlassGeo.rotateX(Math.PI * 0.5);
+
+        [-1, 1].forEach(side => {
+            [
+                almondUV(0.25, 0.36),
+                almondUV(3.40, 0.36)
+            ].forEach(([fu, fv]) => {
+                const p = frontEval.evalBase(fu, fv, false);
+                const n = frontEval.evalFlushNormal(fu, fv);
+                const pod = new THREE.Group();
+                pod.position.set(
+                    side * (p[0] - n.x * 0.020),
+                    p[1] - n.y * 0.020,
+                    p[2] - n.z * 0.020
+                );
+                pod.rotation.set(0.14, side * 0.16, 0);
+                pod.add(new THREE.Mesh(shroudGeo, mat.machinedAlu));
+                const gLens = new THREE.Mesh(projGlassGeo, mat.headlightLens);
+                gLens.position.z = 0.014;
+                pod.add(gLens);
+                pod.add(new THREE.Mesh(buildVariableTube([[0, 0, 0.006], [0, 0, 0.015]], 0.007, 6, 8), mat.ledWhite));
+                group.add(pod);
+            });
+        });
+
+        const drlPrimaryPts = [];
+        for (let i = 0; i <= 16; i++) {
+            const a = lerp(0.15, 3.05, i / 16);
+            const [fu, fv] = almondUV(a, 0.78);
+            const p = frontEval.evalBase(fu, fv, false);
+            const n = frontEval.evalFlushNormal(fu, fv);
+            drlPrimaryPts.push([p[0] - n.x * 0.010, p[1] - n.y * 0.010, p[2] - n.z * 0.010]);
+        }
+        addMirroredMesh(group, buildVariableTube(drlPrimaryPts, t => [0.0042, 0.0036 * (0.7 + 0.4 * Math.sin(t * Math.PI))], 28, 8), mat.ledWhite, false, false);
+
+        const drlAccentPts = [];
+        for (let i = 0; i <= 12; i++) {
+            const a = lerp(-0.35, -2.55, i / 12);
+            const [fu, fv] = almondUV(a, 0.74);
+            const p = frontEval.evalBase(fu, fv, false);
+            const n = frontEval.evalFlushNormal(fu, fv);
+            drlAccentPts.push([p[0] - n.x * 0.012, p[1] - n.y * 0.012, p[2] - n.z * 0.012]);
+        }
+        addMirroredMesh(group, buildVariableTube(drlAccentPts, [0.0032, 0.0028], 20, 8), mat.ledWhite, false, false);
+
+        const coverGeo = buildParametricSurface(28, 8, (ua, vr) => {
+            const a = ua * Math.PI * 2;
+            const r = lerp(0.01, 0.94, vr);
+            const [fu, fv] = almondUV(a, r);
+            const p = frontEval.evalBase(fu, fv, false);
+            const n = frontEval.evalFlushNormal(fu, fv);
+            const lift = 0.0018 * (1.0 - 0.5 * vr * vr);
+            return [p[0] + n.x * lift, p[1] + n.y * lift, p[2] + n.z * lift];
+        }, { closedU: true, flipWinding: true });
+        addMirroredMesh(group, coverGeo, mat.headlightLens, false, false);
+    };
+    buildConformalHeadlights();
+
+    // E. Rejilla Hexagonal, Splitter, Canards, Extractor de Frenos y Emblema
+    const frontGrilleGeo = buildParametricSurface(24, 8, (u, v) => {
+        const s = (u - 0.5) * 2;
+        const x = s * 0.80;
+        const z = 2.24 - 0.30 * s * s;
+        const y = lerp(0.118, 0.258 - 0.032 * s * s, v);
+        return [x, y, z];
+    }, { flipWinding: false });
+    group.add(new THREE.Mesh(frontGrilleGeo, mat.hexMesh));
+
+    const intakeBladeGeo = buildSculptedAirfoil(18, 10, u => ({
+        x: lerp(0.18, 0.82, u),
+        y: lerp(0.180, 0.215, u),
+        z: lerp(2.26, 1.94, u * u),
+        chord: lerp(0.095, 0.072, u),
+        thickness: 0.13,
+        camber: 0.03,
+        pitch: 0.05,
+        roll: -0.08
+    }));
+    addMirroredMesh(group, intakeBladeGeo, mat.carbon);
+
+    const splitterGeo = buildParametricSurface(44, 16, (u, v) => {
+        const s = (u - 0.5) * 2;
+        const absS = Math.abs(s);
+        const x = s * 0.995;
+
+        const leadZ = 2.34 - 0.44 * Math.pow(absS, 1.85);
+        const trailZ = Math.max(1.755, leadZ - lerp(0.24, 0.14, absS));
+
+        const theta = v * Math.PI * 2;
+        const xc = 0.5 * (1 + Math.cos(theta));
+        const sign = Math.sin(theta) >= 0 ? 1 : -1;
+        const halfThick = 0.012 * Math.sqrt(Math.max(0.04, Math.sin(xc * Math.PI)));
+        const wingletLift = Math.pow(smoothstep(0.84, 1.0, absS), 1.85) * 0.115;
+
+        const z = lerp(leadZ, trailZ, xc);
+        const y = 0.112 + wingletLift + sign * halfThick + 0.008 * (1 - absS * absS) * (1 - xc);
+        return [x, y, z];
+    }, { closedV: true, worldUV: true, uvScaleU: 1.8, uvScaleV: 1.8 });
+    const splitterMesh = new THREE.Mesh(splitterGeo, mat.carbon);
+    splitterMesh.castShadow = true;
+    splitterMesh.receiveShadow = true;
+    group.add(splitterMesh);
+
+    const canardGeo = buildSculptedAirfoil(20, 12, u => ({
+        x: lerp(0.89, 1.015, u),
+        y: lerp(0.215, 0.315, Math.pow(u, 1.3)),
+        z: lerp(2.02, 1.78, u),
+        chord: lerp(0.088, 0.048, u),
+        thickness: 0.12,
+        camber: -0.05,
+        pitch: -0.18,
+        roll: 0.36
+    }));
+    addMirroredMesh(group, canardGeo, mat.carbon);
+
+    const brakeVentBackGeo = buildParametricSurface(14, 12, (u, v) => {
+        const z = lerp(0.71, 0.98, u);
+        const y = lerp(0.62, 0.17, v);
+        const cove = Math.sin(v * Math.PI) * 0.045;
+        const x = lerp(0.84, 0.89, u) - cove;
+        return [x, y, z];
+    }, { flipWinding: false });
+    addMirroredMesh(group, brakeVentBackGeo, mat.voidBlack, false, true);
+
+    for (let i = 0; i < 3; i++) {
+        const y0 = 0.25 + i * 0.115;
+        const louverGeo = buildSculptedAirfoil(14, 10, u => ({
+            x: lerp(0.835, 0.945, u),
+            y: y0 + u * 0.022,
+            z: lerp(0.76, 0.93, u),
+            chord: 0.055,
+            thickness: 0.14,
+            camber: 0.02,
+            pitch: 0.16,
+            roll: -0.24
+        }));
+        addMirroredMesh(group, louverGeo, mat.carbon);
+    }
+
+    const crestGeo = buildVariableTube([
+        [0, frontEval.evalHoodCenterY(2.265) - 0.004, 2.265],
+        [0, frontEval.evalHoodCenterY(2.235) + 0.002, 2.235],
+        [0, frontEval.evalHoodCenterY(2.202) + 0.005, 2.202]
+    ], t => [0.017 * (0.45 + 0.55 * Math.sin(t * Math.PI)), 0.0032], 12, 8);
+    group.add(new THREE.Mesh(crestGeo, mat.machinedAlu));
+
+    car.add(group);
+
+    return {
+        frunkPivot,
+        frunkLight,
+        frunkLedMat,
+        updateStruts: (spaceParent) => {
+            frunkStrutL.update(frunkChassisAnchorL, frunkLidAnchorL, spaceParent);
+            frunkStrutR.update(frunkChassisAnchorR, frunkLidAnchorR, spaceParent);
+        }
+    };
+}
+
+/**
+ * 4.3 Puertas Diédricas / Mariposa con Pistones Hidráulicos, Umbral de Carbono y Tomas "C"
+ */
+function buildDoorsAndSideIntakes(car, mat) {
+    const group = new THREE.Group();
+
+    const sillTubGeo = buildSplineLoft([
+        [[0.66, 0.18, -0.76], [0.85, 0.17, -0.76], [0.86, 0.34, -0.76], [0.76, 0.42, -0.76], [0.66, 0.36, -0.76]],
+        [[0.66, 0.18, -0.05], [0.85, 0.17, -0.05], [0.85, 0.34, -0.05], [0.75, 0.41, -0.05], [0.66, 0.35, -0.05]],
+        [[0.66, 0.18, 0.67], [0.86, 0.17, 0.67], [0.86, 0.36, 0.67], [0.76, 0.44, 0.67], [0.66, 0.38, 0.67]]
+    ], 22, 16, { closedV: true, worldUV: true });
+    addMirroredMesh(group, sillTubGeo, mat.carbon, true, true);
+
+    const jambSealGeo = buildVariableTube([
+        [0.845, 0.19, 0.66],
+        [0.845, 0.68, 0.64],
+        [0.720, 0.72, 0.59],
+        [0.515, 1.04, -0.04],
+        [0.460, 1.02, -0.62],
+        [0.860, 0.82, -0.74],
+        [0.855, 0.20, -0.74]
+    ], 0.0085, 36, 8);
+    addMirroredMesh(group, jambSealGeo, mat.voidBlack, false, false);
+
+    const evalDoorOuter = (u, v) => {
+        const z = lerp(-0.78, 0.676, u);
+        const yTop = lerp(0.840, 0.742, smootherstep(0, 1, u));
+        const yBot = lerp(0.160, 0.155, u);
+        const y = lerp(yTop, yBot, v);
+
+        const shoulderX = lerp(0.965, 0.915, smootherstep(0, 1, u));
+        const sillX = lerp(0.880, 0.895, u);
+        const topTuck = -0.055 * Math.pow(smoothstep(0.18, 0.0, v), 1.8);
+        const upperConvex = 0.044 * Math.sin(clamp(v / 0.65, 0, 1) * Math.PI);
+        const rearPull = 1.0 - smootherstep(0.05, 0.88, u);
+        const lowerBand = smoothstep(0.36, 0.72, v) * (1.0 - 0.55 * smoothstep(0.84, 1.0, v));
+        const undercut = -0.105 * rearPull * lowerBand;
+
+        const x = lerp(shoulderX, sillX, v) + topTuck + upperConvex + undercut;
+        return [x, y, z];
+    };
+
+    const doorOuterGeo = buildParametricSurface(42, 26, evalDoorOuter, { worldUV: true, flipWinding: false });
+
+    const doorInnerCardGeo = buildParametricSurface(24, 18, (u, v) => {
+        const p = evalDoorOuter(u, v);
+        const edge = smoothstep(0.0, 0.14, u) * smoothstep(1.0, 0.86, u) * smoothstep(0.0, 0.12, v) * smoothstep(1.0, 0.88, v);
+        const thick = lerp(0.018, 0.058, edge);
+        return [p[0] - thick, p[1], p[2]];
+    }, { worldUV: true, flipWinding: true });
+
+    const armrestGeo = buildVariableTube([
+        [0.852, 0.565, 0.42],
+        [0.842, 0.555, 0.02],
+        [0.838, 0.580, -0.46]
+    ], t => [0.026 * (0.7 + 0.35 * Math.sin(t * Math.PI)), 0.032], 18, 10);
+
+    const pullStrapGeo = buildVariableTube([
+        [0.822, 0.545, 0.18],
+        [0.788, 0.515, 0.14],
+        [0.785, 0.495, 0.07],
+        [0.822, 0.535, 0.05]
+    ], [0.008, 0.003], 14, 8);
+
+    const ambientLedGeo = buildVariableTube([
+        [0.842, 0.625, 0.46],
+        [0.835, 0.620, 0.00],
+        [0.845, 0.650, -0.52]
+    ], [0.0032, 0.0032], 18, 8);
+
+    const doorBladeGeo = buildVariableTube([
+        [0.892, 0.420, 0.56],
+        [0.858, 0.415, 0.08],
+        [0.832, 0.430, -0.40],
+        [0.885, 0.465, -0.74]
+    ], t => [0.011, 0.022 * (0.65 + 0.35 * Math.sin(t * Math.PI))], 28, 10, { worldUV: true });
+
+    const sideGlassGeo = buildParametricSurface(28, 16, (u, v) => {
+        const zTop = lerp(-0.62, -0.02, u);
+        const zBot = lerp(-0.58, 0.60, u);
+        const z = lerp(zTop, zBot, v);
+        const yTop = lerp(1.025, 1.058, Math.sin(u * Math.PI * 0.65 + 0.35));
+        const yBot = lerp(0.835, 0.742, u);
+        const y = lerp(yTop, yBot, v);
+        const xTop = lerp(0.460, 0.522, u);
+        const xBot = lerp(0.895, 0.855, u) - 0.010 * Math.sin(u * Math.PI);
+        const bulge = Math.sin(v * Math.PI) * 0.048;
+        const x = lerp(xTop, xBot, Math.pow(v, 1.08)) + bulge;
+        return [x, y, z];
+    }, { flipWinding: false });
+
+    const bPillarGeo = buildVariableTube([
+        [0.862, 0.806, -0.26],
+        [0.725, 0.935, -0.30],
+        [0.486, 1.046, -0.34]
+    ], [0.009, 0.015], 14, 8);
+
+    const stalkGeo = buildSculptedAirfoil(18, 12, u => ({
+        x: lerp(0.870, 1.035, u),
+        y: lerp(0.755, 0.818, smoothstep(0, 1, u)),
+        z: lerp(0.46, 0.40, u),
+        chord: lerp(0.082, 0.052, u),
+        thickness: 0.22,
+        camber: 0.04,
+        pitch: 0.08,
+        roll: 0.28
+    }));
+
+    const mirrorCapGeo = buildParametricSurface(18, 14, (u, v) => {
+        const theta = lerp(-0.10, Math.PI + 0.10, v);
+        const prof = Math.sin(Math.pow(u, 0.74) * Math.PI);
+        return [
+            lerp(0.985, 1.140, u),
+            0.828 + Math.sin(theta) * 0.036 * prof,
+            0.398 + Math.cos(theta) * 0.064 * prof - u * 0.025
+        ];
+    }, { worldUV: true, flipWinding: false });
+
+    const mirrorBaseGeo = buildParametricSurface(18, 12, (u, v) => {
+        const theta = lerp(Math.PI, Math.PI * 2, v);
+        const prof = Math.sin(Math.pow(u, 0.74) * Math.PI);
+        return [
+            lerp(0.985, 1.140, u),
+            0.828 + Math.sin(theta) * 0.024 * prof,
+            0.398 + Math.cos(theta) * 0.060 * prof - u * 0.025
+        ];
+    }, { worldUV: true, flipWinding: false });
+
+    const mirrorLedGeo = buildVariableTube([
+        [1.045, 0.826, 0.448],
+        [1.105, 0.828, 0.422]
+    ], [0.0022, 0.0022], 8, 8);
+
+    const mirrorFaceGeo = buildParametricSurface(12, 8, (u, v) => {
+        const a = u * Math.PI * 2;
+        return [
+            1.062 + Math.cos(a) * 0.052 * v,
+            0.828 + Math.sin(a) * 0.024 * v,
+            0.342 - 0.006 * Math.cos(a) * v
+        ];
+    }, { flipWinding: true });
+
+    const doorAmbientMat = new THREE.MeshStandardMaterial({
+        color: new THREE.Color('#ff182a'),
+        emissive: new THREE.Color('#ff1426'),
+        emissiveIntensity: 1.65,
+        roughness: 0.2,
+        toneMapped: false
+    });
+
+    const assembleButterflyDoor = (side, partName) => {
+        const pivotPos = new THREE.Vector3(side * 0.82, 0.73, 0.68);
+        const pivot = new THREE.Group();
+        pivot.position.copy(pivotPos);
+        group.add(pivot);
+
+        const content = new THREE.Group();
+        content.position.set(-pivotPos.x, -pivotPos.y, -pivotPos.z);
+        pivot.add(content);
+
+        const addPart = (geo, material, cast = true, recv = true, order = 0) => {
+            const g = side > 0 ? geo : mirrorGeometryX(geo);
+            const m = new THREE.Mesh(g, material);
+            m.castShadow = cast;
+            m.receiveShadow = recv;
+            if (order) m.renderOrder = order;
+            content.add(m);
+            return m;
+        };
+
+        addPart(doorOuterGeo, mat.paint, true, true);
+        addPart(doorInnerCardGeo, mat.carbon, false, true);
+        addPart(armrestGeo, mat.alcantara, false, true);
+        addPart(pullStrapGeo, mat.seatTrimRed, false, false);
+        addPart(ambientLedGeo, doorAmbientMat, false, false);
+        addPart(doorBladeGeo, mat.carbon, true, true);
+        addPart(sideGlassGeo, mat.glass, false, false, 4);
+        addPart(bPillarGeo, mat.voidBlack, false, false);
+        addPart(stalkGeo, mat.carbon, true, true);
+        addPart(mirrorCapGeo, mat.paint, true, true);
+        addPart(mirrorBaseGeo, mat.carbon, true, true);
+        addPart(mirrorLedGeo, mat.ledWhite, false, false);
+        addPart(mirrorFaceGeo, mat.mirrorChrome, false, false);
+
+        const doorStrutAnchor = new THREE.Object3D();
+        doorStrutAnchor.position.set(side * 0.84, 0.44, 0.34);
+        content.add(doorStrutAnchor);
+
+        const chassisStrutAnchor = new THREE.Object3D();
+        chassisStrutAnchor.position.set(side * 0.74, 0.50, 0.62);
+        group.add(chassisStrutAnchor);
+
+        const strut = createHydraulicStrut(group, mat, 0.255, 0.275, 0.0095, 0.0046);
+        const dihedralAxis = new THREE.Vector3(0.62, -0.70 * side, 0.28 * side).normalize();
+
+        tagInteractive(pivot, partName);
+
+        return {
+            pivot,
+            dihedralAxis,
+            maxAngle: 1.06,
+            updateStrut: (spaceParent) => strut.update(chassisStrutAnchor, doorStrutAnchor, spaceParent)
+        };
+    };
+
+    const doorL = assembleButterflyDoor(1, 'doorL');
+    const doorR = assembleButterflyDoor(-1, 'doorR');
+
+    const cabinWelcomeLight = new THREE.PointLight(0xffcf96, 0.0, 1.9, 2.0);
+    cabinWelcomeLight.position.set(0, 0.94, -0.06);
+    group.add(cabinWelcomeLight);
+
+    // Taloneras de carbono y tomas laterales en "C"
+    const skirtGeo = buildParametricSurface(38, 14, (u, v) => {
+        const z = lerp(-0.92, 0.96, u);
+        const theta = v * Math.PI * 2;
+        const xc = 0.5 * (1 + Math.cos(theta));
+        const sign = Math.sin(theta) >= 0 ? 1 : -1;
+
+        const outerX = lerp(0.995, 0.945, u) + 0.024 * Math.pow(1 - u, 3);
+        const innerX = outerX - 0.14;
+        const x = lerp(outerX, innerX, xc);
+
+        const wingletLift = Math.pow(smoothstep(0.16, 0.0, u), 1.85) * 0.155 * (1 - xc);
+        const yBase = 0.116 + 0.018 * xc + wingletLift;
+        const halfThick = 0.012 * Math.sqrt(Math.max(0.05, Math.sin(xc * Math.PI)));
+        return [x, yBase + sign * halfThick, z];
+    }, { closedV: true, worldUV: true, uvScaleU: 1.8, uvScaleV: 1.5 });
+    addMirroredMesh(group, skirtGeo, mat.carbon);
+
+    const cFrameGeo = buildVariableTube([
+        [0.885, 0.852, -0.52],
+        [0.955, 0.818, -0.66],
+        [1.002, 0.675, -0.78],
+        [0.998, 0.460, -0.80],
+        [0.972, 0.275, -0.74],
+        [0.935, 0.175, -0.58]
+    ], t => {
+        const w = 0.024 + 0.018 * Math.sin(t * Math.PI);
+        return [w * 0.68, w * 1.40];
+    }, 36, 12, { worldUV: true });
+    addMirroredMesh(group, cFrameGeo, mat.carbon);
+
+    const radGrilleGeo = buildParametricSurface(12, 12, (u, v) => {
+        const z = lerp(-0.88, -0.72, u);
+        const y = lerp(0.78, 0.22, v);
+        const arc = Math.sin(v * Math.PI);
+        const x = lerp(0.72, 0.86, u) + 0.042 * arc;
+        return [x, y, z];
+    }, { flipWinding: false });
+    addMirroredMesh(group, radGrilleGeo, mat.hexMesh, false, true);
+
+    const sideVaneGeo = buildSculptedAirfoil(14, 10, u => ({
+        x: lerp(0.74, 0.965, u),
+        y: 0.495,
+        z: lerp(-0.84, -0.71, u),
+        chord: 0.12,
+        thickness: 0.12,
+        camber: 0,
+        pitch: 0,
+        roll: 0
+    }));
+    addMirroredMesh(group, sideVaneGeo, mat.carbon);
+
+    car.add(group);
+    return { doorL, doorR, cabinWelcomeLight };
+}
+
+/**
+ * 4.4 Caderas Traseras Musculosas, Arbotantes Voladores y Puente Kamm-Tail
+ */
+function buildRearHaunches(car, mat) {
+    const group = new THREE.Group();
+
+    const TH_REAR = Math.PI + 0.3928;
+    const TH_FRONT = -0.5310;
+    const U_ARCH_0 = 0.22;
+    const U_ARCH_1 = 0.80;
+
+    const evalRear = (u, v) => {
+        const zInner = lerp(-2.26, -0.68, u);
+        const xInner = lerp(0.54, 0.52, u) + 0.04 * Math.sin(u * Math.PI);
+        const yInner = lerp(0.835, 0.975, smootherstep(0, 1, u));
+
+        let zLip, yLip, xLip;
+        if (u < U_ARCH_0) {
+            const k = u / U_ARCH_0;
+            const zRearBot = SPEC.rZ + Math.cos(TH_REAR) * SPEC.rArchR;
+            zLip = lerp(-2.24, zRearBot, k);
+            yLip = lerp(0.365, 0.210, smootherstep(0, 1, k));
+            xLip = lerp(0.915, 1.008, smoothstep(0, 1, k));
+        } else if (u <= U_ARCH_1) {
+            const k = (u - U_ARCH_0) / (U_ARCH_1 - U_ARCH_0);
+            const th = lerp(TH_REAR, TH_FRONT, k);
+            const cosT = Math.cos(th);
+            const sinT = Math.sin(th);
+            zLip = SPEC.rZ + cosT * SPEC.rArchR;
+            yLip = SPEC.rR + sinT * SPEC.rArchR;
+            xLip = 1.028 - 0.028 * Math.pow(Math.abs(cosT), 1.65) - 0.015 * Math.max(0, -sinT);
+        } else {
+            const k = (u - U_ARCH_1) / (1.0 - U_ARCH_1);
+            const zFrontBot = SPEC.rZ + Math.cos(TH_FRONT) * SPEC.rArchR;
+            zLip = lerp(zFrontBot, -0.70, k);
+            yLip = lerp(0.160, 0.165, k);
+            xLip = lerp(1.005, 0.960, smoothstep(0, 1, k));
+        }
+
+        const vNorm = Math.min(v / 0.90, 1.0);
+        const z = lerp(zInner, zLip, smootherstep(0.28, 0.90, vNorm));
+
+        if (v <= 0.68) {
+            const s = v / 0.68;
+            const haunchWave = gauss(z, SPEC.rZ + 0.04, 0.50);
+            const xShoulder = Math.max(xLip, 0.955 + 0.078 * haunchWave);
+            const yShoulder = Math.max(yLip + 0.055, lerp(0.825, 0.875, u)) + 0.052 * haunchWave;
+
+            const x = lerp(xInner, xShoulder, Math.pow(s, 0.90));
+            const crown = 0.042 * Math.sin(s * Math.PI) * (0.45 + 0.55 * haunchWave);
+            const y = lerp(yInner, yShoulder, smootherstep(0, 1, s)) + crown;
+            return [x, y, z];
+        } else if (v <= 0.90) {
+            const st = (v - 0.68) / 0.22;
+            const topP = evalRear(u, 0.68);
+            const bulge = Math.sin(st * Math.PI) * 0.028;
+            const x = lerp(topP[0], xLip, smootherstep(0, 1, st)) + bulge;
+            const y = lerp(topP[1], yLip, Math.pow(st, 1.06));
+            return [x, y, z];
+        } else {
+            const lt = (v - 0.90) / 0.10;
+            const lipP = evalRear(u, 0.90);
+            const rollIn = 0.036 * smootherstep(0, 1, lt);
+            let dzRoll = 0, dyRoll = -0.005 * lt;
+            if (u >= U_ARCH_0 && u <= U_ARCH_1) {
+                const k = (u - U_ARCH_0) / (U_ARCH_1 - U_ARCH_0);
+                const th = lerp(TH_REAR, TH_FRONT, k);
+                dzRoll = -Math.cos(th) * 0.005 * lt;
+                dyRoll = -Math.sin(th) * 0.005 * lt;
+            }
+            return [lipP[0] - rollIn, lipP[1] + dyRoll, lipP[2] + dzRoll];
+        }
+    };
+
+    const rearHaunchGeo = buildParametricSurface(56, 36, (u, v) => evalRear(u, v), {
+        worldUV: true,
+        flipWinding: false
+    });
+    addMirroredMesh(group, rearHaunchGeo, mat.paint, true, true);
+
+    const buttressGeo = buildSplineLoft([
+        [[0.44, 1.052, -0.60], [0.51, 1.015, -0.60], [0.55, 0.960, -0.60], [0.48, 0.968, -0.60]],
+        [[0.52, 0.992, -1.08], [0.61, 0.945, -1.08], [0.65, 0.895, -1.08], [0.56, 0.905, -1.08]],
+        [[0.62, 0.915, -1.62], [0.73, 0.878, -1.62], [0.77, 0.838, -1.62], [0.66, 0.848, -1.62]],
+        [[0.68, 0.848, -2.14], [0.82, 0.828, -2.14], [0.84, 0.805, -2.14], [0.72, 0.808, -2.14]]
+    ], 28, 14, { closedV: true, worldUV: true });
+    addMirroredMesh(group, buttressGeo, mat.paint);
+
+    const tailBridgeGeo = buildParametricSurface(14, 32, (u, v) => {
+        const s = (v - 0.5) * 2;
+        const x = s * 0.94;
+        const sweep = 0.068 * s * s;
+        const z = lerp(-2.28, -2.08, u) + sweep;
+        const lipDrop = -0.042 * Math.pow(smoothstep(0.32, 0.0, u), 1.75);
+        const y = 0.846 - 0.022 * s * s + lipDrop + 0.012 * Math.sin(u * Math.PI);
+        return [x, y, z];
+    }, { worldUV: true, flipWinding: false });
+    const tailBridge = new THREE.Mesh(tailBridgeGeo, mat.paint);
+    tailBridge.castShadow = true;
+    tailBridge.receiveShadow = true;
+    group.add(tailBridge);
+
+    car.add(group);
+}
+
+/**
+ * 4.5 Cabina en Gota, Parabrisas con Frit Cerámico y Techo Doble Burbuja
+ */
+function buildCanopyAndRoof(car, mat) {
+    const group = new THREE.Group();
+
+    const windshieldGeo = buildParametricSurface(32, 28, (u, v) => {
+        const s = (v - 0.5) * 2;
+        const absS = Math.abs(s);
+
+        const halfW = lerp(0.515, 0.725, smoothstep(0, 1, u));
+        const x = s * halfW;
+
+        const wrapBack = lerp(0.11, 0.18, u) * Math.pow(absS, 1.85);
+        const z = lerp(0.02, 0.78, u) - wrapBack;
+
+        const dome = (1 - absS * absS) * lerp(0.042, 0.028, u);
+        const y = lerp(1.088, 0.724, Math.pow(u, 1.08)) + dome;
+        return [x, y, z];
+    }, { flipWinding: false });
+    const wsMesh = new THREE.Mesh(windshieldGeo, mat.glass);
+    wsMesh.renderOrder = 4;
+    group.add(wsMesh);
+
+    const wsFritBotGeo = buildParametricSurface(6, 24, (u, v) => {
+        const s = (v - 0.5) * 2;
+        const absS = Math.abs(s);
+        const uu = lerp(0.92, 1.0, u);
+        const x = s * lerp(0.515, 0.725, smoothstep(0, 1, uu));
+        const z = lerp(0.02, 0.78, uu) - lerp(0.11, 0.18, uu) * Math.pow(absS, 1.85);
+        const y = lerp(1.088, 0.724, Math.pow(uu, 1.08)) + (1 - absS * absS) * lerp(0.042, 0.028, uu) - 0.002;
+        return [x, y, z];
+    }, { flipWinding: false });
+    group.add(new THREE.Mesh(wsFritBotGeo, mat.voidBlack));
+
+    const roofGeo = buildParametricSurface(32, 32, (u, v) => {
+        const s = (v - 0.5) * 2;
+        const absS = Math.abs(s);
+
+        const halfW = lerp(0.455, 0.515, smoothstep(0, 1, u));
+        const x = s * halfW;
+
+        const wrap = 0.105 * Math.pow(absS, 1.8) * (0.45 + 0.55 * u);
+        const z = lerp(-0.66, 0.02, u) - wrap;
+
+        const longArc = Math.sin(lerp(0.14, 0.86, u) * Math.PI);
+        const baseArch = lerp(1.036, 1.088, u) + 0.030 * longArc;
+        const latDrop = -0.046 * Math.pow(absS, 2.0);
+        const bubble = 0.018 * gauss(absS, 0.48, 0.20) * Math.sin(u * Math.PI);
+
+        return [x, baseArch + latDrop + bubble, z];
+    }, { worldUV: true, uvScaleU: 1.0, uvScaleV: 1.0, flipWinding: false });
+    const roofMesh = new THREE.Mesh(roofGeo, mat.carbon);
+    roofMesh.castShadow = true;
+    roofMesh.receiveShadow = true;
+    group.add(roofMesh);
+
+    const scoopGeo = buildSplineLoft([
+        [[0, 1.106, -0.10], [0.085, 1.108, -0.10], [0.072, 1.136, -0.12], [0, 1.145, -0.13], [-0.072, 1.136, -0.12], [-0.085, 1.108, -0.10]],
+        [[0, 1.092, -0.38], [0.095, 1.094, -0.38], [0.068, 1.136, -0.38], [0, 1.144, -0.38], [-0.068, 1.136, -0.38], [-0.095, 1.094, -0.38]],
+        [[0, 1.044, -0.70], [0.078, 1.046, -0.70], [0.044, 1.088, -0.70], [0, 1.096, -0.70], [-0.044, 1.088, -0.70], [-0.078, 1.046, -0.70]],
+        [[0, 0.996, -0.96], [0.052, 0.998, -0.96], [0.026, 1.024, -0.96], [0, 1.030, -0.96], [-0.026, 1.024, -0.96], [-0.052, 0.998, -0.96]]
+    ], 24, 18, { closedV: true, worldUV: true });
+    const scoopMesh = new THREE.Mesh(scoopGeo, mat.carbon);
+    scoopMesh.castShadow = true;
+    group.add(scoopMesh);
+
+    const scoopMouthGeo = buildParametricSurface(8, 10, (u, v) => {
+        const s = (v - 0.5) * 2;
+        return [s * 0.068, lerp(1.110, 1.138 - 0.010 * s * s, u), -0.125 - 0.010 * Math.abs(s)];
+    }, { flipWinding: true });
+    group.add(new THREE.Mesh(scoopMouthGeo, mat.hexMesh));
+
+    const pillarGeo = buildVariableTube([
+        [0.728, 0.725, 0.60],
+        [0.642, 0.900, 0.34],
+        [0.520, 1.052, -0.04],
+        [0.486, 1.064, -0.32],
+        [0.456, 1.026, -0.64]
+    ], t => [0.020, 0.030 * (1 - 0.22 * t)], 36, 12, { worldUV: true });
+    addMirroredMesh(group, pillarGeo, mat.carbon);
+
+    car.add(group);
+}
+
+/**
+ * 4.6 Vano Motor Abierto con V12 Atmosférico a 60°, Colectores Titanio y Mamparo Oro 24K
+ */
+function buildV12EngineBay(car, mat) {
+    const group = new THREE.Group();
+
+    const firewallGeo = buildParametricSurface(14, 16, (u, v) => {
+        const s = (v - 0.5) * 2;
+        return [s * 0.48, lerp(0.32, 0.90, u), -0.78 - 0.03 * s * s];
+    }, { flipWinding: true });
+    group.add(new THREE.Mesh(firewallGeo, mat.goldFoil));
+
+    const blockGeo = buildSplineLoft([
+        [[-0.22, 0.40, -0.88], [0.22, 0.40, -0.88], [0.30, 0.64, -0.88], [0, 0.60, -0.88], [-0.30, 0.64, -0.88]],
+        [[-0.22, 0.40, -1.72], [0.22, 0.40, -1.72], [0.30, 0.64, -1.72], [0, 0.60, -1.72], [-0.30, 0.64, -1.72]]
+    ], 14, 14, { closedV: true });
+    group.add(new THREE.Mesh(blockGeo, mat.matteCarbon));
+
+    [-1, 1].forEach(side => {
+        const vcGeo = buildVariableTube([
+            [side * 0.245, 0.675, -0.92],
+            [side * 0.255, 0.680, -1.30],
+            [side * 0.245, 0.672, -1.68]
+        ], [0.068, 0.042], 20, 12);
+        group.add(new THREE.Mesh(vcGeo, mat.crinkleRed));
+
+        const plenumGeo = buildVariableTube([
+            [side * 0.145, 0.775, -0.92],
+            [side * 0.155, 0.785, -1.30],
+            [side * 0.140, 0.768, -1.66]
+        ], t => [0.056 * (0.85 + 0.20 * Math.sin(t * Math.PI)), 0.042], 20, 12, { worldUV: true });
+        group.add(new THREE.Mesh(plenumGeo, mat.carbon));
+
+        for (let c = 0; c < 6; c++) {
+            const cz = lerp(-0.98, -1.62, c / 5);
+            group.add(new THREE.Mesh(buildVariableTube([
+                [side * 0.16, 0.74, cz],
+                [side * 0.09, 0.71, cz],
+                [side * 0.05, 0.65, cz]
+            ], 0.015, 8, 8), mat.machinedAlu));
+
+            group.add(new THREE.Mesh(buildVariableTube([
+                [side * 0.29, 0.64, cz],
+                [side * 0.37, 0.59, cz - 0.06],
+                [side * 0.34, 0.52, -1.78],
+                [side * 0.16, 0.53, -1.96]
+            ], 0.016, 14, 8), mat.titanium));
+        }
+    });
+
+    const xBraceA = buildVariableTube([
+        [-0.48, 0.904, -0.82],
+        [-0.20, 0.916, -1.06],
+        [0.00, 0.910, -1.28],
+        [0.20, 0.892, -1.50],
+        [0.47, 0.858, -1.76]
+    ], [0.016, 0.010], 24, 10, { worldUV: true });
+    group.add(new THREE.Mesh(xBraceA, mat.carbon));
+    group.add(new THREE.Mesh(mirrorGeometryX(xBraceA), mat.carbon));
+
+    const xHub = new THREE.Mesh(new THREE.LatheGeometry([
+        new THREE.Vector2(0.0, 0.0),
+        new THREE.Vector2(0.034, 0.0),
+        new THREE.Vector2(0.040, 0.008),
+        new THREE.Vector2(0.032, 0.018),
+        new THREE.Vector2(0.0, 0.020)
+    ], 18), mat.machinedAlu);
+    xHub.position.set(0, 0.900, -1.28);
+    group.add(xHub);
+
+    const bayLight = new THREE.PointLight(0xffdca8, 0.95, 1.45, 2.0);
+    bayLight.position.set(0, 0.92, -1.28);
+    group.add(bayLight);
+
+    const engGlassGeo = buildParametricSurface(22, 18, (u, v) => {
+        const s = (v - 0.5) * 2;
+        const z = lerp(-2.10, -0.70, u);
+        const halfW = lerp(0.53, 0.46, u);
+        const y = lerp(0.842, 1.028, smoothstep(0, 1, u)) - 0.022 * s * s;
+        return [s * halfW, y, z];
+    }, { flipWinding: false });
+    const engGlassMesh = new THREE.Mesh(engGlassGeo, mat.engineGlass);
+    engGlassMesh.renderOrder = 3;
+    group.add(engGlassMesh);
+
+    for (let i = 0; i < 6; i++) {
+        const t = i / 5;
+        const z = lerp(-1.00, -1.90, t);
+        const y = lerp(0.988, 0.870, t);
+        const wSpan = lerp(0.42, 0.48, t);
+        const slatGeo = buildSculptedAirfoil(12, 10, u => ({
+            x: lerp(0.24, wSpan, u),
+            y: y - 0.016 * u * u + 0.008,
+            z: z - 0.028 * u,
+            chord: 0.056,
+            thickness: 0.13,
+            camber: 0.02,
+            pitch: 0.24,
+            roll: -0.05
+        }));
+        addMirroredMesh(group, slatGeo, mat.carbon);
+    }
+
+    group.add(new THREE.Mesh(buildVariableTube([
+        [0, 1.024, -0.82],
+        [0, 0.960, -1.36],
+        [0, 0.886, -1.90],
+        [0, 0.850, -2.12]
+    ], t => [0.024 * (1 - 0.30 * t), 0.016], 20, 10, { worldUV: true }), mat.carbon));
+
+    group.add(new THREE.Mesh(buildVariableTube([
+        [0, 1.036, -0.86],
+        [0, 1.002, -1.10]
+    ], [0.0055, 0.004], 10, 8), mat.ledRed));
+
+    car.add(group);
+}
+
+/**
+ * 4.7 Zaga Kamm-Tail, Pilotos OLED 3D Rubí, Cuádruple Escape, Difusor y Alerón Swan-Neck
+ */
+function buildRearFasciaAndAero(car, mat) {
+    const group = new THREE.Group();
+
+    const rearGrilleGeo = buildParametricSurface(12, 28, (u, v) => {
+        const s = (v - 0.5) * 2;
+        const x = s * 0.90;
+        const z = -2.18 + 0.072 * s * s;
+        const y = lerp(0.41, 0.80 - 0.022 * s * s, u);
+        return [x, y, z];
+    }, { flipWinding: false });
+    group.add(new THREE.Mesh(rearGrilleGeo, mat.hexMesh));
+
+    const rearBezelGeo = buildVariableTube([
+        [0.00, 0.806, -2.25],
+        [0.58, 0.798, -2.22],
+        [0.915, 0.762, -2.15],
+        [0.925, 0.560, -2.12],
+        [0.840, 0.395, -2.16],
+        [0.50, 0.386, -2.22],
+        [0.00, 0.394, -2.24]
+    ], [0.016, 0.020], 40, 12, { worldUV: true });
+    addMirroredMesh(group, rearBezelGeo, mat.carbon);
+
+    const tlUpperPts = [
+        [-0.905, 0.678, -2.140],
+        [-0.860, 0.746, -2.172],
+        [-0.620, 0.752, -2.215],
+        [-0.300, 0.746, -2.240],
+        [0.000, 0.744, -2.246],
+        [0.300, 0.746, -2.240],
+        [0.620, 0.752, -2.215],
+        [0.860, 0.746, -2.172],
+        [0.905, 0.678, -2.140]
+    ];
+    group.add(new THREE.Mesh(buildVariableTube(tlUpperPts, [0.0058, 0.0085], 56, 10), mat.ledRed));
+    const tlDiff = new THREE.Mesh(buildVariableTube(tlUpperPts, [0.012, 0.017], 48, 10), mat.rubyLens);
+    tlDiff.renderOrder = 3;
+    group.add(tlDiff);
+
+    const tlLowerGeo = buildVariableTube([
+        [0.52, 0.692, -2.215],
+        [0.82, 0.686, -2.176],
+        [0.89, 0.630, -2.148]
+    ], [0.0048, 0.0068], 20, 8);
+    addMirroredMesh(group, tlLowerGeo, mat.ledRed, false, false);
+
+    const tipProfile = [
+        new THREE.Vector2(0.036, 0.00),
+        new THREE.Vector2(0.043, 0.00),
+        new THREE.Vector2(0.047, 0.14),
+        new THREE.Vector2(0.050, 0.215),
+        new THREE.Vector2(0.047, 0.224),
+        new THREE.Vector2(0.043, 0.220),
+        new THREE.Vector2(0.040, 0.13),
+        new THREE.Vector2(0.001, 0.04)
+    ];
+    const exhaustTipGeo = new THREE.LatheGeometry(tipProfile, 32);
+    exhaustTipGeo.rotateX(-Math.PI * 0.5);
+
+    const bezelPts = [];
+    for (let i = 0; i < 20; i++) {
+        const a = (i / 20) * Math.PI * 2;
+        bezelPts.push([Math.cos(a) * 0.252, 0.535 + Math.sin(a) * 0.068, -2.205]);
+    }
+    group.add(new THREE.Mesh(buildVariableTube(bezelPts, [0.014, 0.018], 32, 10, { closed: true, worldUV: true }), mat.carbon));
+
+    [
+        [-0.172, 0.531, -2.085],
+        [-0.058, 0.537, -2.095],
+        [0.058, 0.537, -2.095],
+        [0.172, 0.531, -2.085]
+    ].forEach(([ex, ey, ez]) => {
+        const tip = new THREE.Mesh(exhaustTipGeo, mat.titanium);
+        tip.position.set(ex, ey, ez);
+        tip.rotation.x = 0.045;
+        tip.castShadow = true;
+        group.add(tip);
+    });
+
+    const diffuserDeckGeo = buildParametricSurface(18, 30, (u, v) => {
+        const s = (v - 0.5) * 2;
+        const x = s * 0.68;
+        const z = lerp(-2.31, -1.56, u) + 0.05 * s * s * (1 - u);
+        const ramp = Math.pow(1 - u, 1.55);
+        const venturiArch = 0.044 * Math.sin(Math.abs(s) * Math.PI) * (1 - u);
+        const y = 0.120 + ramp * 0.248 + venturiArch;
+        return [x, y, z];
+    }, { worldUV: true, uvScaleU: 1.8, uvScaleV: 1.8, flipWinding: false });
+    const diffMesh = new THREE.Mesh(diffuserDeckGeo, mat.carbon);
+    diffMesh.castShadow = true;
+    diffMesh.receiveShadow = true;
+    group.add(diffMesh);
+
+    group.add(new THREE.Mesh(buildVariableTube([
+        [-0.67, 0.360, -2.26],
+        [-0.34, 0.378, -2.31],
+        [0.00, 0.370, -2.32],
+        [0.34, 0.378, -2.31],
+        [0.67, 0.360, -2.26]
+    ], [0.013, 0.015], 28, 10, { worldUV: true }), mat.carbon));
+
+    [0.145, 0.375, 0.605].forEach((sx, idx) => {
+        const strakeH = lerp(0.235, 0.185, idx / 2);
+        const strakeGeo = buildSculptedAirfoil(16, 12, u => ({
+            x: sx + idx * 0.014 * (1 - u),
+            y: lerp(0.124 + idx * 0.008, 0.124 + strakeH + idx * 0.010, u),
+            z: lerp(-1.95, -2.06, u) + idx * 0.022,
+            chord: lerp(0.64 - idx * 0.06, 0.42, u),
+            thickness: 0.048,
+            camber: 0.02,
+            pitch: 0,
+            roll: Math.PI * 0.5
+        }));
+        addMirroredMesh(group, strakeGeo, mat.carbon);
+    });
+
+    group.add(new THREE.Mesh(buildVariableTube([
+        [0, 0.195, -2.275],
+        [0, 0.312, -2.305]
+    ], [0.006, 0.0048], 8, 8), mat.ledRed));
+
+    const wingGeo = buildSculptedAirfoil(48, 22, u => {
+        const s = (u - 0.5) * 2;
+        const absS = Math.abs(s);
+        return {
+            x: s * 0.92,
+            y: 1.062 + 0.032 * Math.pow(absS, 1.7),
+            z: -2.15 - 0.105 * Math.pow(absS, 1.8),
+            chord: lerp(0.30, 0.24, absS * absS),
+            thickness: 0.135,
+            camber: -0.075,
+            pitch: 0.13 + 0.025 * absS,
+            roll: -s * 0.035
+        };
+    });
+    const wingMesh = new THREE.Mesh(wingGeo, mat.carbon);
+    wingMesh.castShadow = true;
+    wingMesh.receiveShadow = true;
+    group.add(wingMesh);
+
+    const epShape = new THREE.Shape();
+    epShape.moveTo(0.14, 0.048);
+    epShape.bezierCurveTo(0.175, 0.018, 0.175, -0.068, 0.088, -0.100);
+    epShape.bezierCurveTo(-0.04, -0.120, -0.165, -0.075, -0.180, 0.012);
+    epShape.bezierCurveTo(-0.180, 0.078, -0.075, 0.112, 0.042, 0.102);
+    epShape.bezierCurveTo(0.10, 0.092, 0.128, 0.068, 0.14, 0.048);
+
+    const epGeo = new THREE.ExtrudeGeometry(epShape, {
+        depth: 0.011,
+        bevelEnabled: true,
+        bevelThickness: 0.0045,
+        bevelSize: 0.004,
+        bevelSegments: 4,
+        curveSegments: 20
+    });
+    epGeo.rotateY(Math.PI * 0.5);
+    epGeo.translate(0.916, 1.094, -2.26);
+    addMirroredMesh(group, epGeo, mat.carbon);
+
+    addMirroredMesh(group, buildVariableTube([
+        [0.930, 1.028, -2.14],
+        [0.930, 0.996, -2.26],
+        [0.930, 1.018, -2.38]
+    ], [0.003, 0.0038], 14, 8), mat.anodizedRed, false, false);
+
+    const swanNeckGeo = buildVariableTube([
+        [0.24, 0.842, -1.98],
+        [0.25, 0.946, -2.03],
+        [0.255, 1.076, -2.01],
+        [0.26, 1.122, -2.09],
+        [0.26, 1.084, -2.16]
+    ], t => [0.011, 0.034 * (1.15 - 0.35 * t)], 30, 12);
+    addMirroredMesh(group, swanNeckGeo, mat.machinedAlu);
+
+    addMirroredMesh(group, buildVariableTube([
+        [0.26, 1.082, -2.13],
+        [0.26, 1.068, -2.23]
+    ], [0.014, 0.007], 8, 8), mat.carbon);
+
+    car.add(group);
+}
+
+/**
+ * 4.8 Ruedas Forjadas Cóncavas 20"/21", Dirección Ackermann y Frenos Carbono-Cerámicos
+ */
+function buildWheelsAndBrakes(wheelsParent, mat) {
+    const wheelRig = {
+        frontLeft: null,
+        frontRight: null,
+        rearLeft: null,
+        rearRight: null
+    };
+
+    const createWheelCorner = (radius, width, isFront, isLeft) => {
+        const cornerRoot = new THREE.Group();
+        const knuckleGroup = new THREE.Group();
+        const spinHub = new THREE.Group();
+        cornerRoot.add(knuckleGroup);
+        knuckleGroup.add(spinHub);
+
+        const sideSign = isLeft ? 1 : -1;
+        const rimR = radius * 0.768;
+        const halfW = width * 0.5;
+
+        const tireSpline = new THREE.SplineCurve([
+            new THREE.Vector2(rimR - 0.005, -halfW * 0.88),
+            new THREE.Vector2(rimR + 0.012, -halfW * 0.94),
+            new THREE.Vector2(rimR + 0.038, -halfW * 1.01),
+            new THREE.Vector2(radius - 0.020, -halfW * 0.99),
+            new THREE.Vector2(radius - 0.007, -halfW * 0.90),
+            new THREE.Vector2(radius - 0.002, -halfW * 0.75),
+            new THREE.Vector2(radius, -halfW * 0.42),
+            new THREE.Vector2(radius + 0.002, 0),
+            new THREE.Vector2(radius, halfW * 0.42),
+            new THREE.Vector2(radius - 0.002, halfW * 0.75),
+            new THREE.Vector2(radius - 0.007, halfW * 0.90),
+            new THREE.Vector2(radius - 0.020, halfW * 0.99),
+            new THREE.Vector2(rimR + 0.038, halfW * 1.01),
+            new THREE.Vector2(rimR + 0.012, halfW * 0.95),
+            new THREE.Vector2(rimR - 0.005, halfW * 0.88)
+        ]);
+        const tireGeo = new THREE.LatheGeometry(tireSpline.getPoints(30), 48);
+        tireGeo.rotateZ(isLeft ? -Math.PI * 0.5 : Math.PI * 0.5);
+        const tireMesh = new THREE.Mesh(tireGeo, mat.tire);
+        tireMesh.castShadow = true;
+        tireMesh.receiveShadow = true;
+        spinHub.add(tireMesh);
+
+        const barrelGeo = new THREE.LatheGeometry([
+            new THREE.Vector2(rimR - 0.004, -halfW * 0.88),
+            new THREE.Vector2(rimR - 0.018, -halfW * 0.80),
+            new THREE.Vector2(rimR - 0.024, -halfW * 0.22),
+            new THREE.Vector2(rimR - 0.020, halfW * 0.54),
+            new THREE.Vector2(rimR - 0.006, halfW * 0.84),
+            new THREE.Vector2(rimR + 0.004, halfW * 0.89),
+            new THREE.Vector2(rimR - 0.004, halfW * 0.91),
+            new THREE.Vector2(rimR - 0.016, halfW * 0.86),
+            new THREE.Vector2(rimR - 0.032, halfW * 0.58),
+            new THREE.Vector2(rimR - 0.032, -halfW * 0.80)
+        ], 44);
+        barrelGeo.rotateZ(isLeft ? -Math.PI * 0.5 : Math.PI * 0.5);
+        const barrelMesh = new THREE.Mesh(barrelGeo, mat.wheelAlloy);
+        barrelMesh.castShadow = true;
+        spinHub.add(barrelMesh);
+
+        const hubOutX = sideSign * (isFront ? halfW * 0.22 : halfW * 0.10);
+        const rimOutX = sideSign * (halfW * 0.78);
+        const midDishX = sideSign * (isFront ? halfW * 0.44 : halfW * 0.28);
+
+        // 10 radios en Y forjados cóncavos
+        for (let i = 0; i < 5; i++) {
+            const baseA = (i / 5) * Math.PI * 2;
+            const split = 0.285;
+
+            [-1, 1].forEach(fork => {
+                const a0 = baseA + fork * 0.070;
+                const a1 = baseA + fork * 0.138;
+                const a2 = baseA + fork * split;
+                const r0 = 0.056;
+                const r1 = rimR * 0.46;
+                const r2 = rimR * 0.955;
+
+                const spokeGeo = buildVariableTube([
+                    [hubOutX, Math.sin(a0) * r0, Math.cos(a0) * r0],
+                    [midDishX, Math.sin(a1) * r1, Math.cos(a1) * r1],
+                    [lerp(midDishX, rimOutX, 0.65), Math.sin(lerp(a1, a2, 0.62)) * (rimR * 0.74), Math.cos(lerp(a1, a2, 0.62)) * (rimR * 0.74)],
+                    [rimOutX, Math.sin(a2) * r2, Math.cos(a2) * r2]
+                ], t => {
+                    const th = lerp(0.0135, 0.0082, t);
+                    return [th * 1.42, th * 0.76];
+                }, 14, 8);
+                const sMesh = new THREE.Mesh(spokeGeo, mat.wheelAlloy);
+                sMesh.castShadow = true;
+                spinHub.add(sMesh);
+
+                spinHub.add(new THREE.Mesh(buildVariableTube([
+                    [hubOutX + sideSign * 0.009, Math.sin(a0) * (r0 + 0.01), Math.cos(a0) * (r0 + 0.01)],
+                    [midDishX + sideSign * 0.008, Math.sin(a1) * r1, Math.cos(a1) * r1],
+                    [rimOutX + sideSign * 0.005, Math.sin(a2) * (r2 - 0.008), Math.cos(a2) * (r2 - 0.008)]
+                ], [0.0036, 0.0024], 12, 6), mat.machinedAlu));
+            });
+        }
+
+        // Válvula de aire metálica
+        spinHub.add(new THREE.Mesh(buildVariableTube([
+            [sideSign * (halfW * 0.72), rimR - 0.020, 0],
+            [sideSign * (halfW * 0.74), rimR - 0.042, 0]
+        ], 0.003, 6, 6), mat.machinedAlu));
+
+        // Campana central y monotuerca anodizada roja
+        const hubBellGeo = new THREE.LatheGeometry([
+            new THREE.Vector2(0.0, halfW * 0.02),
+            new THREE.Vector2(0.068, halfW * 0.06),
+            new THREE.Vector2(0.064, halfW * 0.25),
+            new THREE.Vector2(0.048, halfW * 0.30),
+            new THREE.Vector2(0.0, halfW * 0.30)
+        ], 24);
+        hubBellGeo.rotateZ(isLeft ? -Math.PI * 0.5 : Math.PI * 0.5);
+        spinHub.add(new THREE.Mesh(hubBellGeo, mat.wheelAlloy));
+
+        const nutShape = new THREE.Shape();
+        for (let i = 0; i <= 20; i++) {
+            const a = (i / 20) * Math.PI * 2;
+            const r = i % 2 === 0 ? 0.042 : 0.034;
+            if (i === 0) nutShape.moveTo(Math.cos(a) * r, Math.sin(a) * r);
+            else nutShape.lineTo(Math.cos(a) * r, Math.sin(a) * r);
+        }
+        const nutGeo = new THREE.ExtrudeGeometry(nutShape, {
+            depth: 0.019,
+            bevelEnabled: true,
+            bevelThickness: 0.0045,
+            bevelSize: 0.0038,
+            bevelSegments: 3
+        });
+        nutGeo.rotateY(isLeft ? Math.PI * 0.5 : -Math.PI * 0.5);
+        nutGeo.translate(sideSign * (halfW * 0.26), 0, 0);
+        spinHub.add(new THREE.Mesh(nutGeo, mat.anodizedRed));
+
+        const pinGeo = new THREE.LatheGeometry([
+            new THREE.Vector2(0, 0),
+            new THREE.Vector2(0.018, 0),
+            new THREE.Vector2(0.016, 0.011),
+            new THREE.Vector2(0.009, 0.016),
+            new THREE.Vector2(0, 0.017)
+        ], 16);
+        pinGeo.rotateZ(isLeft ? -Math.PI * 0.5 : Math.PI * 0.5);
+        pinGeo.translate(sideSign * (halfW * 0.33), 0, 0);
+        spinHub.add(new THREE.Mesh(pinGeo, mat.machinedAlu));
+
+        // Disco carbono-cerámico perforado (gira con spinHub)
+        const rotorR = isFront ? 0.204 : 0.194;
+        const rotorX = 0.0;
+
+        const makeRotorFace = (offsetX, flip) => {
+            const g = buildParametricSurface(36, 4, (u, v) => {
+                const a = u * Math.PI * 2;
+                const r = lerp(rotorR * 0.50, rotorR, v);
+                return [rotorX + offsetX, Math.sin(a) * r, Math.cos(a) * r];
+            }, { flipWinding: flip });
+            const pos = g.attributes.position;
+            const uv = g.attributes.uv;
+            for (let i = 0; i < pos.count; i++) {
+                uv.setXY(i, 0.5 + pos.getZ(i) / (rotorR * 2), 0.5 + pos.getY(i) / (rotorR * 2));
+            }
+            uv.needsUpdate = true;
+            return g;
+        };
+        spinHub.add(new THREE.Mesh(makeRotorFace(sideSign * 0.015, !isLeft), mat.ceramicRotor));
+        spinHub.add(new THREE.Mesh(makeRotorFace(-sideSign * 0.015, isLeft), mat.ceramicRotor));
+
+        spinHub.add(new THREE.Mesh(buildParametricSurface(36, 4, (u, v) => {
+            const a = u * Math.PI * 2;
+            const r = rotorR - 0.002 * Math.sin(v * Math.PI);
+            return [rotorX + lerp(-0.015, 0.015, v), Math.sin(a) * r, Math.cos(a) * r];
+        }, { closedU: true }), mat.matteCarbon));
+
+        const hatGeo = new THREE.LatheGeometry([
+            new THREE.Vector2(0.055, -0.020),
+            new THREE.Vector2(rotorR * 0.52, -0.016),
+            new THREE.Vector2(rotorR * 0.52, 0.016),
+            new THREE.Vector2(rotorR * 0.45, 0.025),
+            new THREE.Vector2(0.055, 0.025)
+        ], 24);
+        hatGeo.rotateZ(isLeft ? -Math.PI * 0.5 : Math.PI * 0.5);
+        hatGeo.translate(rotorX, 0, 0);
+        spinHub.add(new THREE.Mesh(hatGeo, mat.matteCarbon));
+
+        for (let b = 0; b < 10; b++) {
+            const ba = (b / 10) * Math.PI * 2;
+            const br = rotorR * 0.51;
+            spinHub.add(new THREE.Mesh(buildVariableTube([
+                [rotorX + sideSign * 0.009, Math.sin(ba) * br, Math.cos(ba) * br],
+                [rotorX + sideSign * 0.022, Math.sin(ba) * br, Math.cos(ba) * br]
+            ], 0.0065, 5, 6), mat.machinedAlu));
+        }
+
+        // Mangueta y pinza Giallo Modena de 6 pistones (estacionaria al rodar, gira con dirección)
+        const uprightGeo = new THREE.LatheGeometry([
+            new THREE.Vector2(0.032, -halfW * 0.65),
+            new THREE.Vector2(0.060, -halfW * 0.35),
+            new THREE.Vector2(0.055, -halfW * 0.12),
+            new THREE.Vector2(0.030, -halfW * 0.10)
+        ], 16);
+        uprightGeo.rotateZ(isLeft ? -Math.PI * 0.5 : Math.PI * 0.5);
+        knuckleGroup.add(new THREE.Mesh(uprightGeo, mat.matteCarbon));
+
+        const calCenterA = isFront ? Math.PI : 0;
+        const calSpan = isFront ? 1.08 : 0.90;
+        const calInR = rotorR * 0.63;
+        const calOutR = rotorR + 0.035;
+
+        const calShape = new THREE.Shape();
+        const segs = 16;
+        for (let i = 0; i <= segs; i++) {
+            const a = calCenterA - calSpan * 0.5 + (i / segs) * calSpan;
+            const r = calOutR + 0.006 * Math.sin((i / segs) * Math.PI);
+            if (i === 0) calShape.moveTo(Math.cos(a) * r, Math.sin(a) * r);
+            else calShape.lineTo(Math.cos(a) * r, Math.sin(a) * r);
+        }
+        for (let i = segs; i >= 0; i--) {
+            const a = calCenterA - calSpan * 0.5 + (i / segs) * calSpan;
+            calShape.lineTo(Math.cos(a) * calInR, Math.sin(a) * calInR);
+        }
+        calShape.closePath();
+
+        const calGeo = new THREE.ExtrudeGeometry(calShape, {
+            depth: 0.066,
+            bevelEnabled: true,
+            bevelThickness: 0.015,
+            bevelSize: 0.011,
+            bevelSegments: 4,
+            curveSegments: 16
+        });
+        calGeo.translate(0, 0, -0.033);
+        calGeo.rotateY(Math.PI * 0.5);
+        calGeo.translate(rotorX + sideSign * 0.006, 0, 0);
+        const calMesh = new THREE.Mesh(calGeo, mat.caliperGold);
+        calMesh.castShadow = true;
+        knuckleGroup.add(calMesh);
+
+        const pistons = isFront ? [-1, 0, 1] : [-0.65, 0.65];
+        pistons.forEach(p => {
+            const pa = calCenterA + p * 0.24;
+            const pr = (calInR + calOutR) * 0.52;
+            knuckleGroup.add(new THREE.Mesh(buildVariableTube([
+                [rotorX + sideSign * 0.042, Math.sin(pa) * pr, Math.cos(pa) * pr],
+                [rotorX + sideSign * 0.052, Math.sin(pa) * pr, Math.cos(pa) * pr]
+            ], 0.007, 5, 6), mat.machinedAlu));
+        });
+
+        tagInteractive(cornerRoot, 'wheels');
+        return { cornerRoot, knuckleGroup, spinHub, radius };
+    };
+
+    [
+        { key: 'frontLeft', x: SPEC.fTrack, y: SPEC.fR, z: SPEC.fZ, r: SPEC.fR, w: SPEC.fW, front: true, left: true },
+        { key: 'frontRight', x: -SPEC.fTrack, y: SPEC.fR, z: SPEC.fZ, r: SPEC.fR, w: SPEC.fW, front: true, left: false },
+        { key: 'rearLeft', x: SPEC.rTrack, y: SPEC.rR, z: SPEC.rZ, r: SPEC.rR, w: SPEC.rW, front: false, left: true },
+        { key: 'rearRight', x: -SPEC.rTrack, y: SPEC.rR, z: SPEC.rZ, r: SPEC.rR, w: SPEC.rW, front: false, left: false }
+    ].forEach(c => {
+        const rig = createWheelCorner(c.r, c.w, c.front, c.left);
+        rig.cornerRoot.position.set(c.x, c.y, c.z);
+        wheelsParent.add(rig.cornerRoot);
+        wheelRig[c.key] = rig;
+    });
+
+    return wheelRig;
+}
+
+/**
+ * 4.9 Habitáculo Interior con Volante Sincronizado a la Dirección
+ */
+function buildInteriorCockpit(car, mat) {
+    const group = new THREE.Group();
+
+    group.add(new THREE.Mesh(buildParametricSurface(16, 12, (u, v) => {
+        const s = (v - 0.5) * 2;
+        return [s * 0.70, 0.18 + Math.pow(Math.abs(s), 4) * 0.52, lerp(-0.68, 0.78, u)];
+    }), mat.matteCarbon));
+
+    group.add(new THREE.Mesh(buildParametricSurface(20, 14, (u, v) => {
+        const s = (v - 0.5) * 2;
+        const x = s * 0.70;
+        const z = lerp(0.32, 0.76, u) - 0.09 * s * s;
+        const binnacle = 0.080 * gauss(s, 0.44, 0.22) * Math.sin(u * Math.PI);
+        const y = lerp(0.61, 0.70, u) + Math.sin(u * Math.PI) * 0.058 + binnacle - 0.025 * s * s;
+        return [x, y, z];
+    }, { flipWinding: false }), mat.alcantara));
+
+    group.add(new THREE.Mesh(buildParametricSurface(8, 12, (u, v) => {
+        const s = (v - 0.5) * 2;
+        return [0.30 + s * 0.130, lerp(0.665, 0.752, u), 0.435 + 0.022 * s * s - 0.02 * u];
+    }, { flipWinding: false }), mat.clusterOLED));
+
+    group.add(new THREE.Mesh(buildSplineLoft([
+        [[-0.075, 0.57, 0.38], [0.075, 0.57, 0.38], [0.085, 0.49, 0.38], [-0.085, 0.49, 0.38]],
+        [[-0.070, 0.46, 0.04], [0.070, 0.46, 0.04], [0.090, 0.33, 0.04], [-0.090, 0.33, 0.04]],
+        [[-0.075, 0.43, -0.52], [0.075, 0.43, -0.52], [0.095, 0.23, -0.52], [-0.095, 0.23, -0.52]]
+    ], 16, 10, { closedV: true, worldUV: true }), mat.carbon));
+
+    for (let i = 0; i < 4; i++) {
+        const swZ = lerp(0.22, 0.02, i / 3);
+        const swY = lerp(0.53, 0.47, i / 3);
+        group.add(new THREE.Mesh(buildVariableTube([
+            [0, swY, swZ],
+            [0, swY + 0.020, swZ + 0.008]
+        ], 0.005, 5, 6), mat.machinedAlu));
+    }
+
+    const makeBucketSeat = (cx) => {
+        const sg = new THREE.Group();
+        sg.add(new THREE.Mesh(buildParametricSurface(22, 16, (u, v) => {
+            const s = (v - 0.5) * 2;
+            const absS = Math.abs(s);
+            const halfW = 0.205 + 0.042 * gauss(u, 0.72, 0.16) - 0.090 * smoothstep(0.82, 1.0, u);
+            const bolster = Math.pow(absS, 2.2) * (0.090 * (1 - 0.55 * smoothstep(0.82, 1.0, u)));
+            let y, z;
+            if (u < 0.36) {
+                const k = u / 0.36;
+                z = lerp(0.22, -0.14, k);
+                y = lerp(0.32, 0.24, k) + bolster * 0.85;
+            } else {
+                const k = (u - 0.36) / 0.64;
+                z = lerp(-0.14, -0.50, k) + bolster;
+                y = lerp(0.24, 0.94, k);
+            }
+            return [cx + s * halfW, y, z];
+        }, { flipWinding: false }), mat.alcantara));
+
+        sg.add(new THREE.Mesh(buildParametricSurface(18, 14, (u, v) => {
+            const s = (v - 0.5) * 2;
+            const absS = Math.abs(s);
+            const halfW = 0.215 + 0.042 * gauss(u, 0.72, 0.16) - 0.090 * smoothstep(0.82, 1.0, u);
+            const bolster = Math.pow(absS, 2.2) * (0.090 * (1 - 0.55 * smoothstep(0.82, 1.0, u)));
+            return [cx + s * halfW, lerp(0.23, 0.94, u), lerp(-0.15, -0.53, u) + bolster - 0.024];
+        }, { worldUV: true, flipWinding: true }), mat.carbon));
+
+        [-1, 1].forEach(side => {
+            sg.add(new THREE.Mesh(buildVariableTube([
+                [cx + side * 0.19, 0.42, -0.18],
+                [cx + side * 0.23, 0.72, -0.32],
+                [cx + side * 0.13, 0.93, -0.47]
+            ], 0.0045, 14, 8), mat.seatTrimRed));
+        });
+        return sg;
+    };
+    group.add(makeBucketSeat(0.30));
+    group.add(makeBucketSeat(-0.30));
+
+    // Columna de dirección, levas fijas y volante en "D" rotatorio
+    const wg = new THREE.Group();
+    wg.position.set(0.30, 0.676, 0.215);
+    wg.rotation.x = 0.26;
+
+    [-1, 1].forEach(side => {
+        wg.add(new THREE.Mesh(buildVariableTube([
+            [side * 0.054, 0.01, -0.046],
+            [side * 0.102, 0.044, -0.040],
+            [side * 0.112, 0.092, -0.034]
+        ], [0.015, 0.004], 12, 8), mat.machinedAlu));
+    });
+
+    const steeringWheelSpin = new THREE.Group();
+    wg.add(steeringWheelSpin);
+
+    const rimPts = [];
+    for (let i = 0; i < 24; i++) {
+        const a = (i / 24) * Math.PI * 2;
+        const rx = Math.cos(a) * 0.152;
+        let ry = Math.sin(a) * 0.146;
+        if (ry < -0.108) ry = -0.108 - (ry + 0.108) * 0.25;
+        rimPts.push([rx, ry, 0]);
+    }
+    steeringWheelSpin.add(new THREE.Mesh(buildVariableTube(rimPts, t => {
+        const grip = 1 + 0.22 * Math.pow(Math.cos(t * Math.PI * 2), 4);
+        return [0.0145 * grip, 0.0165 * grip];
+    }, 36, 10, { closed: true }), mat.alcantara));
+
+    steeringWheelSpin.add(new THREE.Mesh(buildVariableTube([
+        [-0.013, 0.146, 0], [0, 0.147, 0], [0.013, 0.146, 0]
+    ], 0.0168, 8, 10), mat.anodizedRed));
+
+    [
+        [[-0.134, 0.01, -0.005], [-0.04, 0, -0.02], [0, 0, -0.024]],
+        [[0.134, 0.01, -0.005], [0.04, 0, -0.02], [0, 0, -0.024]],
+        [[0, -0.108, -0.005], [0, -0.05, -0.02], [0, 0, -0.024]]
+    ].forEach(pts => {
+        steeringWheelSpin.add(new THREE.Mesh(buildVariableTube(pts, [0.013, 0.0075], 10, 8, { worldUV: true }), mat.carbon));
+    });
+    steeringWheelSpin.add(new THREE.Mesh(buildVariableTube([[0, 0, -0.012], [0, 0, -0.046]], [0.044, 0.040], 8, 12), mat.carbon));
+
+    group.add(wg);
+    car.add(group);
+
+    return { steeringWheelSpin };
+}
+
+/**
+ * 4.10 Sombra Radial Multicapa en el Suelo
+ */
+function buildSeamlessContactShadow(scene, mat) {
+    const shadowGeo = buildParametricSurface(2, 2, (u, v) => [
+        lerp(-1.90, 1.90, v),
+        0.001,
+        lerp(-3.15, 3.15, u)
+    ], { flipWinding: false });
+
+    const shadowMesh = new THREE.Mesh(shadowGeo, mat.contactShadow);
+    shadowMesh.renderOrder = -1;
+    scene.add(shadowMesh);
+}
+
+// ============================================================================
+// 5. MOTOR DE RENDERIZADO MOBILE-SAFE, CÁMARA TELEOBJETIVO Y BUCLE PRINCIPAL
+// ============================================================================
+
+function initHypercarStudio() {
+    try {
+        const renderer = new THREE.WebGLRenderer({
+            antialias: true,
+            powerPreference: 'high-performance',
+            stencil: false
+        });
+        const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+        renderer.setPixelRatio(pixelRatio);
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.08;
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color('#050507');
+        scene.environment = createAutomotiveStudioEnv(renderer);
+
+        const aspect = window.innerWidth / Math.max(window.innerHeight, 1);
+        const camera = new THREE.PerspectiveCamera(36, aspect, 0.1, 60);
+
+        const computeHeroDistanceScale = (asp) => {
+            if (asp < 1.0) {
+                return clamp(1.18 / Math.max(asp, 0.44), 1.0, 2.20);
+            }
+            return clamp(1.55 / Math.max(asp, 1.0), 0.92, 1.15);
+        };
+        const distScale = computeHeroDistanceScale(aspect);
+        camera.position.set(
+            3.75 * distScale,
+            1.22 * lerp(1.0, distScale, 0.30),
+            4.25 * distScale
+        );
+
+        // Iluminación de estudio equilibrada con mapa de sombras 1024x1024
+        const keyLight = new THREE.DirectionalLight('#fff8f0', 1.55);
+        keyLight.position.set(4.8, 7.2, 5.2);
+        keyLight.castShadow = true;
+        keyLight.shadow.mapSize.set(1024, 1024);
+        keyLight.shadow.camera.near = 1.0;
+        keyLight.shadow.camera.far = 18.0;
+        const sc = 3.2;
+        keyLight.shadow.camera.left = -sc;
+        keyLight.shadow.camera.right = sc;
+        keyLight.shadow.camera.top = sc;
+        keyLight.shadow.camera.bottom = -sc;
+        keyLight.shadow.bias = -0.0005;
+        keyLight.shadow.normalBias = 0.018;
+        scene.add(keyLight);
+
+        const rimLight = new THREE.DirectionalLight('#cfe2ff', 0.90);
+        rimLight.position.set(-5.2, 3.4, -5.6);
+        scene.add(rimLight);
+
+        const lowFill = new THREE.DirectionalLight('#dce6f5', 0.55);
+        lowFill.position.set(5.8, 0.85, 1.6);
+        scene.add(lowFill);
+
+        const lowFillRear = new THREE.DirectionalLight('#cbd9f0', 0.42);
+        lowFillRear.position.set(-4.5, 0.85, -3.8);
+        scene.add(lowFillRear);
+
+        const hemiLight = new THREE.HemisphereLight('#5a657d', '#1c1920', 0.52);
+        scene.add(hemiLight);
+
+        const textures = createProceduralTextures(renderer.capabilities.getMaxAnisotropy());
+        const materials = createMaterials(textures);
+
+        const hypercar = new THREE.Group();
+        const bodyGroup = new THREE.Group();
+        const wheelsGroup = new THREE.Group();
+        hypercar.add(bodyGroup);
+        hypercar.add(wheelsGroup);
+
+        buildChassisAndWheelWells(bodyGroup, materials);
+        const frunkRig = buildFrontClipAndAero(bodyGroup, materials);
+        const doorsRig = buildDoorsAndSideIntakes(bodyGroup, materials);
+        buildRearHaunches(bodyGroup, materials);
+        buildCanopyAndRoof(bodyGroup, materials);
+        buildV12EngineBay(bodyGroup, materials);
+        buildRearFasciaAndAero(bodyGroup, materials);
+        const cockpitRig = buildInteriorCockpit(bodyGroup, materials);
+        const wheelRig = buildWheelsAndBrakes(wheelsGroup, materials);
+        scene.add(hypercar);
+
+        buildSeamlessContactShadow(scene, materials);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.target.set(0, 0.45, 0.0);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.enablePan = false;
+        controls.minDistance = 2.6;
+        controls.maxDistance = 12.5;
+        controls.minPolarAngle = 0.14;
+        controls.maxPolarAngle = Math.PI * 0.5 - 0.035;
+        controls.update();
+
+        // Post-procesado estándar (SIN HalfFloatType/MSAA custom) con fallback seguro
+        let composer = null;
+        let bloomPass = null;
+        let useComposer = false;
+        try {
+            composer = new EffectComposer(renderer);
+            composer.setPixelRatio(pixelRatio);
+            composer.setSize(window.innerWidth, window.innerHeight);
+            composer.addPass(new RenderPass(scene, camera));
+            bloomPass = new UnrealBloomPass(
+                new THREE.Vector2(window.innerWidth, window.innerHeight),
+                0.20,
+                0.35,
+                1.55
+            );
+            composer.addPass(bloomPass);
+            composer.addPass(new OutputPass());
+            useComposer = true;
+        } catch (postErr) {
+            console.warn('Post-procesado desactivado, usando renderizado directo:', postErr);
+            useComposer = false;
+        }
+
+        // MOTOR DE ANIMACIÓN MECÁNICA HIDRÁULICA, ACKERMANN Y COREOGRAFÍA FLUIDA
+        const anim = {
+            autoMode: true,
+            autoClock: 0,
+            manualWheelDrive: false,
+            manualWheelTime: 0,
+
+            doorL: { value: 0, target: 0, vel: 0 },
+            doorR: { value: 0, target: 0, vel: 0 },
+            frunk: { value: 0, target: 0, vel: 0 },
+
+            wheelSpeed: 0,
+            targetSpeed: 0,
+            steerAngle: 0,
+            targetSteer: 0,
+            frontSpin: 0,
+            rearSpin: 0,
+            pitch: 0,
+            roll: 0,
+            heave: 0,
+
+            pulseTime: -1,
+            prevDoorLTarget: 0,
+            prevDoorRTarget: 0,
+            prevFrunkTarget: 0
+        };
+
+        const triggerOpticalPulse = () => {
+            anim.pulseTime = 0;
+        };
+
+        const stepHydraulic = (state, dt, maxSpeed = 0.56) => {
+            const diff = state.target - state.value;
+            const dist = Math.abs(diff);
+            const cushion = smootherstep(0.0, 0.24, dist);
+            const rateLimit = lerp(0.10, maxSpeed, cushion);
+            const desiredVel = clamp(diff * 2.8, -rateLimit, rateLimit);
+            state.vel = lerp(state.vel, desiredVel, clamp(dt * 6.5, 0, 1));
+            state.value = clamp(state.value + state.vel * dt, 0, 1);
+            if (dist < 0.0006 && Math.abs(state.vel) < 0.0015) {
+                state.value = state.target;
+                state.vel = 0;
+            }
+            return state.value;
+        };
+
+        // INTERACCIÓN DIRECTA POR TOQUE / CLIC SIN SELECTORES UI
+        const raycaster = new THREE.Raycaster();
+        const pointerNDC = new THREE.Vector2();
+        let downX = 0, downY = 0, downTime = 0, lastEmptyTapTime = 0;
+
+        renderer.domElement.addEventListener('pointerdown', (e) => {
+            downX = e.clientX;
+            downY = e.clientY;
+            downTime = performance.now();
+        });
+
+        renderer.domElement.addEventListener('pointerup', (e) => {
+            const dx = e.clientX - downX;
+            const dy = e.clientY - downY;
+            const dtMs = performance.now() - downTime;
+            if (Math.hypot(dx, dy) > 8 || dtMs > 380) return;
+
+            const rect = renderer.domElement.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) return;
+            pointerNDC.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+            pointerNDC.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+            raycaster.setFromCamera(pointerNDC, camera);
+            const hits = raycaster.intersectObjects(hypercar.children, true);
+
+            let hitPart = null;
+            for (const h of hits) {
+                if (h.object.userData && h.object.userData.interactivePart) {
+                    hitPart = h.object.userData.interactivePart;
+                    break;
+                }
+            }
+
+            if (hitPart === 'doorL') {
+                anim.autoMode = false;
+                anim.doorL.target = anim.doorL.target > 0.5 ? 0 : 1;
+                triggerOpticalPulse();
+            } else if (hitPart === 'doorR') {
+                anim.autoMode = false;
+                anim.doorR.target = anim.doorR.target > 0.5 ? 0 : 1;
+                triggerOpticalPulse();
+            } else if (hitPart === 'frunk') {
+                anim.autoMode = false;
+                anim.frunk.target = anim.frunk.target > 0.5 ? 0 : 1;
+                triggerOpticalPulse();
+            } else if (hitPart === 'wheels') {
+                anim.autoMode = false;
+                anim.manualWheelDrive = !anim.manualWheelDrive;
+            } else if (hits.length === 0) {
+                const now = performance.now();
+                if (now - lastEmptyTapTime < 380) {
+                    anim.autoMode = true;
+                    anim.manualWheelDrive = false;
+                    anim.autoClock = 0;
+                    triggerOpticalPulse();
+                    lastEmptyTapTime = 0;
+                } else {
+                    lastEmptyTapTime = now;
+                }
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            const w = Math.max(window.innerWidth, 1);
+            const h = Math.max(window.innerHeight, 1);
+            const pr = Math.min(window.devicePixelRatio || 1, 2);
+            camera.aspect = w / h;
+            camera.updateProjectionMatrix();
+            renderer.setPixelRatio(pr);
+            renderer.setSize(w, h);
+            if (useComposer && composer && bloomPass) {
+                composer.setPixelRatio(pr);
+                composer.setSize(w, h);
+                bloomPass.setSize(w, h);
+            }
+        });
+
+        let lastTime = performance.now();
+        const LOOP_DURATION = 33.0;
+        const WHEELBASE = SPEC.fZ - SPEC.rZ;
+        const TRACK = SPEC.fTrack * 2.0;
+
+        function animate(now) {
+            requestAnimationFrame(animate);
+            try {
+                const dt = Math.min(Math.max((now - lastTime) * 0.001, 0.0001), 0.05);
+                lastTime = now;
+
+                if (anim.autoMode) {
+                    const prevT = anim.autoClock;
+                    anim.autoClock = (anim.autoClock + dt) % LOOP_DURATION;
+                    const t = anim.autoClock;
+
+                    // Pulso inicial de desbloqueo al arrancar el ciclo
+                    if (prevT > t || (prevT < 0.4 && t >= 0.4)) {
+                        triggerOpticalPulse();
+                    }
+
+                    if (t >= 1.6 && t < 7.8) {
+                        const k = (t - 1.6) / 6.2;
+                        anim.targetSpeed = 3.2 * Math.sin(k * Math.PI);
+                        anim.targetSteer = THREE.MathUtils.degToRad(22) * Math.sin(k * Math.PI * 2.0);
+                    } else if (t >= 27.0 && t < 32.2) {
+                        const k = (t - 27.0) / 5.2;
+                        anim.targetSpeed = 3.5 * Math.sin(k * Math.PI);
+                        anim.targetSteer = -THREE.MathUtils.degToRad(21) * Math.sin(k * Math.PI * 2.0);
+                    } else {
+                        anim.targetSpeed = 0;
+                        anim.targetSteer = 0;
+                    }
+
+                    anim.doorL.target = (t >= 8.2 && t < 23.8) ? 1 : 0;
+                    anim.doorR.target = (t >= 8.75 && t < 23.2) ? 1 : 0;
+                    anim.frunk.target = (t >= 12.0 && t < 20.6) ? 1 : 0;
+
+                    if (anim.doorL.target !== anim.prevDoorLTarget ||
+                        anim.doorR.target !== anim.prevDoorRTarget ||
+                        anim.frunk.target !== anim.prevFrunkTarget) {
+                        triggerOpticalPulse();
+                    }
+                    anim.prevDoorLTarget = anim.doorL.target;
+                    anim.prevDoorRTarget = anim.doorR.target;
+                    anim.prevFrunkTarget = anim.frunk.target;
+                } else {
+                    if (anim.manualWheelDrive) {
+                        anim.manualWheelTime += dt;
+                        anim.targetSpeed = 3.0;
+                        anim.targetSteer = THREE.MathUtils.degToRad(22) * Math.sin(anim.manualWheelTime * 1.15);
+                    } else {
+                        anim.targetSpeed = 0;
+                        anim.targetSteer = 0;
+                    }
+                }
+
+                // Rodadura física y geometría de dirección Ackermann real
+                const prevSpeed = anim.wheelSpeed;
+                anim.wheelSpeed = lerp(anim.wheelSpeed, anim.targetSpeed, clamp(dt * 3.2, 0, 1));
+                anim.steerAngle = lerp(anim.steerAngle, anim.targetSteer, clamp(dt * 4.5, 0, 1));
+                const accel = (anim.wheelSpeed - prevSpeed) / Math.max(dt, 0.001);
+
+                const distStep = anim.wheelSpeed * dt;
+                anim.frontSpin += distStep / SPEC.fR;
+                anim.rearSpin += distStep / SPEC.rR;
+
+                let leftSteer = 0, rightSteer = 0;
+                const absSteer = Math.abs(anim.steerAngle);
+                if (absSteer > 1e-4) {
+                    const R = WHEELBASE / Math.tan(absSteer);
+                    const innerA = Math.min(Math.atan(WHEELBASE / Math.max(R - TRACK * 0.5, 0.5)), THREE.MathUtils.degToRad(24.0));
+                    const outerA = Math.atan(WHEELBASE / (R + TRACK * 0.5));
+                    if (anim.steerAngle > 0) {
+                        leftSteer = innerA;
+                        rightSteer = outerA;
+                    } else {
+                        leftSteer = -outerA;
+                        rightSteer = -innerA;
+                    }
+                }
+
+                wheelRig.frontLeft.knuckleGroup.rotation.y = leftSteer;
+                wheelRig.frontRight.knuckleGroup.rotation.y = rightSteer;
+                wheelRig.frontLeft.spinHub.rotation.x = anim.frontSpin;
+                wheelRig.frontRight.spinHub.rotation.x = anim.frontSpin;
+                wheelRig.rearLeft.spinHub.rotation.x = anim.rearSpin;
+                wheelRig.rearRight.spinHub.rotation.x = anim.rearSpin;
+
+                // Volante sincronizado con las ruedas delanteras
+                cockpitRig.steeringWheelSpin.rotation.z = -anim.steerAngle * 2.4;
+
+                // Micro-suspensión dinámica (cabeceo y balanceo)
+                const targetPitch = clamp(-accel * 0.0042, -0.011, 0.011);
+                const targetRoll = clamp(anim.wheelSpeed * anim.steerAngle * 0.009, -0.012, 0.012);
+                const roadMicro = anim.wheelSpeed > 0.05 ? Math.sin(now * 0.018) * 0.0016 * clamp(anim.wheelSpeed / 3.0, 0, 1) : 0;
+                anim.pitch = lerp(anim.pitch, targetPitch, clamp(dt * 6.0, 0, 1));
+                anim.roll = lerp(anim.roll, targetRoll, clamp(dt * 6.0, 0, 1));
+                anim.heave = lerp(anim.heave, roadMicro, clamp(dt * 8.0, 0, 1));
+
+                bodyGroup.rotation.x = anim.pitch;
+                bodyGroup.rotation.z = anim.roll;
+                bodyGroup.position.y = anim.heave;
+
+                // Cinemática hidráulica de puertas diédricas y maletero delantero (44°)
+                const dL = stepHydraulic(anim.doorL, dt, 0.54);
+                const dR = stepHydraulic(anim.doorR, dt, 0.54);
+                const fr = stepHydraulic(anim.frunk, dt, 0.58);
+
+                doorsRig.doorL.pivot.quaternion.setFromAxisAngle(doorsRig.doorL.dihedralAxis, dL * doorsRig.doorL.maxAngle);
+                doorsRig.doorR.pivot.quaternion.setFromAxisAngle(doorsRig.doorR.dihedralAxis, dR * doorsRig.doorR.maxAngle);
+                frunkRig.frunkPivot.rotation.x = -fr * THREE.MathUtils.degToRad(44);
+
+                // Iluminación de bienvenida en cabina y maletero
+                const doorOpenMax = Math.max(dL, dR);
+                doorsRig.cabinWelcomeLight.intensity = smoothstep(0.05, 0.75, doorOpenMax) * 1.15;
+                const frGlow = smoothstep(0.06, 0.70, fr);
+                frunkRig.frunkLight.intensity = frGlow * 1.10;
+                frunkRig.frunkLedMat.emissiveIntensity = frGlow * 2.15;
+
+                // Pulso óptico de bienvenida en DRL y pilotos traseros
+                let pulseBoost = 0;
+                if (anim.pulseTime >= 0) {
+                    anim.pulseTime += dt;
+                    if (anim.pulseTime < 0.65) {
+                        const p1 = Math.exp(-Math.pow((anim.pulseTime - 0.12) / 0.06, 2));
+                        const p2 = Math.exp(-Math.pow((anim.pulseTime - 0.34) / 0.07, 2)) * 0.85;
+                        pulseBoost = Math.max(p1, p2);
+                    } else {
+                        anim.pulseTime = -1;
+                    }
+                }
+                materials.ledWhite.emissiveIntensity = 2.35 + pulseBoost * 1.35;
+                materials.ledRed.emissiveIntensity = 2.45 + pulseBoost * 1.25;
+
+                // Actualización en tiempo real de los 4 pistones hidráulicos telescópicos
+                bodyGroup.updateMatrixWorld(true);
+                doorsRig.doorL.updateStrut(bodyGroup);
+                doorsRig.doorR.updateStrut(bodyGroup);
+                frunkRig.updateStruts(bodyGroup);
+
+                controls.update();
+
+                if (useComposer && composer) {
+                    try {
+                        composer.render();
+                    } catch (renderErr) {
+                        console.warn('Fallback a renderizado directo:', renderErr);
+                        useComposer = false;
+                        renderer.render(scene, camera);
+                    }
+                } else {
+                    renderer.render(scene, camera);
+                }
+            } catch (loopErr) {
+                console.error('Error en bucle de animación:', loopErr);
+            }
+        }
+        requestAnimationFrame(animate);
+    } catch (err) {
+        console.error('Error fatal inicializando el estudio 3D:', err);
+        showFatalError('No se pudo inicializar el motor 3D WebGL: ' + (err && err.message ? err.message : err));
+    }
+}
+
+if (document.readyState === 'complete') {
+    initHypercarStudio();
+} else {
+    window.addEventListener('load', initHypercarStudio);
+}
+</script>
+</body>
+</html>
