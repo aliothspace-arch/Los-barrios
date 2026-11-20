@@ -535,6 +535,43 @@ export const SHOP_OWNER_PROFILES: Record<string, ShopOwnerProfile> = {
   },
 };
 
+export const SHOP_AMBIENT_GREETINGS: Record<string, string[]> = {
+  shop_247: [
+    '¡Buenas! Pasa, tenemos bebidas frías y botiquines al fondo.',
+    '¡Bienvenido al 24/7! Si necesitas algo, acércate a la caja.',
+  ],
+  shop_binco: [
+    '¡Ey! Échale un ojo a la nueva colección de Grove Street.',
+    '¡Pasa adelante! Aquí tenemos la ropa al mejor precio del barrio.',
+  ],
+  shop_cluckin: [
+    '¡Alitas recién hechas y tacos crujientes! ¿Qué te pongo hoy?',
+    '¡Huele a gloria en este carrito! Acércate a pedir cuando quieras.',
+  ],
+  shop_ammunation: [
+    'Entra, chico. Aquí vendemos protección seria, nada de juguetes.',
+    'Bienvenido a Ammu-Nation. Mantén las manos a la vista cerca del mostrador.',
+  ],
+  shop_lscustoms: [
+    '¡Qué pasa, jefe! Trae el coche o acércate al mostrador si necesitas piezas.',
+    'Taller abierto todo el día. Reparación, nitro y pintura al instante.',
+  ],
+  shop_burgershot: [
+    '¡Bienvenido a Burger Shot! Menús recién salidos de la plancha.',
+    '¡Pasa! Pide en la caja cuando quieras algo caliente.',
+  ],
+  shop_suburban: [
+    'Bienvenido a Sub Urban Vinewood. Acércate a la caja si buscas estilo.',
+    'Buenas tardes. Tenemos trajes ejecutivos recién llegados.',
+  ],
+};
+
+export function getShopAmbientGreeting(shopId: string, index = 0): string {
+  const pool = SHOP_AMBIENT_GREETINGS[shopId] ?? SHOP_AMBIENT_GREETINGS.shop_247;
+  return pool[Math.abs(index) % pool.length];
+}
+
 export function getShopOwnerProfile(shopId: string): ShopOwnerProfile {
   return SHOP_OWNER_PROFILES[shopId] ?? SHOP_OWNER_PROFILES.shop_247;
 }
+

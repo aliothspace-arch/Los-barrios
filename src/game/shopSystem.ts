@@ -137,3 +137,71 @@ export function findNearestShop(
   }
   return best;
 }
+
+/**
+ * Converts a world point into shop-local coordinates where +Z faces out the door / street.
+ */
+export function worldToShopSpace(
+  shop: Pick<ShopSpec, 'originX' | 'originZ' | 'facingHeading'>,
+  wx: number,
+  wz: number,
+): { lx: number; lz: number } {
+  const dx = wx - shop.originX;
+  const dz = wz - shop.originZ;
+  const c = Math.cos(shop.facingHeading);
+  const s = Math.sin(shop.facingHeading);
+  return {
+    lx: dx * c - dz * s,
+    lz: dx * s + dz * c,
+  };
+}
+
+/**
+ * Strict counter/register interaction detector:
+ * - `indoor` stores: ONLY triggers when CJ walks inside near the checkout counter (never from the sidewalk outside!).
+ * - `street_cart`: triggers on foot directly in front of the street cart.
+ * - `outdoor_bay`: triggers on foot at the mechanic counter OR in a car parked in the open forecourt.
+ */
+export function findNearestShopRegister(
+  px: number,
+  pz: number,
+  inVehicle: boolean,
+  shops: ShopSpec[],
+): ShopSpec | null {
+  let best: ShopSpec | null = null;
+  let bestDist = Infinity;
+
+  for (let i = 0; i < shops.length; i++) {
+    const shop = shops[i];
+    if (shop.venueMode === 'indoor') {
+      if (inVehicle) continue;
+      const local = worldToShopSpace(shop, px, pz);
+      const dist = Math.hypot(shop.registerX - px, shop.registerZ - pz);
+      // Must be inside front glass threshold and right beside the counter
+      if (local.lz <= 2.95 && local.lz >= -1.2 && Math.abs(local.lx) <= 2.8 && dist <= 2.75) {
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = shop;
+        }
+      }
+    } else if (shop.venueMode === 'street_cart') {
+      if (inVehicle) continue;
+      const dist = Math.hypot(shop.registerX - px, shop.registerZ - pz);
+      if (dist <= 2.65 && dist < bestDist) {
+        bestDist = dist;
+        best = shop;
+      }
+    } else {
+      // outdoor_bay (LS Customs)
+      const dist = Math.hypot(shop.registerX - px, shop.registerZ - pz);
+      const maxRange = inVehicle ? 8.8 : 2.9;
+      if (dist <= maxRange && dist < bestDist) {
+        bestDist = dist;
+        best = shop;
+      }
+    }
+  }
+
+  return best;
+}
+

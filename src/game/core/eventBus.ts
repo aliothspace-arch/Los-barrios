@@ -3,6 +3,9 @@ import type { WeatherType } from '../types';
 export type GameSfxEvent =
   | { kind: 'impact'; intensity: number }
   | { kind: 'door' }
+  | { kind: 'gear_shift'; up: boolean }
+  | { kind: 'curb_bump'; intensity: number }
+  | { kind: 'scrape'; intensity: number }
   | { kind: 'checkpoint' }
   | { kind: 'jump' }
   | { kind: 'punch' }
@@ -24,6 +27,10 @@ export interface GameEventMap {
     z: number;
     count: number;
     kind: 'spark' | 'smoke' | 'spray';
+    vx?: number;
+    vy?: number;
+    vz?: number;
+    intensity?: number;
   };
   'weather:changed': { weather: WeatherType };
   'activity:started': { activityId: string };

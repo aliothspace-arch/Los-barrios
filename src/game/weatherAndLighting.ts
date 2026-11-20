@@ -1,40 +1,21 @@
 import * as THREE from 'three';
-import type { TimePreset, WeatherType } from './types';
+import type { WeatherType } from './types';
 import type { HyperrealMaterialLibrary, SharedWeatherUniforms } from './textures';
 import { createGaussianSoftboxTexture } from './rendering/hypercarBuilders';
-
-interface AtmosphereTarget {
-  sunElevation: number;
-  sunAzimuth: number;
-  sunColor: THREE.Color;
-  sunIntensity: number;
-  hemiSky: THREE.Color;
-  hemiGround: THREE.Color;
-  hemiIntensity: number;
-  fogColor: THREE.Color;
-  fogDensity: number;
-  skyZenith: THREE.Color;
-  skyMid: THREE.Color;
-  skyHorizon: THREE.Color;
-  skyGround: THREE.Color;
-  antiSunColor: THREE.Color;
-  sunDiscStrength: number;
-  cloudCoverage: number;
-  cloudDarkness: number;
-  starVisibility: number;
-  wetness: number;
-  windStrength: number;
-  rainDensity: number;
-  nightFactor: number;
-  exposure: number;
-}
-
-const TIME_CLOCK_HOURS: Record<TimePreset, string> = {
-  sunset: '18:20',
-  noon: '13:15',
-  night: '23:40',
-  dawn: '06:35',
-};
+import { HyperrealRainSystem } from './rendering/rainSystem';
+import { STREETLAMP_POSITIONS } from './worldLayout';
+import {
+  computeNearestLampBulbs,
+  computeWetRoadMetrics,
+} from './simulation/rainMath';
+import {
+  createInitialAtmosphereState,
+  evaluateDynamicAtmosphere,
+  formatClockHHMM,
+  stepAtmosphereState,
+  type DynamicAtmosphereState,
+  type PureAtmosphereSample,
+} from './simulation/atmosphereModel';
 
 /**
  * Hybrid AAA Automotive Studio + Open-World California Environment Scene for PMREM IBL.
@@ -153,12 +134,6 @@ function buildHybridAutomotiveEnvironmentScene(): {
   return { scene: envScene, textures };
 }
 
-// Physically-Inspired California Atmospheric Sky Dome:
-// - Rayleigh/Mie multi-band atmospheric gradient + Belt of Venus anti-solar twilight glow
-// - Dual-lobe Henyey-Greenstein solar aureole & limb-darkened sun disc
-// - Multi-layer procedural clouds: high-altitude wispy cirrus + self-shadowed volumetric cumulus with silver-lining transmittance
-// - Twinkling night starfield + lunar sky glow
-// - Strictly non-blinding AgX photographic luminance ceiling
 function createNonGlareSkyDome(): {
   mesh: THREE.Mesh;
   uniforms: {
@@ -222,7 +197,6 @@ function createNonGlareSkyDome(): {
       uniform float uTime;
       varying vec3 vWorldDir;
 
-      // Fast 2D value noise with domain rotation for organic multi-octave FBM
       float hash21(vec2 p) {
         p = fract(p * vec2(127.1, 311.7));
         p += dot(p, p + 34.17);
@@ -248,7 +222,6 @@ function createNonGlareSkyDome(): {
 
       const mat2 CLOUD_ROT = mat2(0.80, -0.60, 0.60, 0.80);
 
-      // 4-octave rotated FBM for realistic billowy cumulus cloud structure
       float fbmClouds(vec2 p) {
         float v = 0.0;
         float amp = 0.52;
@@ -260,7 +233,6 @@ function createNonGlareSkyDome(): {
         return v;
       }
 
-      // Anisotropic wispy FBM for high-altitude California cirrus streaks
       float fbmCirrus(vec2 p) {
         float n1 = noise2(p * vec2(1.6, 4.2));
         vec2 q = CLOUD_ROT * p * vec2(2.4, 5.8) + vec2(n1 * 0.85, -n1 * 0.45);
@@ -268,7 +240,6 @@ function createNonGlareSkyDome(): {
         return n1 * 0.58 + n2 * 0.42;
       }
 
-      // Henyey-Greenstein phase function for forward-scattered Mie solar aureole & silver-lining
       float hgPhase(float cosTheta, float g) {
         float g2 = g * g;
         return (1.0 - g2) / pow(max(1.0 + g2 - 2.0 * g * cosTheta, 0.001), 1.5) * 0.079577;
@@ -281,7 +252,6 @@ function createNonGlareSkyDome(): {
         float sunCos = dot(dir, sunDir);
         float sunForward = max(sunCos, 0.0);
 
-        // 1. Multi-Band Physical Rayleigh & Mie Atmospheric Gradient
         vec3 col;
         if (h >= 0.0) {
           float lowT = smoothstep(0.0, 0.34, pow(h, 0.72));
@@ -289,12 +259,10 @@ function createNonGlareSkyDome(): {
           col = mix(uHorizonColor, uMidSkyColor, lowT);
           col = mix(col, uZenithColor, highT);
 
-          // Anti-solar Belt of Venus
           float antiSunAzimuth = smoothstep(-0.15, 0.85, -sunCos);
           float beltBand = exp(-pow((h - 0.11) / 0.13, 2.0)) * smoothstep(0.0, 0.04, h);
           col = mix(col, uAntiSunColor, antiSunAzimuth * beltBand * 0.42);
 
-          // Restrained warm solar horizon glow
           float horizonMieBand = exp(-h * 5.6) * pow(sunForward, 2.8) * uSunStrength;
           col += uSunColor * horizonMieBand * 0.24;
         } else {
@@ -302,7 +270,6 @@ function createNonGlareSkyDome(): {
           col = mix(uHorizonColor, uGroundColor, t);
         }
 
-        // 2. Crisp Night Starfield & Subtle Lunar Glow
         if (h > 0.04 && uStarVisibility > 0.02) {
           vec3 starGrid1 = dir * 195.0;
           vec3 starCell1 = floor(starGrid1);
@@ -341,7 +308,6 @@ function createNonGlareSkyDome(): {
           col += vec3(0.74, 0.85, 0.98) * (moonDisc + moonHalo) * uStarVisibility * horizonFade;
         }
 
-        // 3. Solar Aureole & Limb-Darkened Sun Disc
         if (h > -0.02 && uSunStrength > 0.01) {
           float mieWide = hgPhase(sunForward, 0.72) * 0.09 * uSunStrength;
           float mieTight = pow(sunForward, 16.0) * 0.22 * uSunStrength;
@@ -349,7 +315,6 @@ function createNonGlareSkyDome(): {
           col += uSunColor * (mieWide + mieTight + solarDisc);
         }
 
-        // 4. Multi-Layer Volumetric-Style Procedural Clouds
         if (h > 0.015) {
           float shellDist = 1.0 / (h + 0.13);
           vec2 skyPlane = dir.xz * shellDist;
@@ -402,10 +367,8 @@ function createNonGlareSkyDome(): {
           }
         }
 
-        // 5. Seamless Horizon Aerial Perspective Lock
         float horizonFogLock = exp(-abs(h) * 14.5);
         col = mix(col, uHorizonColor, horizonFogLock * 0.36);
-
         col = min(col, vec3(1.10));
 
         gl_FragColor = vec4(col, 1.0);
@@ -429,21 +392,18 @@ export class DynamicWeatherAndLighting {
   public readonly fog: THREE.FogExp2;
 
   private readonly skyUniforms: ReturnType<typeof createNonGlareSkyDome>['uniforms'];
-  private readonly rainMesh: THREE.InstancedMesh;
-  private readonly rainPositions: Float32Array;
-  private readonly rainSpeeds: Float32Array;
-  private readonly rainCount: number;
-  private readonly dummy = new THREE.Object3D();
+  private readonly rainSystem: HyperrealRainSystem;
   private readonly sunVec = new THREE.Vector3();
 
-  private readonly currentTarget: AtmosphereTarget;
-  private weather: WeatherType = 'golden';
-  private timePreset: TimePreset = 'sunset';
+  private atmosphereState: DynamicAtmosphereState;
+  private currentSample: PureAtmosphereSample;
 
   private lightningTimer = 5.0;
   private lightningFlash = 0;
   private lastSyncedWetness = -1;
   private lastSyncedNight = -1;
+  private lastLampFocusX = Number.NaN;
+  private lastLampFocusZ = Number.NaN;
   private envMapTex: THREE.Texture | null = null;
   private pmrem: THREE.PMREMGenerator;
 
@@ -454,7 +414,7 @@ export class DynamicWeatherAndLighting {
     private readonly materials: HyperrealMaterialLibrary,
     private readonly isSoftwareGl: boolean,
   ) {
-    // 1. Hybrid AAA Automotive Gaussian-Softbox + Outdoor PMREM Environment Map (blur sigma 0.032)
+    // 1. Hybrid AAA Automotive Gaussian-Softbox + Outdoor PMREM Environment Map
     this.pmrem = new THREE.PMREMGenerator(renderer);
     this.pmrem.compileEquirectangularShader();
     const { scene: hybridEnv, textures: envTextures } = buildHybridAutomotiveEnvironmentScene();
@@ -472,14 +432,14 @@ export class DynamicWeatherAndLighting {
       tex.dispose();
     }
 
-    // 2. Non-Glare Procedural California Atmospheric Sky Dome
+    // 2. Non-Glare Procedural California Atmospheric Sky Dome (render after opaque world for Early-Z culling)
     const dome = createNonGlareSkyDome();
     this.skyDome = dome.mesh;
+    this.skyDome.renderOrder = 10;
     this.skyUniforms = dome.uniforms;
     scene.add(this.skyDome);
 
     // 3. AAA 4-Point Automotive & Open-World Lighting Rig
-    // Point 1: Clean High-Contrast Key Light + 2048x2048 Texel-Snapped Shadows
     this.sunLight = new THREE.DirectionalLight(0xfff0dc, 2.45);
     this.sunLight.position.set(-64, 48, -52);
     this.sunLight.castShadow = !isSoftwareGl;
@@ -498,148 +458,158 @@ export class DynamicWeatherAndLighting {
     scene.add(this.sunLight);
     scene.add(this.sunLight.target);
 
-    // Point 2: Cool Counter-Silhouette Rim Light (0xcfe2ff, carves carbon aero & roof scoop silhouettes)
     this.fillLight = new THREE.DirectionalLight(0xcfe2ff, 0.85);
     this.fillLight.position.set(68, 46, -64);
     scene.add(this.fillLight);
 
-    // Point 3: Low-Angle Waistline Fill Light (0xdce6f5, illuminates forged concave rims, ceramic rotors & yellow calipers)
     this.lowFillLight = new THREE.DirectionalLight(0xdce6f5, 0.48);
     this.lowFillLight.position.set(16, 14, 78);
     scene.add(this.lowFillLight);
 
-    // Point 4: Deep Obsidian-Slate Hemisphere Light (eliminates toy-like flat orange ambient washout)
     this.hemiLight = new THREE.HemisphereLight(0x5a657d, 0x18161d, 0.50);
     scene.add(this.hemiLight);
 
-    // Refined low-density atmospheric haze (preserves deep obsidian blacks on vehicles and architecture)
     this.fog = new THREE.FogExp2(0x4e484b, 0.0022);
     scene.fog = this.fog;
     scene.background = this.fog.color.clone();
 
-    // 4. Instanced Volumetric Rain Streaks
-    this.rainCount = isSoftwareGl ? 220 : 680;
-    const rainGeo = new THREE.CylinderGeometry(0.011, 0.011, 1.35, 4, 1, true);
-    const rainMat = new THREE.MeshBasicMaterial({
-      color: 0xb9cde0,
-      transparent: true,
-      opacity: 0.36,
-      depthWrite: false,
-    });
-    this.rainMesh = new THREE.InstancedMesh(rainGeo, rainMat, this.rainCount);
-    this.rainMesh.frustumCulled = false;
-    this.rainMesh.visible = false;
-    scene.add(this.rainMesh);
+    // 4. AAA Multi-Layer Volumetric Rain Streaks, Ground Crown Splashes & Wind Mist
+    this.rainSystem = new HyperrealRainSystem(scene, uniforms, isSoftwareGl);
 
-    this.rainPositions = new Float32Array(this.rainCount * 3);
-    this.rainSpeeds = new Float32Array(this.rainCount);
-    for (let i = 0; i < this.rainCount; i++) {
-      this.rainPositions[i * 3] = (Math.random() - 0.5) * 62;
-      this.rainPositions[i * 3 + 1] = Math.random() * 28;
-      this.rainPositions[i * 3 + 2] = (Math.random() - 0.5) * 62;
-      this.rainSpeeds[i] = 24 + Math.random() * 14;
+    this.atmosphereState = createInitialAtmosphereState();
+    this.currentSample = evaluateDynamicAtmosphere(this.atmosphereState);
+    this.applySampleToScene(renderer, scene, 0, 0, 0, true);
+  }
+
+  public resetCycle(): void {
+    this.atmosphereState = createInitialAtmosphereState();
+    this.currentSample = evaluateDynamicAtmosphere(this.atmosphereState);
+    this.lightningFlash = 0;
+  }
+
+  public advanceTimeSeconds(seconds: number): void {
+    stepAtmosphereState(this.atmosphereState, seconds);
+    this.currentSample = evaluateDynamicAtmosphere(this.atmosphereState);
+  }
+
+  public setAtmosphereForTest(weather: WeatherType, timeOfDayHours?: number): void {
+    this.atmosphereState.prevWeather = weather;
+    this.atmosphereState.weather = weather;
+    this.atmosphereState.weatherBlend = 1.0;
+    this.atmosphereState.dwellTimerSec = 90;
+    if (typeof timeOfDayHours === 'number' && Number.isFinite(timeOfDayHours)) {
+      this.atmosphereState.timeOfDayHours = ((timeOfDayHours % 24) + 24) % 24;
     }
-
-    this.currentTarget = this.computeTarget(this.weather, this.timePreset);
-    this.applyImmediate(renderer, scene);
+    this.lightningFlash = weather === 'storm' ? 0.35 : 0;
+    this.currentSample = evaluateDynamicAtmosphere(this.atmosphereState);
   }
 
-  public setWeather(w: WeatherType): void {
-    this.weather = w;
-    Object.assign(this.currentTarget, this.computeTarget(this.weather, this.timePreset));
-    this.snapBlend(0.78);
+  public syncToScene(
+    renderer: THREE.WebGLRenderer,
+    scene: THREE.Scene,
+    focusX: number,
+    focusZ: number,
+  ): void {
+    this.applySampleToScene(renderer, scene, focusX, focusZ, 0.04, true);
   }
 
-  public setTimePreset(t: TimePreset): void {
-    this.timePreset = t;
-    Object.assign(this.currentTarget, this.computeTarget(this.weather, this.timePreset));
-    this.snapBlend(0.82);
+  public updateVehicleLightReflection(
+    carX: number,
+    carZ: number,
+    heading: number,
+    active: boolean,
+  ): void {
+    if (!active) {
+      this.uniforms.uCarLightActive.value = 0;
+      return;
+    }
+    const sinH = Math.sin(heading);
+    const cosH = Math.cos(heading);
+    this.uniforms.uCarHeadlightDir.value.set(sinH, -0.08, cosH).normalize();
+    this.uniforms.uCarHeadlightPos.value.set(carX + sinH * 2.15, 0.58, carZ + cosH * 2.15);
+    this.uniforms.uCarTaillightPos.value.set(carX - sinH * 2.12, 0.72, carZ - cosH * 2.12);
+    this.uniforms.uCarLightActive.value = 1.0;
   }
 
-  private snapBlend(factor: number): void {
-    const t = this.currentTarget;
-    this.sunLight.color.lerp(t.sunColor, factor);
-    this.sunLight.intensity = THREE.MathUtils.lerp(this.sunLight.intensity, t.sunIntensity, factor);
-    this.hemiLight.color.lerp(t.hemiSky, factor);
-    this.hemiLight.groundColor.lerp(t.hemiGround, factor);
-    this.hemiLight.intensity = THREE.MathUtils.lerp(this.hemiLight.intensity, t.hemiIntensity, factor);
-    this.fog.color.lerp(t.fogColor, factor);
-    this.fog.density = THREE.MathUtils.lerp(this.fog.density, t.fogDensity, factor);
-    this.skyUniforms.uZenithColor.value.lerp(t.skyZenith, factor);
-    this.skyUniforms.uMidSkyColor.value.lerp(t.skyMid, factor);
-    this.skyUniforms.uHorizonColor.value.lerp(t.skyHorizon, factor);
-    this.skyUniforms.uGroundColor.value.lerp(t.skyGround, factor);
-    this.skyUniforms.uAntiSunColor.value.lerp(t.antiSunColor, factor);
-    this.skyUniforms.uSunColor.value.lerp(t.sunColor, factor);
-    this.skyUniforms.uSunStrength.value = THREE.MathUtils.lerp(
-      this.skyUniforms.uSunStrength.value,
-      t.sunDiscStrength,
-      factor,
-    );
-    this.skyUniforms.uCloudCoverage.value = THREE.MathUtils.lerp(
-      this.skyUniforms.uCloudCoverage.value,
-      t.cloudCoverage,
-      factor,
-    );
-    this.skyUniforms.uCloudDarkness.value = THREE.MathUtils.lerp(
-      this.skyUniforms.uCloudDarkness.value,
-      t.cloudDarkness,
-      factor,
-    );
-    this.skyUniforms.uStarVisibility.value = THREE.MathUtils.lerp(
-      this.skyUniforms.uStarVisibility.value,
-      t.starVisibility,
-      factor,
-    );
-    this.uniforms.uWetness.value = THREE.MathUtils.lerp(this.uniforms.uWetness.value, t.wetness, factor);
-    this.uniforms.uWindStrength.value = THREE.MathUtils.lerp(this.uniforms.uWindStrength.value, t.windStrength, factor);
-    this.uniforms.uNightFactor.value = THREE.MathUtils.lerp(this.uniforms.uNightFactor.value, t.nightFactor, factor);
-    this.syncRoadWetClearcoat(true);
-    this.syncNightEmissives(true);
+  public setCarSpeedNorm(speedNorm: number): void {
+    this.uniforms.uCarSpeedNorm.value = Math.max(0, Math.min(1, speedNorm));
+  }
+
+  /**
+   * Temporarily reveals the GPU rain system during boot compileAsync so rain streaks,
+   * splashes, and mist shaders compile up front instead of stalling mid-drive.
+   */
+  public setRainWarmupVisible(visible: boolean): void {
+    this.rainSystem.group.visible = visible;
+  }
+
+  private syncNearestLamps(focusX: number, focusZ: number, force = false): void {
+    if (
+      !force &&
+      Number.isFinite(this.lastLampFocusX) &&
+      Math.hypot(focusX - this.lastLampFocusX, focusZ - this.lastLampFocusZ) < 4.5
+    ) {
+      return;
+    }
+    this.lastLampFocusX = focusX;
+    this.lastLampFocusZ = focusZ;
+    const nearest = computeNearestLampBulbs(focusX, focusZ, STREETLAMP_POSITIONS, 6);
+    const arr = this.uniforms.uNearLamps.value;
+    for (let i = 0; i < nearest.length && i < arr.length; i++) {
+      arr[i].set(nearest[i].x, nearest[i].y, nearest[i].z);
+    }
   }
 
   private syncRoadWetClearcoat(force = false): void {
     const wet = this.uniforms.uWetness.value;
+    const rain = this.uniforms.uRainDensity.value;
     if (!force && Math.abs(wet - this.lastSyncedWetness) < 0.0005) return;
     this.lastSyncedWetness = wet;
-    const cc = wet > 0.35 ? Math.min(0.84, (wet - 0.35) * 1.25) : 0.14;
-    const envI = 0.42 + cc * 0.58;
+    const metrics = computeWetRoadMetrics(wet, rain, this.uniforms.uWindStrength.value);
+    const cc = metrics.roadClearcoat;
+    const envI = metrics.roadEnvIntensity;
     this.materials.roadNS.clearcoat = cc;
     this.materials.roadEW.clearcoat = cc;
     this.materials.culDeSacAsphalt.clearcoat = cc;
+    this.materials.roadNS.clearcoatRoughness = wet > 0.3 ? 0.04 : 0.12;
+    this.materials.roadEW.clearcoatRoughness = wet > 0.3 ? 0.04 : 0.12;
+    this.materials.culDeSacAsphalt.clearcoatRoughness = wet > 0.3 ? 0.04 : 0.12;
     this.materials.roadNS.envMapIntensity = envI;
     this.materials.roadEW.envMapIntensity = envI;
     this.materials.culDeSacAsphalt.envMapIntensity = envI;
-    this.materials.sidewalk.clearcoat = cc * 0.42;
-    this.materials.sidewalk.envMapIntensity = 0.28 + cc * 0.35;
+    this.materials.sidewalk.clearcoat = cc * 0.48;
+    this.materials.sidewalk.envMapIntensity = 0.28 + wet * 0.52;
   }
 
   private syncNightEmissives(force = false): void {
     const night = this.uniforms.uNightFactor.value;
     if (!force && Math.abs(night - this.lastSyncedNight) < 0.0005) return;
     this.lastSyncedNight = night;
-    this.materials.streetlampGlow.emissiveIntensity = 0.25 + night * 2.2;
-    const skyEmissive = 0.12 + night * 1.0;
+    this.materials.streetlampGlow.emissiveIntensity = 0.35 + night * 2.55;
+    this.materials.trafficStreetSignMat.emissiveIntensity = 0.28 + night * 0.95;
+    this.materials.trafficLensGreenMat.emissiveIntensity = 1.45 + night * 1.35;
+    this.materials.trafficLensRedMat.emissiveIntensity = 1.45 + night * 1.35;
+    const skyEmissive = 0.12 + night * 1.05;
     for (let i = 0; i < this.materials.skyscraperFacades.length; i++) {
       this.materials.skyscraperFacades[i].emissiveIntensity = skyEmissive;
     }
-    const commEmissive = 0.12 + night * 0.85;
+    const commEmissive = 0.12 + night * 0.88;
     for (let i = 0; i < this.materials.commercialWalls.length; i++) {
       this.materials.commercialWalls[i].emissiveIntensity = commEmissive;
     }
-    this.materials.mazeBankGlass.emissiveIntensity = 0.14 + night * 1.1;
+    this.materials.mazeBankGlass.emissiveIntensity = 0.14 + night * 1.15;
   }
 
   public getWeather(): WeatherType {
-    return this.weather;
-  }
-
-  public getTimePreset(): TimePreset {
-    return this.timePreset;
+    return this.atmosphereState.weather;
   }
 
   public getClockText(): string {
-    return TIME_CLOCK_HOURS[this.timePreset];
+    return formatClockHHMM(this.atmosphereState.timeOfDayHours);
+  }
+
+  public getTimeOfDayHours(): number {
+    return this.atmosphereState.timeOfDayHours;
   }
 
   public getSunDirection(): THREE.Vector3 {
@@ -647,383 +617,91 @@ export class DynamicWeatherAndLighting {
   }
 
   public getCurrentExposure(): number {
-    return this.currentTarget.exposure;
+    return this.currentSample.exposure;
   }
 
   public getNightFactor(): number {
     return this.uniforms.uNightFactor.value;
   }
 
+  public getRainDensity(): number {
+    return this.uniforms.uRainDensity.value;
+  }
+
+  public getWetness(): number {
+    return this.uniforms.uWetness.value;
+  }
+
   public getWarmthFactor(): number {
-    if (this.timePreset === 'night') return 0.08;
-    if (this.weather === 'rain' || this.weather === 'storm' || this.weather === 'fog') return 0.18;
-    if (this.timePreset === 'sunset') return 0.55;
-    if (this.timePreset === 'dawn') return 0.45;
-    return 0.22;
+    return this.currentSample.warmth;
   }
 
   public getBloomStrength(): number {
-    if (this.timePreset === 'night') return 0.26;
-    if (this.weather === 'rain' || this.weather === 'storm') return 0.22;
-    if (this.timePreset === 'sunset' || this.timePreset === 'dawn') return 0.19;
-    return 0.16;
+    return this.currentSample.bloomStrength;
   }
 
-  private computeTarget(weather: WeatherType, time: TimePreset): AtmosphereTarget {
-    // AAA Hybrid Automotive Photorealistic Golden Hour (clean highlights, deep slate-obsidian shadows)
-    let sunElevation = 24.0;
-    let sunAzimuth = -118;
-    let sunColor = new THREE.Color(0xffe4c4);
-    let sunIntensity = 2.45;
-    let hemiSky = new THREE.Color(0x5a657d);
-    let hemiGround = new THREE.Color(0x18161d);
-    let hemiIntensity = 0.50;
-    let fogColor = new THREE.Color(0x52484a);
-    let fogDensity = 0.0020;
-    let skyZenith = new THREE.Color(0x0f223d);
-    let skyMid = new THREE.Color(0x2d4a6e);
-    let skyHorizon = new THREE.Color(0x826558);
-    let skyGround = new THREE.Color(0x18161d);
-    let antiSunColor = new THREE.Color(0x4b425c);
-    let sunDiscStrength = 0.52;
-    let cloudCoverage = 0.42;
-    let cloudDarkness = 0.24;
-    let starVisibility = 0.16;
-    let nightFactor = 0.20;
-    let exposure = 1.06;
-
-    if (time === 'noon') {
-      sunElevation = 56;
-      sunAzimuth = -112;
-      sunColor = new THREE.Color(0xfff6eb);
-      sunIntensity = 2.55;
-      hemiSky = new THREE.Color(0x687894);
-      hemiGround = new THREE.Color(0x1c1b22);
-      hemiIntensity = 0.54;
-      fogColor = new THREE.Color(0x788da3);
-      fogDensity = 0.0017;
-      skyZenith = new THREE.Color(0x12386b);
-      skyMid = new THREE.Color(0x366aa3);
-      skyHorizon = new THREE.Color(0x8da4ba);
-      skyGround = new THREE.Color(0x201f26);
-      antiSunColor = new THREE.Color(0x6886a6);
-      sunDiscStrength = 0.40;
-      cloudCoverage = 0.34;
-      cloudDarkness = 0.12;
-      starVisibility = 0.0;
-      nightFactor = 0.0;
-      exposure = 1.04;
-    } else if (time === 'dawn') {
-      sunElevation = 18.0;
-      sunAzimuth = 72;
-      sunColor = new THREE.Color(0xf7cbb4);
-      sunIntensity = 2.25;
-      hemiSky = new THREE.Color(0x58627d);
-      hemiGround = new THREE.Color(0x18161f);
-      hemiIntensity = 0.48;
-      fogColor = new THREE.Color(0x584d59);
-      fogDensity = 0.0024;
-      skyZenith = new THREE.Color(0x151f3d);
-      skyMid = new THREE.Color(0x3a4569);
-      skyHorizon = new THREE.Color(0x8a6975);
-      skyGround = new THREE.Color(0x1c1822);
-      antiSunColor = new THREE.Color(0x4d3f5e);
-      sunDiscStrength = 0.46;
-      cloudCoverage = 0.42;
-      cloudDarkness = 0.26;
-      starVisibility = 0.28;
-      nightFactor = 0.30;
-      exposure = 1.06;
-    } else if (time === 'night') {
-      sunElevation = -4;
-      sunAzimuth = -110;
-      sunColor = new THREE.Color(0x8cb4eb);
-      sunIntensity = 1.15;
-      hemiSky = new THREE.Color(0x283652);
-      hemiGround = new THREE.Color(0x0d0c12);
-      hemiIntensity = 0.42;
-      fogColor = new THREE.Color(0x0a0e18);
-      fogDensity = 0.0034;
-      skyZenith = new THREE.Color(0x04070f);
-      skyMid = new THREE.Color(0x0a1222);
-      skyHorizon = new THREE.Color(0x162238);
-      skyGround = new THREE.Color(0x070910);
-      antiSunColor = new THREE.Color(0x101a2e);
-      sunDiscStrength = 0.0;
-      cloudCoverage = 0.30;
-      cloudDarkness = 0.72;
-      starVisibility = 1.0;
-      nightFactor = 1.0;
-      exposure = 1.14;
-    }
-
-    let wetness = 0.0;
-    let windStrength = 0.22;
-    let rainDensity = 0.0;
-
-    if (weather === 'golden') {
-      if (time === 'sunset') {
-        fogColor.set(0x544849);
-        sunColor.set(0xffdfc0);
-        fogDensity = 0.0018;
-      }
-      cloudCoverage = Math.max(cloudCoverage, 0.44);
-      windStrength = 0.24;
-    } else if (weather === 'clear') {
-      fogDensity *= 0.65;
-      cloudCoverage = 0.26;
-      cloudDarkness *= 0.65;
-      windStrength = 0.16;
-    } else if (weather === 'fog') {
-      fogDensity = 0.0088;
-      fogColor.set(time === 'night' ? 0x131b26 : 0x626e78);
-      skyZenith.set(time === 'night' ? 0x0e141d : 0x485560);
-      skyMid.set(time === 'night' ? 0x131b26 : 0x586670);
-      skyHorizon.set(time === 'night' ? 0x18212d : 0x687680);
-      skyGround.set(time === 'night' ? 0x0c1017 : 0x22262b);
-      antiSunColor.copy(skyHorizon);
-      sunColor.set(time === 'night' ? 0x6c86a6 : 0xd0d8e0);
-      sunIntensity = time === 'night' ? 0.65 : 1.35;
-      hemiSky.set(time === 'night' ? 0x2c3a4d : 0x768490);
-      hemiGround.set(0x1c1d22);
-      hemiIntensity = 0.58;
-      sunDiscStrength = 0.05;
-      cloudCoverage = 0.78;
-      cloudDarkness = 0.52;
-      starVisibility = 0.0;
-      wetness = 0.16;
-      windStrength = 0.18;
-      exposure = 0.98;
-    } else if (weather === 'rain') {
-      fogDensity = 0.0068;
-      fogColor.set(time === 'night' ? 0x0c121d : 0x34414f);
-      skyZenith.set(time === 'night' ? 0x080c14 : 0x1d2630);
-      skyMid.set(time === 'night' ? 0x0d131f : 0x2c3846);
-      skyHorizon.set(time === 'night' ? 0x111926 : 0x3b4958);
-      skyGround.set(0x151920);
-      antiSunColor.copy(skyHorizon);
-      sunColor.set(0xa4bad0);
-      sunIntensity = time === 'night' ? 0.75 : 1.45;
-      hemiSky.set(0x55697d);
-      hemiGround.set(0x181b22);
-      hemiIntensity = 0.64;
-      sunDiscStrength = 0.0;
-      cloudCoverage = 0.88;
-      cloudDarkness = 0.76;
-      starVisibility = 0.0;
-      wetness = 0.88;
-      windStrength = 0.68;
-      rainDensity = 0.75;
-      nightFactor = Math.max(nightFactor, 0.72);
-      exposure = 0.98;
-    } else if (weather === 'storm') {
-      fogDensity = 0.0094;
-      fogColor.set(0x141c26);
-      skyZenith.set(0x090d14);
-      skyMid.set(0x101822);
-      skyHorizon.set(0x18222e);
-      skyGround.set(0x0c1017);
-      antiSunColor.set(0x151e2a);
-      sunColor.set(0x7d94ad);
-      sunIntensity = 0.85;
-      hemiSky.set(0x364659);
-      hemiGround.set(0x12151c);
-      hemiIntensity = 0.56;
-      sunDiscStrength = 0.0;
-      cloudCoverage = 0.95;
-      cloudDarkness = 0.90;
-      starVisibility = 0.0;
-      wetness = 1.0;
-      windStrength = 1.2;
-      rainDensity = 1.0;
-      nightFactor = Math.max(nightFactor, 0.9);
-      exposure = 0.94;
-    }
-
-    return {
-      sunElevation,
-      sunAzimuth,
-      sunColor,
-      sunIntensity,
-      hemiSky,
-      hemiGround,
-      hemiIntensity,
-      fogColor,
-      fogDensity,
-      skyZenith,
-      skyMid,
-      skyHorizon,
-      skyGround,
-      antiSunColor,
-      sunDiscStrength,
-      cloudCoverage,
-      cloudDarkness,
-      starVisibility,
-      wetness,
-      windStrength,
-      rainDensity,
-      nightFactor,
-      exposure,
-    };
-  }
-
-  private applyImmediate(renderer: THREE.WebGLRenderer, scene: THREE.Scene): void {
-    const t = this.currentTarget;
-    this.sunLight.color.copy(t.sunColor);
-    this.sunLight.intensity = t.sunIntensity;
-    this.hemiLight.color.copy(t.hemiSky);
-    this.hemiLight.groundColor.copy(t.hemiGround);
-    this.hemiLight.intensity = t.hemiIntensity;
-    this.fog.color.copy(t.fogColor);
-    this.fog.density = t.fogDensity;
-    if (scene.background instanceof THREE.Color) {
-      scene.background.copy(t.fogColor);
-    }
-    this.skyUniforms.uZenithColor.value.copy(t.skyZenith);
-    this.skyUniforms.uMidSkyColor.value.copy(t.skyMid);
-    this.skyUniforms.uHorizonColor.value.copy(t.skyHorizon);
-    this.skyUniforms.uGroundColor.value.copy(t.skyGround);
-    this.skyUniforms.uAntiSunColor.value.copy(t.antiSunColor);
-    this.skyUniforms.uSunColor.value.copy(t.sunColor);
-    this.skyUniforms.uSunStrength.value = t.sunDiscStrength;
-    this.skyUniforms.uCloudCoverage.value = t.cloudCoverage;
-    this.skyUniforms.uCloudDarkness.value = t.cloudDarkness;
-    this.skyUniforms.uStarVisibility.value = t.starVisibility;
-    this.uniforms.uWetness.value = t.wetness;
-    this.uniforms.uWindStrength.value = t.windStrength;
-    this.uniforms.uNightFactor.value = t.nightFactor;
-    renderer.toneMappingExposure = t.exposure;
-    this.syncRoadWetClearcoat(true);
-    this.syncNightEmissives(true);
-    this.updateSunDirection(t);
-  }
-
-  private updateSunDirection(t: AtmosphereTarget): void {
-    const phi = THREE.MathUtils.degToRad(90 - Math.max(-12, t.sunElevation));
-    const theta = THREE.MathUtils.degToRad(t.sunAzimuth);
+  private updateSunDirection(s: PureAtmosphereSample): void {
+    const phi = THREE.MathUtils.degToRad(90 - Math.max(-12, s.sunElevation));
+    const theta = THREE.MathUtils.degToRad(s.sunAzimuth);
     this.sunVec.setFromSphericalCoords(1, phi, theta);
     this.skyUniforms.uSunDir.value.copy(this.sunVec);
     this.uniforms.uSunDir.value.copy(this.sunVec);
   }
 
-  public update(
-    dt: number,
-    focusX: number,
-    focusZ: number,
+  private applySampleToScene(
     renderer: THREE.WebGLRenderer,
     scene: THREE.Scene,
-    onLightningStrike?: () => void,
+    focusX: number,
+    focusZ: number,
+    dt: number,
+    forceImmediate = false,
   ): void {
-    const t = this.currentTarget;
-    const blend = 1 - Math.exp(-3.4 * dt);
+    const s = this.currentSample;
 
-    this.sunLight.color.lerp(t.sunColor, blend);
-    this.hemiLight.color.lerp(t.hemiSky, blend);
-    this.hemiLight.groundColor.lerp(t.hemiGround, blend);
-    this.hemiLight.intensity = THREE.MathUtils.lerp(
-      this.hemiLight.intensity,
-      t.hemiIntensity,
-      blend,
-    );
-    this.fog.color.lerp(t.fogColor, blend);
-    this.fog.density = THREE.MathUtils.lerp(this.fog.density, t.fogDensity, blend);
+    this.sunLight.color.setRGB(s.sunColor.r, s.sunColor.g, s.sunColor.b);
+    this.hemiLight.color.setRGB(s.hemiSky.r, s.hemiSky.g, s.hemiSky.b);
+    this.hemiLight.groundColor.setRGB(s.hemiGround.r, s.hemiGround.g, s.hemiGround.b);
+    this.hemiLight.intensity = s.hemiIntensity;
+
+    this.fog.color.setRGB(s.fogColor.r, s.fogColor.g, s.fogColor.b);
+    this.fog.density = s.fogDensity;
     if (scene.background instanceof THREE.Color) {
       scene.background.copy(this.fog.color);
     }
 
-    // Smoothly blend procedural non-glare sky dome colors & cloud states
-    this.skyUniforms.uZenithColor.value.lerp(t.skyZenith, blend);
-    this.skyUniforms.uMidSkyColor.value.lerp(t.skyMid, blend);
-    this.skyUniforms.uHorizonColor.value.lerp(t.skyHorizon, blend);
-    this.skyUniforms.uGroundColor.value.lerp(t.skyGround, blend);
-    this.skyUniforms.uAntiSunColor.value.lerp(t.antiSunColor, blend);
-    this.skyUniforms.uSunColor.value.lerp(t.sunColor, blend);
-    this.skyUniforms.uSunStrength.value = THREE.MathUtils.lerp(
-      this.skyUniforms.uSunStrength.value,
-      t.sunDiscStrength,
-      blend,
-    );
-    this.skyUniforms.uCloudCoverage.value = THREE.MathUtils.lerp(
-      this.skyUniforms.uCloudCoverage.value,
-      t.cloudCoverage,
-      blend,
-    );
-    this.skyUniforms.uCloudDarkness.value = THREE.MathUtils.lerp(
-      this.skyUniforms.uCloudDarkness.value,
-      t.cloudDarkness,
-      blend,
-    );
-    this.skyUniforms.uStarVisibility.value = THREE.MathUtils.lerp(
-      this.skyUniforms.uStarVisibility.value,
-      t.starVisibility,
-      blend,
-    );
+    this.skyUniforms.uZenithColor.value.setRGB(s.skyZenith.r, s.skyZenith.g, s.skyZenith.b);
+    this.skyUniforms.uMidSkyColor.value.setRGB(s.skyMid.r, s.skyMid.g, s.skyMid.b);
+    this.skyUniforms.uHorizonColor.value.setRGB(s.skyHorizon.r, s.skyHorizon.g, s.skyHorizon.b);
+    this.skyUniforms.uGroundColor.value.setRGB(s.skyGround.r, s.skyGround.g, s.skyGround.b);
+    this.skyUniforms.uAntiSunColor.value.setRGB(s.antiSunColor.r, s.antiSunColor.g, s.antiSunColor.b);
+    this.skyUniforms.uSunColor.value.setRGB(s.sunColor.r, s.sunColor.g, s.sunColor.b);
+    this.skyUniforms.uSunStrength.value = s.sunDiscStrength;
+    this.skyUniforms.uCloudCoverage.value = s.cloudCoverage;
+    this.skyUniforms.uCloudDarkness.value = s.cloudDarkness;
+    this.skyUniforms.uStarVisibility.value = s.starVisibility;
+    this.skyUniforms.uLightningFlash.value = this.lightningFlash;
     this.skyUniforms.uTime.value += dt;
     this.skyDome.position.set(focusX, 0, focusZ);
 
-    this.uniforms.uWetness.value = THREE.MathUtils.lerp(
-      this.uniforms.uWetness.value,
-      t.wetness,
-      blend,
-    );
-    this.syncRoadWetClearcoat();
-
-    // High-energy studio-grade PMREM reflection intensity across all presets
-    const targetEnv =
-      this.timePreset === 'night'
-        ? 0.96
-        : this.weather === 'storm'
-          ? 0.94
-          : this.weather === 'rain' || this.weather === 'fog'
-            ? 1.06
-            : 1.22;
-    scene.environmentIntensity = THREE.MathUtils.lerp(
-      scene.environmentIntensity,
-      targetEnv,
-      blend,
-    );
-
-    this.uniforms.uWindStrength.value = THREE.MathUtils.lerp(
-      this.uniforms.uWindStrength.value,
-      t.windStrength,
-      blend,
-    );
-    this.uniforms.uNightFactor.value = THREE.MathUtils.lerp(
-      this.uniforms.uNightFactor.value,
-      t.nightFactor,
-      blend,
-    );
+    this.uniforms.uWetness.value = s.wetness;
+    this.uniforms.uRainDensity.value = s.rainDensity;
+    this.uniforms.uWindStrength.value = s.windStrength;
+    this.uniforms.uNightFactor.value = s.nightFactor;
+    this.uniforms.uLightningFlash.value = this.lightningFlash;
+    this.uniforms.uSkyZenith.value.setRGB(s.skyZenith.r, s.skyZenith.g, s.skyZenith.b);
+    this.uniforms.uSkyHorizon.value.setRGB(s.skyHorizon.r, s.skyHorizon.g, s.skyHorizon.b);
     this.uniforms.uRainTime.value += dt;
     this.uniforms.uWindTime.value += dt;
 
-    renderer.toneMappingExposure = THREE.MathUtils.lerp(
-      renderer.toneMappingExposure,
-      t.exposure,
-      blend,
-    );
+    scene.environmentIntensity = s.envIntensity;
+    renderer.toneMappingExposure = s.exposure;
 
-    if (this.weather === 'storm') {
-      this.lightningTimer -= dt;
-      if (this.lightningTimer <= 0) {
-        this.lightningFlash = 1.0;
-        this.lightningTimer = 4.2 + Math.random() * 6.5;
-        onLightningStrike?.();
-      }
-    }
-    if (this.lightningFlash > 0) {
-      this.lightningFlash = Math.max(0, this.lightningFlash - dt * 3.8);
-    }
-    this.skyUniforms.uLightningFlash.value = this.lightningFlash;
+    this.sunLight.intensity = s.sunIntensity + this.lightningFlash * 3.8;
+    this.fillLight.intensity = s.rimIntensity + this.lightningFlash * 1.1;
+    this.lowFillLight.intensity = s.lowFillIntensity;
 
-    const baseSun = THREE.MathUtils.lerp(this.sunLight.intensity, t.sunIntensity, blend);
-    this.sunLight.intensity = baseSun + this.lightningFlash * 3.8;
-    const baseRim = this.timePreset === 'night' ? 0.65 : 0.85;
-    this.fillLight.intensity = baseRim + this.lightningFlash * 1.1;
-    this.lowFillLight.intensity = this.timePreset === 'night' ? 0.36 : 0.48;
-
-    this.updateSunDirection(t);
+    this.updateSunDirection(s);
     const sunElevPos = Math.max(0.32, Math.abs(this.sunVec.y));
-    // Snap shadow camera target to 0.5m world grid increments to eliminate shadow-edge crawling shimmer!
     const snapX = Math.round(focusX * 2) * 0.5;
     const snapZ = Math.round(focusZ * 2) * 0.5;
     this.sunLight.position.set(
@@ -1034,49 +712,45 @@ export class DynamicWeatherAndLighting {
     this.sunLight.target.position.set(snapX, 0, snapZ);
     this.sunLight.target.updateMatrixWorld();
 
-    this.syncNightEmissives();
+    this.syncNearestLamps(focusX, focusZ, forceImmediate);
+    this.syncRoadWetClearcoat(forceImmediate);
+    this.syncNightEmissives(forceImmediate);
+    this.rainSystem.update(focusX, focusZ, s.rainDensity);
+  }
 
-    if (t.rainDensity > 0.05) {
-      this.rainMesh.visible = true;
-      const activeCount = Math.floor(this.rainCount * t.rainDensity);
-      this.rainMesh.count = activeCount;
-      const windX = this.uniforms.uWindStrength.value * 5.2;
-      const tilt = Math.atan2(windX, 26);
-
-      this.dummy.rotation.set(0, 0, tilt);
-      this.dummy.scale.set(1, 1, 1);
-
-      for (let i = 0; i < activeCount; i++) {
-        let rx = this.rainPositions[i * 3];
-        let ry = this.rainPositions[i * 3 + 1];
-        let rz = this.rainPositions[i * 3 + 2];
-
-        ry -= this.rainSpeeds[i] * dt;
-        rx += windX * dt;
-
-        if (ry < 0) {
-          ry = 24 + Math.random() * 8;
-          rx = (Math.random() - 0.5) * 62;
-          rz = (Math.random() - 0.5) * 62;
-        }
-
-        this.rainPositions[i * 3] = rx;
-        this.rainPositions[i * 3 + 1] = ry;
-        this.rainPositions[i * 3 + 2] = rz;
-
-        this.dummy.position.set(focusX + rx, ry, focusZ + rz);
-        this.dummy.updateMatrix();
-        this.rainMesh.setMatrixAt(i, this.dummy.matrix);
-      }
-      this.rainMesh.instanceMatrix.needsUpdate = true;
-    } else {
-      this.rainMesh.visible = false;
+  public update(
+    dt: number,
+    focusX: number,
+    focusZ: number,
+    renderer: THREE.WebGLRenderer,
+    scene: THREE.Scene,
+    onLightningStrike?: () => void,
+    onWeatherTransition?: (weather: WeatherType) => void,
+  ): void {
+    const { weatherChangedTo } = stepAtmosphereState(this.atmosphereState, dt);
+    if (weatherChangedTo) {
+      onWeatherTransition?.(weatherChangedTo);
     }
+    this.currentSample = evaluateDynamicAtmosphere(this.atmosphereState);
+    const s = this.currentSample;
+
+    if (this.atmosphereState.weather === 'storm' && s.rainDensity > 0.65) {
+      this.lightningTimer -= dt;
+      if (this.lightningTimer <= 0) {
+        this.lightningFlash = 1.0;
+        this.lightningTimer = 4.2 + Math.random() * 6.5;
+        onLightningStrike?.();
+      }
+    }
+    if (this.lightningFlash > 0) {
+      this.lightningFlash = Math.max(0, this.lightningFlash - dt * 3.8);
+    }
+
+    this.applySampleToScene(renderer, scene, focusX, focusZ, dt, false);
   }
 
   public dispose(): void {
-    this.rainMesh.geometry.dispose();
-    (this.rainMesh.material as THREE.Material).dispose();
+    this.rainSystem.dispose();
     this.skyDome.geometry.dispose();
     (this.skyDome.material as THREE.Material).dispose();
     this.envMapTex?.dispose();

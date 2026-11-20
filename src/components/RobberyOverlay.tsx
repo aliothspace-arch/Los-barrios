@@ -5,12 +5,14 @@ interface RobberyOverlayProps {
   robbery: RobberyHUDState | null;
   touchControlsVisible: boolean;
   onAction: (action: RobberyActionType) => void;
+  onSkipDialogue: () => void;
 }
 
 export const RobberyOverlay: React.FC<RobberyOverlayProps> = ({
   robbery,
   touchControlsVisible,
   onAction,
+  onSkipDialogue,
 }) => {
   if (!robbery) return null;
 
@@ -40,7 +42,7 @@ export const RobberyOverlay: React.FC<RobberyOverlayProps> = ({
       />
 
       {/* TOP-LEFT: Compact Robbery Header & Live Gauges (leaves Top-Right GTA Cash/HP/Stars clean) */}
-      <div className="fixed top-6 sm:top-8 [@media(max-height:500px)]:top-2 left-2.5 sm:left-4 z-20 flex flex-col gap-1.5 max-w-[240px] sm:max-w-[300px] [@media(max-height:500px)]:max-w-[210px]">
+      <div className="fixed top-6 sm:top-8 [@media(max-height:500px)]:top-2 left-2.5 sm:left-4 z-20 flex flex-col gap-1.5 max-w-[240px] sm:max-w-[355px] [@media(max-height:500px)]:max-w-[210px]">
         <div className="bg-[#0e0c0a]/86 border border-[#e5a23c]/50 px-3 py-2 [@media(max-height:500px)]:px-2 [@media(max-height:500px)]:py-1.5">
           <div className="flex items-center justify-between gap-2 sm:gap-3">
             <div className="min-w-0">
@@ -286,7 +288,9 @@ export const RobberyOverlay: React.FC<RobberyOverlayProps> = ({
             <div className="text-[10px] [@media(max-height:500px)]:text-[9px] font-hud tracking-[0.14em] text-[#e6d7c1] text-center uppercase">
               {robbery.clerkKo
                 ? robbery.registerLooted
-                  ? 'CAJA SAQUEADA · SAL POR LA PUERTA VERDE'
+                  ? robbery.venueMode === 'indoor'
+                    ? 'CAJA SAQUEADA · SAL POR LA PUERTA VERDE'
+                    : 'CAJA SAQUEADA · ¡HUYE CALLE ABAJO!'
                   : 'ACÉRCATE AL MOSTRADOR PARA SAQUEAR LA CAJA O HUYE'
                 : 'COMBATE 3D EN TIEMPO REAL · MUÉVETE CON WASD / JOYSTICK'}
             </div>
@@ -356,10 +360,16 @@ export const RobberyOverlay: React.FC<RobberyOverlayProps> = ({
         )}
       </div>
 
-      {/* BOTTOM-CENTER: Authentic GTA V Dialogue Subtitles (clears left touch joystick in mobile brawl) */}
+      {/* BOTTOM-CENTER: Authentic GTA V Dialogue Subtitles (click/tap or [Tab] to skip) */}
       {robbery.dialogue && (
-        <div
-          className={`fixed bottom-7 sm:bottom-9 [@media(max-height:500px)]:bottom-1.5 z-30 px-3 sm:px-4 py-1.5 sm:py-2 [@media(max-height:500px)]:py-1 bg-[#0a0908]/88 border-t border-white/15 text-center pointer-events-none ${
+        <button
+          type="button"
+          tabIndex={-1}
+          onClick={(e) => {
+            e.currentTarget.blur();
+            onSkipDialogue();
+          }}
+          className={`pointer-events-auto fixed bottom-7 sm:bottom-9 [@media(max-height:500px)]:bottom-1.5 z-30 px-3 sm:px-4 py-1.5 sm:py-2 [@media(max-height:500px)]:py-1 bg-[#0a0908]/90 hover:bg-[#171411]/95 border-t border-white/20 text-center cursor-pointer ${
             isBrawl && touchControlsVisible
               ? 'right-3 sm:right-5 w-[min(64vw,520px)]'
               : 'left-1/2 -translate-x-1/2 w-[min(92vw,680px)]'
@@ -376,7 +386,10 @@ export const RobberyOverlay: React.FC<RobberyOverlayProps> = ({
           <span className="font-hud text-xs sm:text-base [@media(max-height:500px)]:text-xs text-[#f7f2e8] tracking-wide hud-stroke-sm">
             {robbery.dialogue.text}
           </span>
-        </div>
+          <span className="ml-2.5 text-[10px] font-tech tracking-wider text-[#b5a894] uppercase">
+            [TAB]
+          </span>
+        </button>
       )}
     </div>
   );

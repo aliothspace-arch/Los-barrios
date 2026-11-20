@@ -40,7 +40,11 @@ export const ShopModal: React.FC<ShopModalProps> = ({
         >
           <div>
             <div className="text-[10px] font-hud tracking-[0.2em] uppercase text-[#c7b8a0]">
-              COMERCIO DE LOS SANTOS
+              {shop.venueMode === 'street_cart'
+                ? 'PUESTO CALLEJERO · LOS SANTOS'
+                : shop.venueMode === 'outdoor_bay'
+                  ? 'TALLER ABIERTO · LOS SANTOS'
+                  : 'COMERCIO DE LOS SANTOS'}
             </div>
             <h2 className="font-display text-2xl sm:text-3xl tracking-wider leading-tight">
               {shop.name}

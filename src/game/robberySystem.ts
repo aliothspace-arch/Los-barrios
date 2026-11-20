@@ -13,6 +13,9 @@ import {
   SHOP_OWNER_PROFILES,
   type ShopOwnerProfile,
 } from './data/robberyDialogues';
+import { DialogueDirector, type DialoguePriority } from './dialogueDirector';
+import { worldToShopSpace } from './shopSystem';
+import { shopLocalToWorld } from './worldLayout';
 
 export { getShopOwnerProfile, SHOP_OWNER_PROFILES, type ShopOwnerProfile };
 
@@ -27,7 +30,6 @@ export function computeCooperationProbability(
 ): number {
   const clampedIntim = Math.max(0, Math.min(100, intimidation));
   const clampedRage = Math.max(0, Math.min(100, rage));
-  // Higher baseBravery lowers cooperation; high intimidation boosts it; excessive rage provokes rebellion
   const baseCoop = 0.72 - baseBravery * 0.58;
   const intimBoost = (clampedIntim / 100) * 0.34;
   const ragePenalty = Math.max(0, (clampedRage - 32) / 68) * 0.36;
@@ -76,8 +78,8 @@ export interface RobberyEvent {
 }
 
 export interface RobberyMoveInput {
-  moveX: number; // -1..1 (right positive)
-  moveZ: number; // -1..1 (forward toward -Z is negative, toward exit +Z is positive)
+  moveX: number; // -1..1 (right in shop-local space)
+  moveZ: number; // -1..1 (+1 toward door / street)
   sprint: boolean;
 }
 
@@ -98,9 +100,28 @@ export type ClerkBrawlAction =
   | 'stagger'
   | 'ko';
 
+export interface RobberySpatialBounds {
+  isOutdoor: boolean;
+  minX: number;
+  maxX: number;
+  minZ: number;
+  maxZ: number;
+  counterMinX: number;
+  counterMaxX: number;
+  counterMinZ: number;
+  counterMaxZ: number;
+  standoffZ: number;
+  clerkHomeZ: number;
+  exitMinX: number;
+  exitMaxX: number;
+  exitTriggerZ: number;
+  exitRadius: number;
+}
+
 export interface RobberySession {
   shop: ShopSpec;
   profile: ShopOwnerProfile;
+  bounds: RobberySpatialBounds;
   phase: RobberyPhase;
   outcome: RobberyOutcome;
   phaseTime: number;
@@ -111,6 +132,7 @@ export interface RobberySession {
   rage: number; // 0..100
   threatenCooldown: number;
   rushCooldown: number;
+  clerkReactQueued: boolean;
 
   // Cash & bag state
   bagCash: number;
@@ -131,9 +153,12 @@ export interface RobberySession {
   qteSweetMin: number;
   qteSweetMax: number;
 
-  // Real-time 3D positions inside interior room
-  // Room: x in [-4.2, 4.2], z in [-3.15, 3.95]
-  // Counter AABB: x in [-2.55, 2.55], z in [-1.75, -0.75]
+  // Entry lerp starting coordinates (shop-local)
+  startCjX: number;
+  startCjZ: number;
+  startCjHeading: number;
+
+  // Real-time 3D positions in shop-local space (+Z faces out the door / street)
   cjX: number;
   cjZ: number;
   cjHeading: number;
@@ -174,7 +199,8 @@ export interface RobberySession {
   clerkHitFlash: number;
   clerkKoFallProgress: number; // 0..1
 
-  // Dialogue & UI feedback
+  // Synchronized FIFO Dialogue Director & UI feedback
+  dialogueDirector: DialogueDirector;
   dialogueCounter: number;
   currentDialogue: RobberyDialogueLine | null;
   dialogueTimer: number;
@@ -187,20 +213,105 @@ export interface RobberySession {
   forcedOutcomeRoll?: number;
 }
 
-// Local room geometry constants shared with robberyScene.ts
+// Baseline interior bounds preserved for compatibility & unit tests
 export const INTERIOR_BOUNDS = {
-  minX: -4.15,
-  maxX: 4.15,
-  minZ: -3.15,
-  maxZ: 3.95,
-  counterMinX: -2.6,
-  counterMaxX: 2.6,
-  counterMinZ: -1.78,
-  counterMaxZ: -0.72,
-  exitMinX: -1.45,
-  exitMaxX: 1.45,
-  exitTriggerZ: 3.35,
+  minX: -3.65,
+  maxX: 3.65,
+  minZ: -2.4,
+  maxZ: 6.8,
+  counterMinX: -2.15,
+  counterMaxX: 2.15,
+  counterMinZ: -1.55,
+  counterMaxZ: -0.65,
+  exitMinX: -1.65,
+  exitMaxX: 1.65,
+  exitTriggerZ: 5.95,
 };
+
+export function computeRobberySpatialBounds(shop: ShopSpec): RobberySpatialBounds {
+  const isOutdoor = shop.venueMode !== 'indoor';
+  const counterPad = 0.08;
+  const counterMinX = -shop.counterHalfW - counterPad;
+  const counterMaxX = shop.counterHalfW + counterPad;
+  const counterMinZ = shop.counterLocalZ - shop.counterHalfD - counterPad;
+  const counterMaxZ = shop.counterLocalZ + shop.counterHalfD + counterPad;
+
+  const clerkHomeZ = shop.counterLocalZ - shop.counterHalfD - 0.55;
+  const standoffZ = counterMaxZ + 0.72;
+
+  if (isOutdoor) {
+    return {
+      isOutdoor: true,
+      minX: -8.5,
+      maxX: 8.5,
+      minZ: -5.5,
+      maxZ: standoffZ + 7.2,
+      counterMinX,
+      counterMaxX,
+      counterMinZ,
+      counterMaxZ,
+      standoffZ,
+      clerkHomeZ,
+      exitMinX: -8.5,
+      exitMaxX: 8.5,
+      exitTriggerZ: standoffZ + 5.8,
+      exitRadius: 5.8,
+    };
+  }
+
+  const doorLocalZ =
+    shop.doorX !== undefined && shop.doorZ !== undefined
+      ? worldToShopSpace(shop, shop.doorX, shop.doorZ).lz
+      : 6.5;
+
+  return {
+    isOutdoor: false,
+    minX: -3.6,
+    maxX: 3.6,
+    minZ: -2.38,
+    maxZ: doorLocalZ + 0.65,
+    counterMinX,
+    counterMaxX,
+    counterMinZ,
+    counterMaxZ,
+    standoffZ,
+    clerkHomeZ,
+    exitMinX: -1.65,
+    exitMaxX: 1.65,
+    exitTriggerZ: Math.max(2.6, doorLocalZ - 0.55),
+    exitRadius: 99,
+  };
+}
+
+export function getRobberyCjWorldTransform(
+  s: RobberySession,
+): { x: number; z: number; heading: number } {
+  const w = shopLocalToWorld(s.shop.originX, s.shop.originZ, s.shop.facingHeading, s.cjX, s.cjZ);
+  return { x: w.x, z: w.z, heading: s.cjHeading + s.shop.facingHeading };
+}
+
+export function getRobberyClerkWorldTransform(
+  s: RobberySession,
+): { x: number; z: number; heading: number } {
+  const w = shopLocalToWorld(s.shop.originX, s.shop.originZ, s.shop.facingHeading, s.clerkX, s.clerkZ);
+  return { x: w.x, z: w.z, heading: s.clerkHeading + s.shop.facingHeading };
+}
+
+export function getRobberyBatWorldPos(s: RobberySession): { x: number; z: number } {
+  return shopLocalToWorld(
+    s.shop.originX,
+    s.shop.originZ,
+    s.shop.facingHeading,
+    s.clerkBatDropX,
+    s.clerkBatDropZ,
+  );
+}
+
+export function skipRobberyDialogue(s: RobberySession): boolean {
+  const skipped = s.dialogueDirector.skipCurrent();
+  s.currentDialogue = s.dialogueDirector.getCurrentLine();
+  return skipped;
+}
 
 function pickLine(lines: string[], idx: number): string {
   return lines[Math.abs(idx) % lines.length];
@@ -211,19 +322,27 @@ function pushDialogue(
   events: RobberyEvent[],
   role: 'cj' | 'clerk',
   text: string,
+  opts: { priority?: DialoguePriority; beatTag?: string; pauseAfterSec?: number } = {},
 ): void {
   s.dialogueCounter++;
-  const line: RobberyDialogueLine = {
-    id: s.dialogueCounter,
+  const id = s.dialogueDirector.enqueue({
     speaker: role === 'cj' ? 'CJ' : s.profile.ownerName,
     role,
     text,
     pitch: role === 'cj' ? 0.86 : s.profile.voicePitch,
-    rate: role === 'cj' ? 1.03 : s.profile.voiceRate,
-  };
-  s.currentDialogue = line;
-  s.dialogueTimer = Math.max(2.6, Math.min(5.2, text.length * 0.055 + 1.4));
-  events.push({ type: 'dialogue', dialogue: line });
+    rate: role === 'cj' ? 0.99 : s.profile.voiceRate,
+    priority: opts.priority ?? 'normal',
+    beatTag: opts.beatTag,
+    pauseAfterSec: opts.pauseAfterSec,
+  });
+
+  const active = s.dialogueDirector.getCurrentLine();
+  s.currentDialogue = active;
+  s.dialogueTimer = active ? Math.max(2.6, s.dialogueTimer) : 0;
+
+  if (id > 0 && active && active.id === id) {
+    events.push({ type: 'dialogue', dialogue: active });
+  }
 }
 
 function setFeedback(
@@ -237,29 +356,17 @@ function setFeedback(
   s.feedbackTimer = duration;
 }
 
-function resolveInteriorCircle(
+function resolveShopCircle(
+  bounds: RobberySpatialBounds,
   x: number,
   z: number,
   radius: number,
 ): { x: number; z: number } {
-  let nx = Math.max(
-    INTERIOR_BOUNDS.minX + radius,
-    Math.min(INTERIOR_BOUNDS.maxX - radius, x),
-  );
-  let nz = Math.max(
-    INTERIOR_BOUNDS.minZ + radius,
-    Math.min(INTERIOR_BOUNDS.maxZ - radius, z),
-  );
+  let nx = Math.max(bounds.minX + radius, Math.min(bounds.maxX - radius, x));
+  let nz = Math.max(bounds.minZ + radius, Math.min(bounds.maxZ - radius, z));
 
-  // Resolve against counter AABB
-  const closestX = Math.max(
-    INTERIOR_BOUNDS.counterMinX,
-    Math.min(INTERIOR_BOUNDS.counterMaxX, nx),
-  );
-  const closestZ = Math.max(
-    INTERIOR_BOUNDS.counterMinZ,
-    Math.min(INTERIOR_BOUNDS.counterMaxZ, nz),
-  );
+  const closestX = Math.max(bounds.counterMinX, Math.min(bounds.counterMaxX, nx));
+  const closestZ = Math.max(bounds.counterMinZ, Math.min(bounds.counterMaxZ, nz));
   const dx = nx - closestX;
   const dz = nz - closestZ;
   const distSq = dx * dx + dz * dz;
@@ -270,16 +377,15 @@ function resolveInteriorCircle(
       nx += (dx / dist) * push;
       nz += (dz / dist) * push;
     } else {
-      // Inside AABB: push out along nearest edge
-      const penLeft = Math.abs(nx - INTERIOR_BOUNDS.counterMinX);
-      const penRight = Math.abs(INTERIOR_BOUNDS.counterMaxX - nx);
-      const penBack = Math.abs(nz - INTERIOR_BOUNDS.counterMinZ);
-      const penFront = Math.abs(INTERIOR_BOUNDS.counterMaxZ - nz);
+      const penLeft = Math.abs(nx - bounds.counterMinX);
+      const penRight = Math.abs(bounds.counterMaxX - nx);
+      const penBack = Math.abs(nz - bounds.counterMinZ);
+      const penFront = Math.abs(bounds.counterMaxZ - nz);
       const minPen = Math.min(penLeft, penRight, penBack, penFront);
-      if (minPen === penFront) nz = INTERIOR_BOUNDS.counterMaxZ + radius;
-      else if (minPen === penBack) nz = INTERIOR_BOUNDS.counterMinZ - radius;
-      else if (minPen === penLeft) nx = INTERIOR_BOUNDS.counterMinX - radius;
-      else nx = INTERIOR_BOUNDS.counterMaxX + radius;
+      if (minPen === penFront) nz = bounds.counterMaxZ + radius;
+      else if (minPen === penBack) nz = bounds.counterMinZ - radius;
+      else if (minPen === penLeft) nx = bounds.counterMinX - radius;
+      else nx = bounds.counterMaxX + radius;
     }
   }
   return { x: nx, z: nz };
@@ -287,9 +393,17 @@ function resolveInteriorCircle(
 
 export function createRobberySession(
   shop: ShopSpec,
-  options: { forcedOutcomeRoll?: number; rng?: () => number } = {},
+  options: {
+    forcedOutcomeRoll?: number;
+    rng?: () => number;
+    startWorldX?: number;
+    startWorldZ?: number;
+    startHeading?: number;
+    dialogueDirector?: DialogueDirector;
+  } = {},
 ): { session: RobberySession; events: RobberyEvent[] } {
   const profile = getShopOwnerProfile(shop.id);
+  const bounds = computeRobberySpatialBounds(shop);
   const rng = options.rng ?? Math.random;
   const totalStacks = 5;
   const basePayout = Math.round(shop.robMin + (shop.robMax - shop.robMin) * (0.45 + rng() * 0.45));
@@ -305,9 +419,26 @@ export function createRobberySession(
     });
   }
 
+  let startCjX = 0;
+  let startCjZ = bounds.standoffZ + 0.65;
+  let startCjHeading = Math.PI;
+  if (options.startWorldX !== undefined && options.startWorldZ !== undefined) {
+    const localStart = worldToShopSpace(shop, options.startWorldX, options.startWorldZ);
+    const resolved = resolveShopCircle(bounds, localStart.lx, localStart.lz, 0.42);
+    startCjX = resolved.x;
+    startCjZ = Math.max(bounds.counterMaxZ + 0.48, resolved.z);
+    if (options.startHeading !== undefined) {
+      startCjHeading = options.startHeading - shop.facingHeading;
+    }
+  }
+
+  const director = options.dialogueDirector ?? new DialogueDirector();
+  director.clear(false);
+
   const session: RobberySession = {
     shop,
     profile,
+    bounds,
     phase: 'entering',
     outcome: 'pending',
     phaseTime: 0,
@@ -316,6 +447,7 @@ export function createRobberySession(
     rage: Math.round(profile.baseBravery * 24),
     threatenCooldown: 0,
     rushCooldown: 0,
+    clerkReactQueued: false,
     bagCash: 0,
     totalStacks,
     stacksCollected: 0,
@@ -326,15 +458,18 @@ export function createRobberySession(
     bagOnCounter: false,
     registerLooted: false,
     lootingTimer: 0,
-    qteWindow: 1.8,
+    qteWindow: 1.85,
     qteElapsed: 0,
     qteResolved: false,
     qteSweetMin: 0.4,
     qteSweetMax: 0.82,
 
-    cjX: 0,
-    cjZ: 3.45,
-    cjHeading: Math.PI,
+    startCjX,
+    startCjZ,
+    startCjHeading,
+    cjX: startCjX,
+    cjZ: startCjZ,
+    cjHeading: startCjHeading,
     cjWalkCycle: 0,
     cjGesture: 'walk',
     cjGestureTimer: 0,
@@ -346,8 +481,8 @@ export function createRobberySession(
     cjPunchCombo: 0,
     cjHitFlash: 0,
 
-    clerkX: 0.2,
-    clerkZ: -2.25,
+    clerkX: 0.12,
+    clerkZ: bounds.clerkHomeZ,
     clerkHeading: 0,
     clerkWalkCycle: 0,
     clerkHealth: 100,
@@ -361,6 +496,7 @@ export function createRobberySession(
     clerkHitFlash: 0,
     clerkKoFallProgress: 0,
 
+    dialogueDirector: director,
     dialogueCounter: 0,
     currentDialogue: null,
     dialogueTimer: 0,
@@ -373,7 +509,13 @@ export function createRobberySession(
   };
 
   const events: RobberyEvent[] = [{ type: 'sfx', sfx: 'door_chime' }];
-  pushDialogue(session, events, 'cj', pickLine(profile.dialogues.cjEntry, Math.floor(rng() * 10)));
+  pushDialogue(
+    session,
+    events,
+    'cj',
+    pickLine(profile.dialogues.cjEntry, Math.floor(rng() * 10)),
+    { beatTag: 'cj_entry' },
+  );
   return { session, events };
 }
 
@@ -388,38 +530,39 @@ function transitionToPhase(
 
   if (next === 'intimidate') {
     s.cjX = 0;
-    s.cjZ = 0.08;
+    s.cjZ = s.bounds.standoffZ;
     s.cjHeading = Math.PI;
     s.cjGesture = 'point';
     s.bagOnCounter = true;
     s.bagOpenRatio = 0.35;
-    pushDialogue(s, events, 'clerk', pickLine(s.profile.dialogues.clerkEntry, s.dialogueCounter));
-  } else if (next === 'branch_reveal') {
-    const rollFn =
-      s.forcedOutcomeRoll !== undefined
-        ? () => s.forcedOutcomeRoll!
-        : rng;
-    s.outcome = rollRobberyOutcome(
-      s.profile.baseBravery,
-      s.intimidation,
-      s.rage,
-      rollFn,
+    s.clerkReactQueued = false;
+    pushDialogue(
+      s,
+      events,
+      'clerk',
+      pickLine(s.profile.dialogues.clerkEntry, s.dialogueCounter),
+      { beatTag: 'clerk_entry' },
     );
+  } else if (next === 'branch_reveal') {
+    const rollFn = s.forcedOutcomeRoll !== undefined ? () => s.forcedOutcomeRoll! : rng;
+    s.outcome = rollRobberyOutcome(s.profile.baseBravery, s.intimidation, s.rage, rollFn);
     if (s.outcome === 'comply') {
-      setFeedback(s, '¡EL DUEÑO SE RINDE!', 'good', 1.6);
+      setFeedback(s, '¡EL DUEÑO SE RINDE!', 'good', 1.8);
       pushDialogue(
         s,
         events,
         'clerk',
         pickLine(s.profile.dialogues.clerkComplyOpen, s.dialogueCounter),
+        { beatTag: 'branch_reveal' },
       );
     } else {
-      setFeedback(s, '¡CUIDADO! ¡SE REVUELVE!', 'bad', 1.6);
+      setFeedback(s, '¡CUIDADO! ¡SE REVUELVE!', 'bad', 1.8);
       pushDialogue(
         s,
         events,
         'clerk',
         pickLine(s.profile.dialogues.clerkRebelDraw, s.dialogueCounter),
+        { priority: 'urgent', beatTag: 'branch_reveal' },
       );
       events.push({ type: 'camera_trauma', amount: 0.35 });
     }
@@ -441,18 +584,30 @@ function transitionToPhase(
       s.stacks[0].state = 'counter';
       s.stacks[0].progress = 1;
     }
-    pushDialogue(s, events, 'cj', pickLine(s.profile.dialogues.cjComplyBag, s.dialogueCounter));
+    pushDialogue(
+      s,
+      events,
+      'cj',
+      pickLine(s.profile.dialogues.cjComplyBag, s.dialogueCounter),
+      { beatTag: 'comply_bag_start' },
+    );
   } else if (next === 'rebel_draw') {
     s.clerkHasBat = true;
     s.clerkAction = 'drawing_bat';
     s.bagOnCounter = false;
     s.bagOpenRatio = 0;
     events.push({ type: 'sfx', sfx: 'bat_whoosh' });
-    pushDialogue(s, events, 'cj', pickLine(s.profile.dialogues.cjRebelShock, s.dialogueCounter));
+    pushDialogue(
+      s,
+      events,
+      'cj',
+      pickLine(s.profile.dialogues.cjRebelShock, s.dialogueCounter),
+      { beatTag: 'rebel_shock' },
+    );
   } else if (next === 'rebel_qte_dodge') {
     s.clerkHasBat = true;
-    s.clerkX = 1.35;
-    s.clerkZ = -0.05;
+    s.clerkX = Math.min(s.bounds.maxX - 0.8, 1.35);
+    s.clerkZ = s.bounds.standoffZ - 0.25;
     s.clerkHeading = Math.atan2(s.cjX - s.clerkX, s.cjZ - s.clerkZ);
     s.cjHeading = Math.atan2(s.clerkX - s.cjX, s.clerkZ - s.cjZ);
     s.clerkAction = 'windup';
@@ -473,21 +628,25 @@ function transitionToPhase(
     s.clerkAction = s.clerkHealth > 0 ? 'chase' : 'ko';
     s.clerkActionTimer = 0.45;
     s.cjGesture = 'idle';
-    // Position both cleanly on the customer side of the counter for immediate 3D action
-    if (s.clerkZ < -0.5) {
-      s.clerkX = 1.95;
-      s.clerkZ = 0.25;
+    if (s.clerkZ < s.bounds.counterMaxZ + 0.15) {
+      s.clerkX = Math.min(s.bounds.maxX - 0.8, 1.75);
+      s.clerkZ = s.bounds.standoffZ + 0.1;
     }
-    if (s.cjZ < 0.25) {
-      s.cjZ = 0.65;
+    if (s.cjZ < s.bounds.standoffZ + 0.25) {
+      s.cjZ = s.bounds.standoffZ + 0.5;
     }
-    setFeedback(s, '¡PELEA EN TIENDA O HUYE POR LA PUERTA!', 'warn', 2.4);
-    pushDialogue(
-      s,
-      events,
-      'clerk',
-      pickLine(s.profile.dialogues.clerkBrawlTaunt, s.dialogueCounter),
-    );
+    const escapeHint = s.bounds.isOutdoor
+      ? '¡PELEA O ESCAPA POR LA CALLE!'
+      : '¡PELEA EN TIENDA O HUYE POR LA PUERTA!';
+    setFeedback(s, escapeHint, 'warn', 2.4);
+    if (!s.dialogueDirector.isBusy()) {
+      pushDialogue(
+        s,
+        events,
+        'clerk',
+        pickLine(s.profile.dialogues.clerkBrawlTaunt, s.dialogueCounter),
+      );
+    }
   } else if (next === 'exiting') {
     s.bagOnCounter = false;
     s.bagOpenRatio = 0;
@@ -498,7 +657,13 @@ function transitionToPhase(
       s.outcome === 'comply' || s.clerkHealth <= 0
         ? s.profile.dialogues.cjExitComply
         : s.profile.dialogues.cjExitFlee;
-    pushDialogue(s, events, 'cj', pickLine(exitPool, s.dialogueCounter));
+    pushDialogue(
+      s,
+      events,
+      'cj',
+      pickLine(exitPool, s.dialogueCounter),
+      { beatTag: 'exit_line', pauseAfterSec: 0.25 },
+    );
   }
 }
 
@@ -506,7 +671,6 @@ function advanceBagStack(
   s: RobberySession,
   events: RobberyEvent[],
   timingQuality: 'perfect' | 'good' | 'late',
-  rng: () => number,
 ): void {
   const stack = s.stacks[s.activeStackIndex];
   if (!stack) return;
@@ -533,8 +697,8 @@ function advanceBagStack(
     setFeedback(s, `LENTO · +$${gained}`, 'warn', 1.0);
   }
 
-  // Clerk pleads midway through bagging
-  if (s.stacksCollected === 2 || s.stacksCollected === 4) {
+  // Clerk pleads midway ONLY when queue is quiet so dialogue never clips
+  if ((s.stacksCollected === 2 || s.stacksCollected === 4) && !s.dialogueDirector.isBusy()) {
     pushDialogue(
       s,
       events,
@@ -543,10 +707,8 @@ function advanceBagStack(
     );
   }
 
-  // Move to next stack or finish bagging
   const nextIdx = s.activeStackIndex + 1;
   if (nextIdx >= s.totalStacks) {
-    // Brief moment for final stack sweep animation handled in step
     s.activeStackIndex = s.totalStacks;
   } else {
     s.activeStackIndex = nextIdx;
@@ -566,7 +728,6 @@ export function handleRobberyAction(
   const events: RobberyEvent[] = [];
   if (s.completed) return events;
 
-  // 1. Intimidation phase: player presses buttons to pressure clerk
   if (s.phase === 'intimidate') {
     if (action === 'intimidate') {
       s.intimidation = Math.min(100, s.intimidation + 15);
@@ -574,7 +735,7 @@ export function handleRobberyAction(
       s.cjGesture = 'point';
       s.cjGestureTimer = 0.36;
       setFeedback(s, '¡PRESIÓN +15!', 'good', 0.85);
-      if (s.dialogueTimer <= 0.8) {
+      if (s.dialogueDirector.getQueueLength() < 2) {
         pushDialogue(
           s,
           events,
@@ -590,7 +751,9 @@ export function handleRobberyAction(
       s.cjGesture = 'slam';
       s.cjGestureTimer = 0.45;
       setFeedback(s, '¡AMENAZA FUERTE!', 'warn', 1.0);
-      pushDialogue(s, events, 'cj', pickLine(s.profile.dialogues.cjThreaten, s.dialogueCounter));
+      if (s.dialogueDirector.getQueueLength() < 2) {
+        pushDialogue(s, events, 'cj', pickLine(s.profile.dialogues.cjThreaten, s.dialogueCounter));
+      }
       events.push({ type: 'camera_trauma', amount: 0.25 });
     } else if (action === 'rush' && s.rushCooldown <= 0) {
       s.intimidation = Math.min(100, s.intimidation + 20);
@@ -599,31 +762,28 @@ export function handleRobberyAction(
       s.cjGesture = 'slam';
       s.cjGestureTimer = 0.4;
       setFeedback(s, '¡APRESURAS AL DUEÑO!', 'warn', 1.0);
-      pushDialogue(s, events, 'cj', pickLine(s.profile.dialogues.cjRush, s.dialogueCounter));
+      if (s.dialogueDirector.getQueueLength() < 2) {
+        pushDialogue(s, events, 'cj', pickLine(s.profile.dialogues.cjRush, s.dialogueCounter));
+      }
       events.push({ type: 'camera_trauma', amount: 0.22 });
     }
 
-    // Immediate transition once intimidation meter maxes out
     if (s.intimidation >= 100) {
       transitionToPhase(s, 'branch_reveal', events, rng);
     }
     return events;
   }
 
-  // 2. Branch A: Bagging Cash Stacks QTE
   if (s.phase === 'comply_bag' && action === 'grab_cash') {
     if (s.activeStackIndex < s.totalStacks && !s.qteResolved) {
       const progress = s.qteElapsed / Math.max(0.01, s.qteWindow);
       const quality =
-        progress >= s.qteSweetMin && progress <= s.qteSweetMax
-          ? 'perfect'
-          : 'good';
-      advanceBagStack(s, events, quality, rng);
+        progress >= s.qteSweetMin && progress <= s.qteSweetMax ? 'perfect' : 'good';
+      advanceBagStack(s, events, quality);
     }
     return events;
   }
 
-  // 3. Branch B: Bat Ambush Dodge QTE
   if (s.phase === 'rebel_qte_dodge' && action === 'dodge') {
     if (!s.qteResolved) {
       s.qteResolved = true;
@@ -639,7 +799,6 @@ export function handleRobberyAction(
     return events;
   }
 
-  // 4. Branch B: Counter-Strike QTE
   if (s.phase === 'rebel_qte_counter' && (action === 'counter' || action === 'punch')) {
     if (!s.qteResolved) {
       s.qteResolved = true;
@@ -656,13 +815,18 @@ export function handleRobberyAction(
       events.push({ type: 'camera_trauma', amount: 0.36 });
       events.push({ type: 'bill_burst', amount: 6 });
       setFeedback(s, `¡CONTRAATAQUE! +$${bonusCash}`, 'good', 1.3);
-      pushDialogue(s, events, 'cj', pickLine(s.profile.dialogues.cjBrawlHit, s.dialogueCounter));
+      pushDialogue(
+        s,
+        events,
+        'cj',
+        pickLine(s.profile.dialogues.cjBrawlHit, s.dialogueCounter),
+        { priority: 'urgent' },
+      );
       transitionToPhase(s, 'rebel_brawl', events, rng);
     }
     return events;
   }
 
-  // 5. Branch B: Real-Time 3D Brawl Inside Store
   if (s.phase === 'rebel_brawl') {
     if (action === 'punch' && s.cjPunchCooldown <= 0 && s.cjDodgeTimer <= 0) {
       s.cjPunchCooldown = 0.42;
@@ -670,7 +834,6 @@ export function handleRobberyAction(
       s.cjGesture = s.cjPunchCombo === 0 ? 'punch_r' : 'punch_l';
       s.cjGestureTimer = 0.3;
 
-      // Face clerk if close enough
       const dx = s.clerkX - s.cjX;
       const dz = s.clerkZ - s.cjZ;
       const dist = Math.hypot(dx, dz);
@@ -686,9 +849,9 @@ export function handleRobberyAction(
         events.push({ type: 'hitstop', amount: 0.04 });
         events.push({ type: 'camera_trauma', amount: 0.28 });
 
-        // Knockback clerk slightly away from CJ
         const inv = 1 / Math.max(0.1, dist);
-        const pushed = resolveInteriorCircle(
+        const pushed = resolveShopCircle(
+          s.bounds,
           s.clerkX + dx * inv * 0.48,
           s.clerkZ + dz * inv * 0.48,
           0.42,
@@ -704,12 +867,14 @@ export function handleRobberyAction(
           s.clerkBatDropX = s.clerkX + 0.4;
           s.clerkBatDropZ = s.clerkZ + 0.25;
           setFeedback(s, '¡DUEÑO NOQUEADO! SAQUEA LA CAJA [F]', 'good', 2.6);
-          pushDialogue(s, events, 'clerk', pickLine(s.profile.dialogues.clerkKo, 0));
+          pushDialogue(s, events, 'clerk', pickLine(s.profile.dialogues.clerkKo, 0), {
+            priority: 'urgent',
+          });
         } else {
           s.clerkAction = 'stagger';
           s.clerkActionTimer = 0.46;
           setFeedback(s, `¡GOLPE! DUEÑO ${s.clerkHealth}% HP`, 'good', 0.9);
-          if (s.dialogueTimer <= 0.6) {
+          if (!s.dialogueDirector.isBusy()) {
             pushDialogue(
               s,
               events,
@@ -729,7 +894,6 @@ export function handleRobberyAction(
       s.cjDodgeCooldown = 0.78;
       s.cjGesture = 'duck_dodge';
       s.cjGestureTimer = 0.38;
-      // Strafe laterally away from clerk
       const dx = s.cjX - s.clerkX;
       const dz = s.cjZ - s.clerkZ;
       const dist = Math.max(0.1, Math.hypot(dx, dz));
@@ -741,7 +905,9 @@ export function handleRobberyAction(
     }
 
     if (action === 'loot_register') {
-      const nearCounter = Math.abs(s.cjX) <= 2.4 && s.cjZ <= 0.95;
+      const nearCounter =
+        Math.abs(s.cjX) <= s.bounds.counterMaxX + 0.55 &&
+        s.cjZ <= s.bounds.counterMaxZ + 1.85;
       if (s.clerkHealth <= 0 && !s.registerLooted && nearCounter) {
         s.registerLooted = true;
         s.drawerOpenRatio = 1.0;
@@ -765,6 +931,7 @@ export function handleRobberyAction(
           events,
           'cj',
           pickLine(s.profile.dialogues.cjLootRegister, 0),
+          { priority: 'urgent' },
         );
       }
       return events;
@@ -790,7 +957,10 @@ export function stepRobberySession(
 
   s.phaseTime += dt;
   s.totalTime += dt;
-  if (s.dialogueTimer > 0) s.dialogueTimer = Math.max(0, s.dialogueTimer - dt);
+  s.dialogueDirector.update(dt);
+  s.currentDialogue = s.dialogueDirector.getCurrentLine();
+  s.dialogueTimer = s.currentDialogue ? 1.5 : 0;
+
   if (s.feedbackTimer > 0) {
     s.feedbackTimer = Math.max(0, s.feedbackTimer - dt);
     if (s.feedbackTimer <= 0) s.feedbackText = null;
@@ -803,7 +973,6 @@ export function stepRobberySession(
   if (s.cjHitFlash > 0) s.cjHitFlash = Math.max(0, s.cjHitFlash - dt);
   if (s.clerkHitFlash > 0) s.clerkHitFlash = Math.max(0, s.clerkHitFlash - dt);
 
-  // Update active stack bagging animations
   for (const st of s.stacks) {
     if (st.state === 'bagging') {
       st.progress = Math.min(1, st.progress + dt * 2.8);
@@ -813,28 +982,25 @@ export function stepRobberySession(
 
   switch (s.phase) {
     case 'entering': {
-      const t = Math.min(1, s.phaseTime / 1.15);
-      // Smooth ease-out stride from door (3.45) to counter (0.08)
+      const dur = 0.65;
+      const t = Math.min(1, s.phaseTime / dur);
       const ease = 1 - (1 - t) * (1 - t);
-      s.cjZ = 3.45 + (0.08 - 3.45) * ease;
-      s.cjX = 0;
+      s.cjX = s.startCjX * (1 - ease);
+      s.cjZ = s.startCjZ + (s.bounds.standoffZ - s.startCjZ) * ease;
       s.cjHeading = Math.PI;
       s.cjWalkCycle += dt * 7.8;
-      if (s.phaseTime >= 1.15) {
+      if (s.phaseTime >= dur) {
         transitionToPhase(s, 'intimidate', events, rng);
       }
       break;
     }
 
     case 'intimidate': {
-      // Gentle decay on intimidation if player stalls
-      s.intimidation = Math.max(5, s.intimidation - dt * 2.2);
-      if (s.phaseTime >= 2.6 && s.dialogueTimer <= 0.15) {
-        const scared = computeCooperationProbability(
-          s.profile.baseBravery,
-          s.intimidation,
-          s.rage,
-        ) >= 0.5;
+      s.intimidation = Math.max(5, s.intimidation - dt * 2.0);
+      if (!s.clerkReactQueued && s.phaseTime >= 1.5 && !s.dialogueDirector.isBusy()) {
+        s.clerkReactQueued = true;
+        const scared =
+          computeCooperationProbability(s.profile.baseBravery, s.intimidation, s.rage) >= 0.5;
         pushDialogue(
           s,
           events,
@@ -843,16 +1009,24 @@ export function stepRobberySession(
             scared ? s.profile.dialogues.clerkScared : s.profile.dialogues.clerkDefiant,
             s.dialogueCounter,
           ),
+          { beatTag: 'clerk_react' },
         );
       }
-      if (s.phaseTime >= 5.6) {
+      if (
+        (s.phaseTime >= 7.2 && !s.dialogueDirector.isBusy()) ||
+        s.phaseTime >= 11.5
+      ) {
         transitionToPhase(s, 'branch_reveal', events, rng);
       }
       break;
     }
 
     case 'branch_reveal': {
-      if (s.phaseTime >= 0.9) {
+      const revealDone =
+        s.dialogueDirector.hasCompletedBeat('branch_reveal') ||
+        (!s.dialogueDirector.isBeatPlayingOrQueued('branch_reveal') &&
+          !s.dialogueDirector.isBusy());
+      if (s.phaseTime >= 0.9 && (revealDone || s.phaseTime >= 6.2)) {
         if (s.outcome === 'comply') {
           transitionToPhase(s, 'comply_open', events, rng);
         } else {
@@ -864,17 +1038,17 @@ export function stepRobberySession(
 
     case 'comply_open': {
       const prevDrawer = s.drawerOpenRatio;
-      if (s.phaseTime >= 0.65) {
-        s.drawerOpenRatio = Math.min(1, (s.phaseTime - 0.65) / 0.4);
+      if (s.phaseTime >= 0.45) {
+        s.drawerOpenRatio = Math.min(1, (s.phaseTime - 0.45) / 0.4);
         if (prevDrawer === 0 && s.drawerOpenRatio > 0) {
           events.push({ type: 'sfx', sfx: 'drawer_pop' });
         }
       }
-      if (s.phaseTime >= 1.0 && s.stacks[0]) {
+      if (s.phaseTime >= 0.85 && s.stacks[0]) {
         s.stacks[0].state = 'placing';
-        s.stacks[0].progress = Math.min(1, (s.phaseTime - 1.0) / 0.45);
+        s.stacks[0].progress = Math.min(1, (s.phaseTime - 0.85) / 0.42);
       }
-      if (s.phaseTime >= 1.45) {
+      if (s.phaseTime >= 1.3) {
         transitionToPhase(s, 'comply_bag', events, rng);
       }
       break;
@@ -882,7 +1056,6 @@ export function stepRobberySession(
 
     case 'comply_bag': {
       if (s.activeStackIndex >= s.totalStacks) {
-        // Wait briefly for last stack to land inside duffel bag
         const lastStack = s.stacks[s.totalStacks - 1];
         if (!lastStack || lastStack.state === 'bagged') {
           transitionToPhase(s, 'exiting', events, rng);
@@ -900,29 +1073,34 @@ export function stepRobberySession(
       }
 
       if (s.qteElapsed >= s.qteWindow && !s.qteResolved) {
-        advanceBagStack(s, events, 'late', rng);
+        advanceBagStack(s, events, 'late');
       }
       break;
     }
 
     case 'rebel_draw': {
-      // Clerk steps from behind counter around the east end (x = 2.85) toward customer zone
-      const t = Math.min(1, s.phaseTime / 1.1);
+      // Clerk steps smoothly around east end of counter or street cart
+      const t = Math.min(1, s.phaseTime / 1.15);
+      const sideX = s.bounds.counterMaxX + 0.48;
+      const startX = 0.12;
+      const startZ = s.bounds.clerkHomeZ;
+      const endX = Math.min(s.bounds.maxX - 0.8, 1.35);
+      const endZ = s.bounds.standoffZ - 0.25;
       if (t < 0.45) {
         const u = t / 0.45;
-        s.clerkX = 0.2 + (2.95 - 0.2) * u;
-        s.clerkZ = -2.25 + (-1.5 - -2.25) * u;
+        s.clerkX = startX + (sideX - startX) * u;
+        s.clerkZ = startZ + (s.shop.counterLocalZ - startZ) * u;
         s.clerkHeading = Math.PI * 0.42;
       } else {
         const u = (t - 0.45) / 0.55;
-        s.clerkX = 2.95 + (1.45 - 2.95) * u;
-        s.clerkZ = -1.5 + (-0.05 - -1.5) * u;
+        s.clerkX = sideX + (endX - sideX) * u;
+        s.clerkZ = s.shop.counterLocalZ + (endZ - s.shop.counterLocalZ) * u;
         s.clerkHeading = Math.atan2(s.cjX - s.clerkX, s.cjZ - s.clerkZ);
       }
       s.clerkWalkCycle += dt * 9.5;
       s.cjHeading = Math.atan2(s.clerkX - s.cjX, s.clerkZ - s.cjZ);
 
-      if (s.phaseTime >= 1.1) {
+      if (s.phaseTime >= 1.15) {
         transitionToPhase(s, 'rebel_qte_dodge', events, rng);
       }
       break;
@@ -965,10 +1143,10 @@ export function stepRobberySession(
     }
 
     case 'rebel_brawl': {
-      // 1. Player real-time 3D movement inside shop interior
       if (s.cjDodgeTimer > 0) {
         s.cjDodgeTimer = Math.max(0, s.cjDodgeTimer - dt);
-        const nextPos = resolveInteriorCircle(
+        const nextPos = resolveShopCircle(
+          s.bounds,
           s.cjX + s.cjDodgeDirX * 5.6 * dt,
           s.cjZ + s.cjDodgeDirZ * 5.6 * dt,
           0.42,
@@ -981,7 +1159,8 @@ export function stepRobberySession(
           const speed = move.sprint ? 4.6 : 3.4;
           const nx = move.moveX / Math.max(1, mag);
           const nz = move.moveZ / Math.max(1, mag);
-          const resolved = resolveInteriorCircle(
+          const resolved = resolveShopCircle(
+            s.bounds,
             s.cjX + nx * speed * dt,
             s.cjZ + nz * speed * dt,
             0.42,
@@ -998,17 +1177,21 @@ export function stepRobberySession(
         }
       }
 
-      // Auto-escape if CJ walks directly into the illuminated exit doorway
-      if (
-        s.cjZ >= INTERIOR_BOUNDS.exitTriggerZ &&
-        s.cjX >= INTERIOR_BOUNDS.exitMinX &&
-        s.cjX <= INTERIOR_BOUNDS.exitMaxX
-      ) {
+      // Auto-escape: doorway for indoor shops, wide street flee radius for outdoor cart/bay
+      const escapedIndoor =
+        !s.bounds.isOutdoor &&
+        s.cjZ >= s.bounds.exitTriggerZ &&
+        s.cjX >= s.bounds.exitMinX &&
+        s.cjX <= s.bounds.exitMaxX;
+      const escapedOutdoor =
+        s.bounds.isOutdoor &&
+        Math.hypot(s.cjX, s.cjZ - s.bounds.standoffZ) >= s.bounds.exitRadius;
+
+      if (escapedIndoor || escapedOutdoor) {
         transitionToPhase(s, 'exiting', events, rng);
         break;
       }
 
-      // 2. Clerk real-time AI (chase -> telegraph windup -> bat swing -> recover / KO)
       if (s.clerkHealth <= 0 || s.clerkAction === 'ko') {
         s.clerkAction = 'ko';
         s.clerkKoFallProgress = Math.min(1, s.clerkKoFallProgress + dt * 2.6);
@@ -1061,23 +1244,22 @@ export function stepRobberySession(
           s.clerkAction = 'chase';
         }
       } else {
-        // Chase steering (smart counter avoidance if counter sits between clerk and CJ)
         let targetX = s.cjX;
         let targetZ = s.cjZ;
-        const clerkBehind = s.clerkZ < INTERIOR_BOUNDS.counterMinZ;
-        const cjFront = s.cjZ > INTERIOR_BOUNDS.counterMaxZ;
-        const clerkFront = s.clerkZ > INTERIOR_BOUNDS.counterMaxZ;
-        const cjBehind = s.cjZ < INTERIOR_BOUNDS.counterMinZ;
+        const clerkBehind = s.clerkZ < s.bounds.counterMinZ;
+        const cjFront = s.cjZ > s.bounds.counterMaxZ;
+        const clerkFront = s.clerkZ > s.bounds.counterMaxZ;
+        const cjBehind = s.cjZ < s.bounds.counterMinZ;
         if ((clerkBehind && cjFront) || (clerkFront && cjBehind)) {
-          targetX = s.clerkX >= 0 ? 3.15 : -3.15;
-          targetZ = -1.25;
+          targetX = s.clerkX >= 0 ? s.bounds.counterMaxX + 0.55 : s.bounds.counterMinX - 0.55;
+          targetZ = s.shop.counterLocalZ;
         }
 
         if (dist <= 1.72) {
           s.clerkAction = 'windup';
           s.clerkActionTimer = 0.56;
           s.clerkHeading = Math.atan2(toCjX, toCjZ);
-          if (s.dialogueTimer <= 0.4) {
+          if (!s.dialogueDirector.isBusy()) {
             pushDialogue(
               s,
               events,
@@ -1090,7 +1272,8 @@ export function stepRobberySession(
           const sz = targetZ - s.clerkZ;
           const sDist = Math.max(0.05, Math.hypot(sx, sz));
           const chaseSpeed = 2.65;
-          const nextClerk = resolveInteriorCircle(
+          const nextClerk = resolveShopCircle(
+            s.bounds,
             s.clerkX + (sx / sDist) * chaseSpeed * dt,
             s.clerkZ + (sz / sDist) * chaseSpeed * dt,
             0.42,
@@ -1105,9 +1288,9 @@ export function stepRobberySession(
     }
 
     case 'exiting': {
-      // CJ sprints toward front doorway (0, 4.15)
+      const targetExitZ = s.bounds.isOutdoor ? s.bounds.standoffZ + 2.8 : s.bounds.exitTriggerZ + 0.7;
       const dx = 0 - s.cjX;
-      const dz = 4.1 - s.cjZ;
+      const dz = targetExitZ - s.cjZ;
       const d = Math.hypot(dx, dz);
       if (d > 0.1) {
         const step = Math.min(d, 4.4 * dt);
@@ -1116,7 +1299,11 @@ export function stepRobberySession(
         s.cjHeading = Math.atan2(dx, dz);
         s.cjWalkCycle += dt * 11.2;
       }
-      if (s.phaseTime >= 1.15) {
+
+      const exitDone =
+        s.dialogueDirector.hasCompletedBeat('exit_line') ||
+        !s.dialogueDirector.isBusy();
+      if (s.phaseTime >= 1.1 && (exitDone || s.phaseTime >= 4.4)) {
         s.completed = true;
         events.push({
           type: 'completed',
@@ -1169,7 +1356,9 @@ export function buildRobberyHudState(s: RobberySession): RobberyHUDState {
     };
   }
 
-  const nearCounter = Math.abs(s.cjX) <= 2.4 && s.cjZ <= 0.95;
+  const nearCounter =
+    Math.abs(s.cjX) <= s.bounds.counterMaxX + 0.55 &&
+    s.cjZ <= s.bounds.counterMaxZ + 1.85;
   const canLootRegister =
     s.phase === 'rebel_brawl' && s.clerkHealth <= 0 && !s.registerLooted && nearCounter;
   const canExitDoor = s.phase === 'rebel_brawl';
@@ -1181,6 +1370,7 @@ export function buildRobberyHudState(s: RobberySession): RobberyHUDState {
   return {
     shopId: s.shop.id,
     shopName: s.shop.name,
+    venueMode: s.shop.venueMode,
     ownerName: s.profile.ownerName,
     phase: s.phase,
     outcome: s.outcome,
@@ -1196,7 +1386,7 @@ export function buildRobberyHudState(s: RobberySession): RobberyHUDState {
     canExitDoor,
     dodgeCooldownRatio: Math.min(1, s.cjDodgeCooldown / 0.78),
     qte,
-    dialogue: s.dialogueTimer > 0 ? s.currentDialogue : null,
+    dialogue: s.dialogueDirector.getCurrentLine(),
     feedbackText: s.feedbackTimer > 0 ? s.feedbackText : null,
     feedbackTone: s.feedbackTone,
     cooperationChancePct: coopPct,

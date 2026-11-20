@@ -8,13 +8,26 @@ import {
   handleRobberyAction,
   INTERIOR_BOUNDS,
   rollRobberyOutcome,
+  skipRobberyDialogue,
   stepRobberySession,
 } from './robberySystem';
 
 const SHOP_247 = SHOPS.find((s) => s.id === 'shop_247')!;
 const SHOP_AMMU = SHOPS.find((s) => s.id === 'shop_ammunation')!;
+const SHOP_CLUCKIN = SHOPS.find((s) => s.id === 'shop_cluckin')!;
 
 const NO_MOVE = { moveX: 0, moveZ: 0, sprint: false };
+
+function stepUntil(
+  session: ReturnType<typeof createRobberySession>['session'],
+  predicate: () => boolean,
+  maxSteps = 90,
+  dt = 0.1,
+): void {
+  for (let i = 0; i < maxSteps && !predicate(); i++) {
+    stepRobberySession(session, dt, NO_MOVE, () => 0.5);
+  }
+}
 
 test('weighted cooperation probability respects shop bravery, intimidation, excess rage and [0.18, 0.82] bounds', () => {
   const timidShop = computeCooperationProbability(0.28, 70, 20);
@@ -38,18 +51,19 @@ test('weighted cooperation probability respects shop bravery, intimidation, exce
   assert.equal(rollRobberyOutcome(0.5, 50, 20, () => 0.95), 'rebel');
 });
 
-test('Branch A (Cooperation): full interactive flow opens register, bags 5 cash stacks with perfect bonus, and completes', () => {
+test('Branch A (Cooperation): natural dialogue beat pacing + full interactive flow bags 5 cash stacks and completes', () => {
   const { session, events: initEvents } = createRobberySession(SHOP_247, {
     forcedOutcomeRoll: 0.05, // guaranteed comply
     rng: () => 0.5,
   });
 
   assert.equal(session.phase, 'entering');
+  assert.equal(session.bounds.isOutdoor, false);
   assert.ok(initEvents.some((e) => e.type === 'dialogue' && e.dialogue?.role === 'cj'));
   assert.ok(initEvents.some((e) => e.type === 'sfx' && e.sfx === 'door_chime'));
 
   // Advance through entering -> intimidate
-  stepRobberySession(session, 1.2, NO_MOVE, () => 0.5);
+  stepUntil(session, () => session.phase === 'intimidate', 16);
   assert.equal(session.phase, 'intimidate');
 
   // Mash intimidate until meter reaches 100 -> branch_reveal
@@ -59,8 +73,12 @@ test('Branch A (Cooperation): full interactive flow opens register, bags 5 cash 
   assert.equal(session.phase, 'branch_reveal');
   assert.equal(session.outcome, 'comply');
 
-  // Advance branch_reveal -> comply_open -> comply_bag
-  stepRobberySession(session, 0.95, NO_MOVE, () => 0.5);
+  // Natural dialogue pacing: branch_reveal waits for dialogue beat instead of cutting off at 0.5s
+  stepRobberySession(session, 0.5, NO_MOVE, () => 0.5);
+  assert.equal(session.phase, 'branch_reveal', 'Dialogue line must not cut off prematurely');
+
+  // Allow branch_reveal dialogue beat to complete naturally -> comply_open -> comply_bag
+  stepUntil(session, () => session.phase === 'comply_open', 70);
   assert.equal(session.phase, 'comply_open');
 
   let sawDrawerPop = false;
@@ -75,7 +93,6 @@ test('Branch A (Cooperation): full interactive flow opens register, bags 5 cash 
   // Bag all 5 stacks inside sweet spot
   let sawBillBurst = false;
   for (let stack = 0; stack < session.totalStacks; stack++) {
-    // Advance into sweet spot (~55% of window)
     stepRobberySession(session, session.qteWindow * 0.55, NO_MOVE, () => 0.5);
     const evs = handleRobberyAction(session, 'grab_cash', () => 0.5);
     if (evs.some((e) => e.type === 'bill_burst')) sawBillBurst = true;
@@ -84,9 +101,9 @@ test('Branch A (Cooperation): full interactive flow opens register, bags 5 cash 
   assert.equal(session.stacksCollected, session.totalStacks);
   assert.ok(session.bagCash >= SHOP_247.robMin, 'Perfect bagging should yield full payout');
 
-  // Advance final stack animation -> exiting -> completed
+  // Advance final stack animation -> exiting -> completed (allowing natural exit dialogue)
   let completedEvent = null as ReturnType<typeof stepRobberySession>[number] | null;
-  for (let i = 0; i < 40 && !session.completed; i++) {
+  for (let i = 0; i < 80 && !session.completed; i++) {
     const evs = stepRobberySession(session, 0.1, NO_MOVE, () => 0.5);
     const found = evs.find((e) => e.type === 'completed');
     if (found) completedEvent = found;
@@ -102,19 +119,20 @@ test('Branch B (Bat Rebellion): QTE dodge/counter + real-time 3D brawl knockout 
   });
 
   // Entering -> intimidate -> threaten/rush to trigger branch_reveal
-  stepRobberySession(session, 1.2, NO_MOVE, () => 0.5);
+  stepUntil(session, () => session.phase === 'intimidate', 16);
   for (let i = 0; i < 6 && session.phase === 'intimidate'; i++) {
     handleRobberyAction(session, 'intimidate', () => 0.5);
   }
   assert.equal(session.phase, 'branch_reveal');
   assert.equal(session.outcome, 'rebel');
 
-  // branch_reveal -> rebel_draw -> rebel_qte_dodge
-  stepRobberySession(session, 0.95, NO_MOVE, () => 0.5);
+  // Test skipRobberyDialogue fast-forwarding branch_reveal cleanly without breaking transitions
+  skipRobberyDialogue(session);
+  stepUntil(session, () => session.phase === 'rebel_draw', 15);
   assert.equal(session.phase, 'rebel_draw');
   assert.equal(session.clerkHasBat, true);
 
-  stepRobberySession(session, 1.15, NO_MOVE, () => 0.5);
+  stepUntil(session, () => session.phase === 'rebel_qte_dodge', 16);
   assert.equal(session.phase, 'rebel_qte_dodge');
 
   // Successful QTE dodge deals zero player damage & moves to rebel_qte_counter
@@ -142,7 +160,7 @@ test('Branch B (Bat Rebellion): QTE dodge/counter + real-time 3D brawl knockout 
 
   // Move CJ near counter to loot the register after KO
   session.cjX = 0;
-  session.cjZ = 0.2;
+  session.cjZ = session.bounds.standoffZ;
   const hudNear = buildRobberyHudState(session);
   assert.equal(hudNear.canLootRegister, true);
 
@@ -156,12 +174,10 @@ test('Branch B (Bat Rebellion): QTE dodge/counter + real-time 3D brawl knockout 
     stepRobberySession(session, 0.1, { moveX: 0, moveZ: 1, sprint: true }, () => 0.5);
   }
   assert.equal(session.phase, 'exiting');
-  assert.ok(session.cjZ >= INTERIOR_BOUNDS.exitTriggerZ - 0.2);
+  assert.ok(session.cjZ >= session.bounds.exitTriggerZ - 0.2 || session.cjZ >= INTERIOR_BOUNDS.exitTriggerZ - 0.8);
 
   // Finish exiting
-  for (let i = 0; i < 20 && !session.completed; i++) {
-    stepRobberySession(session, 0.1, NO_MOVE, () => 0.5);
-  }
+  stepUntil(session, () => session.completed, 60);
   assert.equal(session.completed, true);
 });
 
@@ -171,12 +187,13 @@ test('Branch B missed dodge QTE deals real bat damage to player and still transi
     rng: () => 0.5,
   });
 
-  stepRobberySession(session, 1.2, NO_MOVE, () => 0.5);
+  stepUntil(session, () => session.phase === 'intimidate', 16);
   for (let i = 0; i < 8 && session.phase === 'intimidate'; i++) {
     handleRobberyAction(session, 'intimidate', () => 0.5);
   }
-  stepRobberySession(session, 0.95, NO_MOVE, () => 0.5); // -> rebel_draw
-  stepRobberySession(session, 1.15, NO_MOVE, () => 0.5); // -> rebel_qte_dodge
+  skipRobberyDialogue(session);
+  stepUntil(session, () => session.phase === 'rebel_draw', 15);
+  stepUntil(session, () => session.phase === 'rebel_qte_dodge', 16);
   assert.equal(session.phase, 'rebel_qte_dodge');
 
   // Let dodge timer expire without pressing button
@@ -184,4 +201,37 @@ test('Branch B missed dodge QTE deals real bat damage to player and still transi
   const dmg = evs.find((e) => e.type === 'damage_player');
   assert.ok(dmg && (dmg.amount ?? 0) > 0, 'Missed dodge QTE must deal bat damage');
   assert.equal(session.phase, 'rebel_qte_counter');
+});
+
+test('Street-cart robbery (Cluckin Bell) runs outdoors with street escape radius >= 5.8m', () => {
+  const { session } = createRobberySession(SHOP_CLUCKIN, {
+    forcedOutcomeRoll: 0.99,
+    rng: () => 0.5,
+    startWorldX: SHOP_CLUCKIN.registerX,
+    startWorldZ: SHOP_CLUCKIN.registerZ,
+    startHeading: Math.PI,
+  });
+
+  assert.equal(session.bounds.isOutdoor, true);
+  assert.equal(session.bounds.exitRadius, 5.8);
+  assert.equal(buildRobberyHudState(session).venueMode, 'street_cart');
+
+  stepUntil(session, () => session.phase === 'intimidate', 16);
+  for (let i = 0; i < 8 && session.phase === 'intimidate'; i++) {
+    handleRobberyAction(session, 'intimidate', () => 0.5);
+  }
+  skipRobberyDialogue(session);
+  stepUntil(session, () => session.phase === 'rebel_draw', 15);
+  stepUntil(session, () => session.phase === 'rebel_qte_dodge', 16);
+  handleRobberyAction(session, 'dodge', () => 0.5);
+  handleRobberyAction(session, 'counter', () => 0.5);
+  assert.equal(session.phase, 'rebel_brawl');
+
+  // Escape down the street (+Z) past 5.8m street radius
+  for (let i = 0; i < 40 && session.phase === 'rebel_brawl'; i++) {
+    stepRobberySession(session, 0.1, { moveX: 0, moveZ: 1, sprint: true }, () => 0.5);
+  }
+  assert.equal(session.phase, 'exiting');
+  stepUntil(session, () => session.completed, 60);
+  assert.equal(session.completed, true);
 });

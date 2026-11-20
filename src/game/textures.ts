@@ -100,6 +100,12 @@ export class HyperrealMaterialLibrary {
   public readonly manholeMat: THREE.MeshStandardMaterial;
   public readonly shrubMat: THREE.MeshStandardMaterial;
   public readonly cafeUmbrellaMat: THREE.MeshStandardMaterial;
+  public readonly trafficBackplateMat: THREE.MeshStandardMaterial;
+  public readonly trafficStreetSignMat: THREE.MeshStandardMaterial;
+  public readonly trafficHousingMat: THREE.MeshStandardMaterial;
+  public readonly trafficLensRedMat: THREE.MeshStandardMaterial;
+  public readonly trafficLensAmberOffMat: THREE.MeshStandardMaterial;
+  public readonly trafficLensGreenMat: THREE.MeshStandardMaterial;
 
   private readonly disposables: Array<{ dispose: () => void }> = [];
 
@@ -527,14 +533,8 @@ export class HyperrealMaterialLibrary {
       envMapIntensity: 0.12,
     });
 
-    // 11. Streetlamp Sodium Vapor Emissive + Micro-Detail Fabric & Car-Flake Maps + California Shade Trees
-    this.streetlampGlow = new THREE.MeshStandardMaterial({
-      color: 0xffe4b5,
-      emissive: new THREE.Color(0xffb454),
-      emissiveIntensity: 1.4,
-      roughness: 0.25,
-      metalness: 0.1,
-    });
+    // 11. Streetlamp Multi-Cell Cobra-Head Prismatic Optic + Micro-Detail Fabric & Car-Flake Maps + California Shade Trees
+    this.streetlampGlow = this.createStreetlampOpticMaterial();
 
     this.fabricNormalMap = this.createFabricNormalMap();
     this.carFlakeNormalMap = this.createCarFlakeNormalMap();
@@ -619,6 +619,12 @@ export class HyperrealMaterialLibrary {
       envMapIntensity: 0.22,
     });
     this.cafeUmbrellaMat = this.awningPalettes[0];
+    this.trafficBackplateMat = this.createTrafficBackplateMaterial();
+    this.trafficStreetSignMat = this.createTrafficStreetSignMaterial();
+    this.trafficHousingMat = this.createWeatheredPaintedMetalMaterial('#1a221d', '#0d110e', 4455, uniforms);
+    this.trafficLensRedMat = this.createTrafficSignalLensMaterial('#ff261b', '#ff3b24', true);
+    this.trafficLensAmberOffMat = this.createTrafficSignalLensMaterial('#3d2908', '#a86b14', false);
+    this.trafficLensGreenMat = this.createTrafficSignalLensMaterial('#18e874', '#26ff88', true);
 
     // 16. Soft Radial Contact Shadow Disc
     this.contactShadowMap = this.createContactShadowTexture();
@@ -628,6 +634,12 @@ export class HyperrealMaterialLibrary {
       this.weatheredNewsBoxMat,
       this.manholeMat,
       this.shrubMat,
+      this.trafficBackplateMat,
+      this.trafficStreetSignMat,
+      this.trafficHousingMat,
+      this.trafficLensRedMat,
+      this.trafficLensAmberOffMat,
+      this.trafficLensGreenMat,
       this.roadNS,
       this.roadEW,
       this.culDeSacAsphalt,
@@ -2910,6 +2922,245 @@ export class HyperrealMaterialLibrary {
       polygonOffset: true,
       polygonOffsetFactor: -1,
       polygonOffsetUnits: -1,
+    });
+  }
+
+  private createStreetlampOpticMaterial(): THREE.MeshStandardMaterial {
+    const w = 256;
+    const h = 256;
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    const ctx = c.getContext('2d')!;
+
+    // Die-cast aluminum bezel frame & internal reflector cavity
+    ctx.fillStyle = '#1b1e24';
+    ctx.fillRect(0, 0, w, h);
+    ctx.strokeStyle = '#383e4a';
+    ctx.lineWidth = 10;
+    ctx.strokeRect(8, 8, w - 16, h - 16);
+
+    // Warm sodium-LED refractive radial core
+    const bg = ctx.createRadialGradient(w * 0.5, h * 0.5, 12, w * 0.5, h * 0.5, w * 0.48);
+    bg.addColorStop(0, '#fff7e2');
+    bg.addColorStop(0.55, '#ffd088');
+    bg.addColorStop(0.88, '#c97e2e');
+    bg.addColorStop(1, '#23262e');
+    ctx.fillStyle = bg;
+    ctx.fillRect(16, 16, w - 32, h - 32);
+
+    // 4x8 precision TIR LED optical lens matrix with chrome reflectors
+    const cols = 4;
+    const rows = 8;
+    const padX = 28;
+    const padY = 24;
+    const cellW = (w - padX * 2) / cols;
+    const cellH = (h - padY * 2) / rows;
+    for (let r = 0; r < rows; r++) {
+      for (let col = 0; col < cols; col++) {
+        const cx = padX + (col + 0.5) * cellW;
+        const cy = padY + (r + 0.5) * cellH;
+        ctx.strokeStyle = 'rgba(42, 34, 24, 0.55)';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(cx - cellW * 0.44, cy - cellH * 0.42, cellW * 0.88, cellH * 0.84);
+
+        const lg = ctx.createRadialGradient(cx, cy, 1, cx, cy, cellH * 0.38);
+        lg.addColorStop(0, '#ffffff');
+        lg.addColorStop(0.5, '#ffe6b0');
+        lg.addColorStop(1, 'rgba(255, 178, 76, 0.15)');
+        ctx.fillStyle = lg;
+        ctx.beginPath();
+        ctx.arc(cx, cy, cellH * 0.36, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    const tex = finalizeTexture(c, true, this.anisotropy, 1, 1);
+    tex.wrapS = THREE.ClampToEdgeWrapping;
+    tex.wrapT = THREE.ClampToEdgeWrapping;
+    this.disposables.push(tex);
+    return new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      map: tex,
+      emissive: new THREE.Color(0xffbd59),
+      emissiveMap: tex,
+      emissiveIntensity: 1.5,
+      roughness: 0.16,
+      metalness: 0.18,
+    });
+  }
+
+  private createTrafficBackplateMaterial(): THREE.MeshStandardMaterial {
+    const w = 256;
+    const h = 512;
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    const ctx = c.getContext('2d')!;
+
+    // Matte black powder-coated aluminum signal backplate
+    ctx.fillStyle = '#14171a';
+    ctx.fillRect(0, 0, w, h);
+
+    // High-visibility Caltrans 2-inch retroreflective yellow safety border
+    ctx.strokeStyle = '#f5be18';
+    ctx.lineWidth = 16;
+    ctx.strokeRect(12, 12, w - 24, h - 24);
+    ctx.strokeStyle = '#2a2e33';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(22, 22, w - 44, h - 44);
+
+    // Horizontal wind-relief louvers and corner mounting rivets
+    for (let y = 44; y < h - 44; y += 22) {
+      ctx.fillStyle = '#0a0c0e';
+      ctx.fillRect(34, y, w - 68, 5);
+      ctx.fillStyle = '#262b30';
+      ctx.fillRect(34, y + 5, w - 68, 2);
+    }
+    ctx.fillStyle = '#7b828a';
+    const rivets = [
+      [28, 28],
+      [w - 28, 28],
+      [28, h * 0.5],
+      [w - 28, h * 0.5],
+      [28, h - 28],
+      [w - 28, h - 28],
+    ];
+    for (const [rx, ry] of rivets) {
+      ctx.beginPath();
+      ctx.arc(rx, ry, 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    const tex = finalizeTexture(c, true, this.anisotropy, 1, 1);
+    tex.wrapS = THREE.ClampToEdgeWrapping;
+    tex.wrapT = THREE.ClampToEdgeWrapping;
+    this.disposables.push(tex);
+    return new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      map: tex,
+      roughness: 0.54,
+      metalness: 0.35,
+    });
+  }
+
+  private createTrafficStreetSignMaterial(): THREE.MeshStandardMaterial {
+    const w = 512;
+    const h = 128;
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    const ctx = c.getContext('2d')!;
+
+    // Internally illuminated Caltrans / LADOT emerald green polycarbonate street blade
+    const g = ctx.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, '#0c4d2e');
+    g.addColorStop(0.5, '#136b41');
+    g.addColorStop(1, '#093b23');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, w, h);
+
+    // White reflective perimeter border + upper clamp bolt tabs
+    ctx.strokeStyle = '#f2f7f4';
+    ctx.lineWidth = 6;
+    ctx.strokeRect(10, 10, w - 20, h - 20);
+
+    // City seal badge on left + block number on right
+    ctx.fillStyle = '#d9f2e3';
+    ctx.beginPath();
+    ctx.arc(46, h * 0.5, 18, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#0c4d2e';
+    ctx.font = 'bold 14px Oswald, Impact, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('LS', 46, h * 0.5 + 1);
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 52px Oswald, Impact, Arial, sans-serif';
+    ctx.fillText('GANTON BLVD', w * 0.5, h * 0.52);
+
+    ctx.font = 'bold 18px Oswald, Arial, sans-serif';
+    ctx.fillStyle = '#cfeadd';
+    ctx.fillText('400 W', w - 52, 34);
+    ctx.fillText('←', w - 52, 92);
+
+    const tex = finalizeTexture(c, true, this.anisotropy, 1, 1);
+    tex.wrapS = THREE.ClampToEdgeWrapping;
+    tex.wrapT = THREE.ClampToEdgeWrapping;
+    this.disposables.push(tex);
+    return new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      map: tex,
+      emissive: new THREE.Color(0x63d999),
+      emissiveMap: tex,
+      emissiveIntensity: 0.52,
+      roughness: 0.28,
+      metalness: 0.14,
+    });
+  }
+
+  private createTrafficSignalLensMaterial(
+    coreHex: string,
+    emitHex: string,
+    active: boolean,
+  ): THREE.MeshStandardMaterial {
+    const size = 128;
+    const c = document.createElement('canvas');
+    c.width = size;
+    c.height = size;
+    const ctx = c.getContext('2d')!;
+
+    ctx.fillStyle = '#0c0e10';
+    ctx.fillRect(0, 0, size, size);
+
+    const rg = ctx.createRadialGradient(64, 64, 4, 64, 64, 58);
+    if (active) {
+      rg.addColorStop(0, '#ffffff');
+      rg.addColorStop(0.28, coreHex);
+      rg.addColorStop(0.82, emitHex);
+      rg.addColorStop(1, '#121417');
+    } else {
+      rg.addColorStop(0, '#543a12');
+      rg.addColorStop(0.65, coreHex);
+      rg.addColorStop(1, '#0e1012');
+    }
+    ctx.fillStyle = rg;
+    ctx.beginPath();
+    ctx.arc(64, 64, 58, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Fresnel concentric rings + honeycomb LED diode dots
+    ctx.strokeStyle = active ? 'rgba(18, 18, 20, 0.28)' : 'rgba(255, 210, 140, 0.12)';
+    ctx.lineWidth = 1.5;
+    for (let r = 12; r <= 54; r += 10) {
+      ctx.beginPath();
+      ctx.arc(64, 64, r, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    for (let y = 18; y <= 110; y += 10) {
+      for (let x = 18; x <= 110; x += 10) {
+        if (Math.hypot(x - 64, y - 64) <= 50) {
+          ctx.fillStyle = active ? 'rgba(255,255,255,0.45)' : 'rgba(190,130,30,0.16)';
+          ctx.beginPath();
+          ctx.arc(x + ((y / 10) % 2) * 4, y, 2.3, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    }
+
+    const tex = finalizeTexture(c, true, this.anisotropy, 1, 1);
+    tex.wrapS = THREE.ClampToEdgeWrapping;
+    tex.wrapT = THREE.ClampToEdgeWrapping;
+    this.disposables.push(tex);
+    return new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      map: tex,
+      emissive: new THREE.Color(active ? emitHex : 0x1a1103),
+      emissiveMap: tex,
+      emissiveIntensity: active ? 1.85 : 0.12,
+      roughness: active ? 0.14 : 0.28,
+      metalness: 0.15,
     });
   }
 

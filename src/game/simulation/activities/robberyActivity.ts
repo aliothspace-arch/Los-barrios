@@ -8,16 +8,22 @@ import {
   buildRobberyHudState,
   createRobberySession,
   handleRobberyAction,
+  skipRobberyDialogue,
   stepRobberySession,
   type RobberyEvent,
   type RobberySession,
 } from '../../robberySystem';
+import type { DialogueDirector } from '../../dialogueDirector';
 import type { ActivityContext, ActivityController } from './activityTypes';
 
 export interface RobberyStartParams {
   shop: ShopSpec;
   forcedOutcomeRoll?: number;
   rng?: () => number;
+  startWorldX?: number;
+  startWorldZ?: number;
+  startHeading?: number;
+  dialogueDirector?: DialogueDirector;
 }
 
 export interface RobberyActivityCallbacks {
@@ -25,9 +31,8 @@ export interface RobberyActivityCallbacks {
 }
 
 /**
- * Interactive 3D store robbery wrapped as an exclusive pluggable ActivityController.
- * Bridges the pure headless `robberySystem` state machine with `GameEventBus`
- * without coupling directly to `SanAndreasEngine`.
+ * Interactive 3D store / street-cart robbery wrapped as an exclusive pluggable ActivityController.
+ * Bridges the in-world `robberySystem` state machine with `GameEventBus` and `DialogueDirector`.
  */
 export class RobberyActivity
   implements ActivityController<RobberyStartParams, RobberyActionType, RobberyHUDState | null>
@@ -56,6 +61,10 @@ export class RobberyActivity
     const { session, events } = createRobberySession(params.shop, {
       forcedOutcomeRoll: params.forcedOutcomeRoll,
       rng: this.rng,
+      startWorldX: params.startWorldX,
+      startWorldZ: params.startWorldZ,
+      startHeading: params.startHeading,
+      dialogueDirector: params.dialogueDirector,
     });
     this.session = session;
     this.dispatchEvents(events, ctx);
@@ -63,6 +72,7 @@ export class RobberyActivity
 
   public update(dt: number, input: ControlInput, ctx: ActivityContext): void {
     if (!this.session) return;
+    // Project camera-relative WASD inputs into shop-local coordinates so movement inside any rotated store feels natural!
     const events = stepRobberySession(
       this.session,
       dt,
@@ -88,8 +98,14 @@ export class RobberyActivity
     }
   }
 
+  public skipDialogue(): boolean {
+    if (!this.session) return false;
+    return skipRobberyDialogue(this.session);
+  }
+
   public cancel(ctx: ActivityContext): void {
     if (!this.session) return;
+    this.session.dialogueDirector.clear(true);
     this.session = null;
     ctx.eventBus.emit('activity:ended', {
       activityId: this.id,

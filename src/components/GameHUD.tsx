@@ -1,5 +1,4 @@
 import React, { memo, useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import type { WeatherType } from '../game/types';
 import type { TouchControlState } from '../game/engine';
 import type { GameHudStore } from '../game/core/gameStore';
 
@@ -7,8 +6,6 @@ interface GameHUDProps {
   hudStore: GameHudStore;
   isFullscreen: boolean;
   onMinimapMount: (canvas: HTMLCanvasElement | null) => void;
-  onCycleWeather: () => void;
-  onCycleTime: () => void;
   onCycleCamera: () => void;
   onToggleMute: () => void;
   onTogglePause: () => void;
@@ -16,26 +13,17 @@ interface GameHUDProps {
   onToggleTouchControls: () => void;
   onTouchState: (partial: Partial<TouchControlState>) => void;
   onEnterExitVehicle: () => void;
-  onToggleDoors: () => void;
   onToggleFrunk: () => void;
   onOpenShop: () => void;
+  onRobNearestShop: () => void;
+  onSkipDialogue: () => void;
   onJumpOrAction: () => void;
   onCameraOrbit: (dx: number, dy: number) => void;
   onCameraOrbitActive: (active: boolean) => void;
 }
 
-const WEATHER_SHORT: Record<WeatherType, string> = {
-  golden: 'DORADO',
-  clear: 'SOL',
-  rain: 'LLUVIA',
-  storm: 'TORMENTA',
-  fog: 'NIEBLA',
-};
-
 /**
  * Isolated high-frequency telemetry speedometer (mobile touch mode).
- * Subscribes ONLY to `hudStore.subscribeTelemetry` so 30Hz speed/RPM ticks
- * never re-render the parent HUD, touch pads, or modals.
  */
 const MobileSpeedometer = memo(function MobileSpeedometer({
   hudStore,
@@ -46,31 +34,49 @@ const MobileSpeedometer = memo(function MobileSpeedometer({
     hudStore.subscribeTelemetry,
     hudStore.getTelemetry,
   );
+  const gearLabel = telemetry.gear === 'R' ? 'R' : telemetry.gear;
   return (
     <div
-      className="fixed bottom-2 left-1/2 -translate-x-1/2 z-10 px-2.5 py-1 bg-[#0d0b09]/42 border-b border-[#e5a23c]/75 flex items-center gap-2 pointer-events-none"
+      className="fixed bottom-2 left-1/2 -translate-x-1/2 z-10 px-2.5 py-1 bg-[#0d0b09]/58 border-b-2 border-[#e5a23c]/80 flex items-center gap-2 pointer-events-none"
       data-testid="mobile-speedometer"
     >
       <div className="flex items-baseline gap-1">
         <span
-          className="font-display text-xl leading-none text-[#f6efe3]"
+          className="font-display text-xl leading-none tabular-nums text-[#f6efe3]"
           data-testid="speed-readout"
         >
           {telemetry.speedKmh}
         </span>
         <span className="text-[8px] font-tech text-[#c9bda8]/85">KM/H</span>
       </div>
-      <div className="flex flex-col min-w-[66px]">
-        <div className="flex items-center justify-between text-[8px] font-hud tracking-wider">
-          <span className="text-[#e5a23c] font-bold">M{telemetry.gear}</span>
-          <span className="text-[#7bc9ff]">N2O {telemetry.nitro}%</span>
+      <div className="flex flex-col min-w-[78px]">
+        <div className="flex items-center justify-between text-[8px] font-hud tracking-wider gap-1.5">
+          <span
+            data-testid="gear-readout"
+            className={`px-1 font-bold tabular-nums border ${
+              telemetry.shiftFlash
+                ? 'bg-[#e03e2d] border-[#ff8275] text-[#fff6f4]'
+                : 'bg-[#191511] border-[#e5a23c]/55 text-[#e5a23c]'
+            }`}
+          >
+            {gearLabel}
+          </span>
+          <div className="flex items-center gap-1">
+            {telemetry.absActive && (
+              <span className="px-1 bg-[#7d1914] text-[#ffd6d2] font-bold">ABS</span>
+            )}
+            {telemetry.tractionSlip && (
+              <span className="px-1 bg-[#7a4b10] text-[#ffe2a8] font-bold">SLIP</span>
+            )}
+            <span className="text-[#7bc9ff] tabular-nums">N2O {telemetry.nitro}%</span>
+          </div>
         </div>
-        <div className="w-full h-[3px] bg-[#25211d]/70 mt-0.5 overflow-hidden">
+        <div className="w-full h-[3px] bg-[#25211d]/75 mt-0.5 overflow-hidden">
           <div
-            className="h-full transition-[width] duration-75"
+            className="w-full h-full origin-left will-change-transform transition-transform duration-75"
             style={{
-              width: `${Math.round(telemetry.rpmRatio * 100)}%`,
-              backgroundColor: telemetry.rpmRatio > 0.85 ? '#e03e2d' : '#e5a23c',
+              transform: `scaleX(${Math.max(0, Math.min(1, telemetry.rpmRatio))})`,
+              backgroundColor: telemetry.shiftFlash || telemetry.rpmRatio > 0.87 ? '#e03e2d' : '#e5a23c',
             }}
           />
         </div>
@@ -93,37 +99,61 @@ const DesktopSpeedometer = memo(function DesktopSpeedometer({
     hudStore.subscribeTelemetry,
     hudStore.getTelemetry,
   );
+  const gearLabel = telemetry.gear === 'R' ? 'R' : telemetry.gear;
   return (
-    <div className="px-2.5 py-1.5 bg-[#0d0b09]/46 border-r-2 border-[#e5a23c]/85 flex flex-col items-end min-w-[114px]">
-      <div className="text-[9px] font-hud tracking-[0.14em] text-[#e5a23c]/95">
-        {vehicleName}
+    <div className="px-2.5 py-1.5 bg-[#0d0b09]/56 border-r-2 border-[#e5a23c]/85 flex flex-col items-end min-w-[136px]">
+      <div className="w-full flex items-center justify-between gap-2 text-[9px] font-hud tracking-[0.14em]">
+        <div className="flex items-center gap-1">
+          <span
+            className={`px-1 py-[1px] font-bold ${
+              telemetry.absActive ? 'bg-[#a8241d] text-[#fff1ef]' : 'text-[#5c5347]/45'
+            }`}
+          >
+            ABS
+          </span>
+          <span
+            className={`px-1 py-[1px] font-bold ${
+              telemetry.tractionSlip ? 'bg-[#a86214] text-[#fff3dc]' : 'text-[#5c5347]/45'
+            }`}
+          >
+            SLIP
+          </span>
+        </div>
+        <span className="text-[#e5a23c]/95 truncate">{vehicleName}</span>
       </div>
-      <div className="flex items-baseline gap-1.5">
+      <div className="flex items-baseline gap-2 mt-0.5">
         <span
-          className="font-display text-3xl leading-none text-[#f6efe3]"
+          className="font-display text-3xl leading-none tabular-nums text-[#f6efe3]"
           data-testid="speed-readout"
         >
           {telemetry.speedKmh}
         </span>
-        <div className="flex flex-col items-start">
+        <div className="flex flex-col items-end">
           <span className="text-[8px] font-tech text-[#c9bda8]/90">KM/H</span>
-          <span className="text-[10px] font-hud font-bold text-[#e5a23c]">
-            M{telemetry.gear}
+          <span
+            data-testid="gear-readout"
+            className={`px-1.5 py-[1px] text-[11px] font-hud font-bold tabular-nums border ${
+              telemetry.shiftFlash
+                ? 'bg-[#e03e2d] border-[#ff8a7d] text-[#fff7f5]'
+                : 'bg-[#17130f] border-[#e5a23c]/60 text-[#e5a23c]'
+            }`}
+          >
+            {gearLabel}
           </span>
         </div>
       </div>
-      <div className="w-full h-1 bg-[#25211d]/70 mt-0.5 overflow-hidden">
+      <div className="w-full h-1 bg-[#25211d]/75 mt-1 overflow-hidden">
         <div
-          className="h-full transition-[width] duration-75"
+          className="w-full h-full origin-left will-change-transform transition-transform duration-75"
           style={{
-            width: `${Math.round(telemetry.rpmRatio * 100)}%`,
-            backgroundColor: telemetry.rpmRatio > 0.85 ? '#e03e2d' : '#e5a23c',
+            transform: `scaleX(${Math.max(0, Math.min(1, telemetry.rpmRatio))})`,
+            backgroundColor: telemetry.shiftFlash || telemetry.rpmRatio > 0.87 ? '#e03e2d' : '#e5a23c',
           }}
         />
       </div>
-      <div className="w-full flex items-center justify-between text-[9px] font-tech text-[#c9bda8]/85 mt-0.5 gap-2">
+      <div className="w-full flex items-center justify-between text-[9px] font-tech tabular-nums text-[#c9bda8]/85 mt-0.5 gap-2">
         <span>N2O {telemetry.nitro}%</span>
-        <span>{telemetry.vehicleHealth}%</span>
+        <span>CHASSIS {telemetry.vehicleHealth}%</span>
       </div>
     </div>
   );
@@ -133,8 +163,6 @@ export const GameHUD: React.FC<GameHUDProps> = memo(function GameHUD({
   hudStore,
   isFullscreen,
   onMinimapMount,
-  onCycleWeather,
-  onCycleTime,
   onCycleCamera,
   onToggleMute,
   onTogglePause,
@@ -142,9 +170,10 @@ export const GameHUD: React.FC<GameHUDProps> = memo(function GameHUD({
   onToggleTouchControls,
   onTouchState,
   onEnterExitVehicle,
-  onToggleDoors,
   onToggleFrunk,
   onOpenShop,
+  onRobNearestShop,
+  onSkipDialogue,
   onJumpOrAction,
   onCameraOrbit,
   onCameraOrbitActive,
@@ -156,11 +185,14 @@ export const GameHUD: React.FC<GameHUDProps> = memo(function GameHUD({
   const minimapRef = useRef<HTMLCanvasElement | null>(null);
   const [ghostHealth, setGhostHealth] = useState(player.health);
   const [stickKnob, setStickKnob] = useState({ x: 0, y: 0 });
+  const [steerSliderX, setSteerSliderX] = useState(0);
   const [isPortraitMobile, setIsPortraitMobile] = useState(false);
   const [portraitDismissed, setPortraitDismissed] = useState(false);
 
   const stickPointerId = useRef<number | null>(null);
   const stickCenter = useRef({ x: 0, y: 0 });
+  const steerPointerId = useRef<number | null>(null);
+  const steerTrackGeom = useRef({ centerX: 0, maxOffset: 64 });
   const orbitPointerId = useRef<number | null>(null);
   const orbitLast = useRef({ x: 0, y: 0 });
 
@@ -169,7 +201,13 @@ export const GameHUD: React.FC<GameHUDProps> = memo(function GameHUD({
     return () => onMinimapMount(null);
   }, [onMinimapMount]);
 
-  // Delayed trailing damage ghost bar
+  useEffect(() => {
+    if (!player.inVehicle) {
+      steerPointerId.current = null;
+      setSteerSliderX(0);
+    }
+  }, [player.inVehicle]);
+
   useEffect(() => {
     if (player.health < ghostHealth) {
       const id = window.setTimeout(() => setGhostHealth(player.health), 420);
@@ -178,7 +216,6 @@ export const GameHUD: React.FC<GameHUDProps> = memo(function GameHUD({
     setGhostHealth(player.health);
   }, [player.health, ghostHealth]);
 
-  // Detect narrow portrait mobile orientation for non-blocking landscape suggestion
   useEffect(() => {
     const check = () => {
       setIsPortraitMobile(window.innerWidth < 640 && window.innerHeight > window.innerWidth);
@@ -190,7 +227,40 @@ export const GameHUD: React.FC<GameHUDProps> = memo(function GameHUD({
 
   const cashFormatted = `$${String(Math.max(0, player.cash)).padStart(7, '0')}`;
 
-  // Touch Virtual Joystick Handlers (On-Foot)
+  const updateSteerSlider = (clientX: number) => {
+    const maxOff = steerTrackGeom.current.maxOffset;
+    const raw = clientX - steerTrackGeom.current.centerX;
+    const clamped = Math.max(-maxOff, Math.min(maxOff, raw));
+    setSteerSliderX(clamped);
+    onTouchState({ stickX: clamped / maxOff });
+  };
+
+  const handleSteerSliderDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    steerPointerId.current = e.pointerId;
+    const rect = e.currentTarget.getBoundingClientRect();
+    steerTrackGeom.current = {
+      centerX: rect.left + rect.width * 0.5,
+      maxOffset: Math.max(40, rect.width * 0.5 - 28),
+    };
+    updateSteerSlider(e.clientX);
+  };
+
+  const handleSteerSliderMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (steerPointerId.current !== e.pointerId) return;
+    e.stopPropagation();
+    updateSteerSlider(e.clientX);
+  };
+
+  const handleSteerSliderUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (steerPointerId.current !== e.pointerId) return;
+    e.stopPropagation();
+    steerPointerId.current = null;
+    setSteerSliderX(0);
+    onTouchState({ stickX: 0 });
+  };
+
   const handleStickDown = (e: React.PointerEvent<HTMLDivElement>) => {
     e.stopPropagation();
     e.currentTarget.setPointerCapture(e.pointerId);
@@ -233,7 +303,6 @@ export const GameHUD: React.FC<GameHUDProps> = memo(function GameHUD({
     onTouchState({ stickX: 0, stickY: 0 });
   };
 
-  // Full-Screen Free Camera Orbit Drag Surface (releases smoothly back behind CJ / vehicle!)
   const handleOrbitDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (orbitPointerId.current !== null) return;
     orbitPointerId.current = e.pointerId;
@@ -284,7 +353,7 @@ export const GameHUD: React.FC<GameHUDProps> = memo(function GameHUD({
         />
       )}
 
-      {/* Non-blocking Portrait Orientation Suggestion on Mobile (below top HUD bar) */}
+      {/* Non-blocking Portrait Orientation Suggestion on Mobile */}
       {!inRobbery && isPortraitMobile && !portraitDismissed && (
         <div className="pointer-events-auto fixed top-14 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 px-3 py-1.5 bg-[#120f0c]/95 border border-[#e2a54a]/70 text-xs font-hud text-[#f5ede0] whitespace-nowrap">
           <span>Gira el móvil en horizontal para jugar mejor</span>
@@ -298,7 +367,7 @@ export const GameHUD: React.FC<GameHUDProps> = memo(function GameHUD({
         </div>
       )}
 
-      {/* TOP-LEFT: Compact Translucent Objective Badge (hidden during store robbery) */}
+      {/* TOP-LEFT: Compact Translucent Objective Badge */}
       {!inRobbery && (
         <div className="fixed top-2.5 left-2.5 sm:top-3.5 sm:left-3.5 z-20 flex flex-col items-start gap-1">
           <div className="px-2 py-0.5 bg-[#0e0c0a]/42 border-l-2 border-[#e5a23c]/85 text-[10px] sm:text-[11px] font-hud tracking-wider text-[#f3eadb]/95">
@@ -310,43 +379,22 @@ export const GameHUD: React.FC<GameHUDProps> = memo(function GameHUD({
         </div>
       )}
 
-      {/* TOP-RIGHT: Authentic GTA San Andreas Status Cluster + Sleek Translucent Utility Buttons */}
+      {/* TOP-RIGHT: Authentic GTA San Andreas Status Cluster + Passive Dynamic Clock + Utility Icons */}
       <div
         className={`fixed right-2.5 sm:right-3.5 z-20 flex flex-col items-end gap-1 transition-[top] duration-200 ${
           showLetterboxOffset ? 'top-6 sm:top-8' : 'top-2.5 sm:top-3.5'
         }`}
       >
-        {/* Compact Translucent Utility Icon Row */}
         <div className="pointer-events-auto flex items-center gap-1">
           {!inRobbery && (
             <>
-              <button
-                type="button"
-                tabIndex={-1}
-                aria-label="Cambiar clima"
-                title="Clima [V]"
-                onClick={(e) => {
-                  e.currentTarget.blur();
-                  onCycleWeather();
-                }}
-                className="px-1.5 h-7 bg-[#0e0c0a]/38 hover:bg-[#1e1a15]/70 border border-[#e5a23c]/30 text-[10px] font-hud tracking-wider text-[#f4ead8]/90 cursor-pointer"
-              >
-                {WEATHER_SHORT[worldUi.weather]}
-              </button>
-
-              <button
-                type="button"
-                tabIndex={-1}
-                aria-label="Cambiar hora del día"
-                title="Hora [T]"
-                onClick={(e) => {
-                  e.currentTarget.blur();
-                  onCycleTime();
-                }}
-                className="px-1.5 h-7 bg-[#0e0c0a]/38 hover:bg-[#1e1a15]/70 border border-[#f4ead8]/18 text-[10px] font-hud tracking-wider text-[#f4ead8]/90 cursor-pointer"
+              <div
+                data-testid="world-clock"
+                aria-label={`Hora de Los Santos ${worldUi.clockText}`}
+                className="pointer-events-none px-2 h-7 flex items-center bg-[#0e0c0a]/38 border border-[#f4ead8]/16 text-[11px] font-tech tabular-nums tracking-wider text-[#f4ead8]/92 whitespace-nowrap"
               >
                 {worldUi.clockText}
-              </button>
+              </div>
 
               <button
                 type="button"
@@ -455,7 +503,7 @@ export const GameHUD: React.FC<GameHUDProps> = memo(function GameHUD({
           {cashFormatted}
         </div>
 
-        {/* Health Bar (with trailing damage ghost) & Armor Bar */}
+        {/* Health & Armor Bars */}
         <div className="flex flex-col items-end gap-1 w-32 sm:w-40">
           <div className="w-full h-3 bg-[#100e0d] border-2 border-[#080706] relative overflow-hidden">
             <div
@@ -477,7 +525,7 @@ export const GameHUD: React.FC<GameHUDProps> = memo(function GameHUD({
           )}
         </div>
 
-        {/* Wanted Level Stars (Custom inline SVG stars) */}
+        {/* Wanted Level Stars */}
         <div className="flex items-center gap-0.5 mt-0.5" aria-label={`Nivel de búsqueda ${player.wantedLevel} de 5`}>
           {[1, 2, 3, 4, 5].map((star) => {
             const active = star <= player.wantedLevel;
@@ -495,7 +543,7 @@ export const GameHUD: React.FC<GameHUDProps> = memo(function GameHUD({
         </div>
       </div>
 
-      {/* CENTER-UPPER DISTRICT / EVENT BANNER (Transient, hidden during store robbery) */}
+      {/* CENTER-UPPER DISTRICT / EVENT BANNER */}
       {!inRobbery && worldUi.bannerText && (
         <div className="fixed top-12 left-1/2 -translate-x-1/2 pointer-events-none text-center">
           <div className="font-display text-2xl sm:text-3xl tracking-[0.14em] text-[#f5e7ce] hud-stroke">
@@ -504,7 +552,7 @@ export const GameHUD: React.FC<GameHUDProps> = memo(function GameHUD({
         </div>
       )}
 
-      {/* BOTTOM-LEFT: Authentic Circular San Andreas Radar Minimap (hidden indoors during robbery) */}
+      {/* BOTTOM-LEFT: Circular San Andreas Radar Minimap */}
       {!inRobbery && (
         <div
           className={`fixed bottom-2.5 left-2.5 sm:bottom-3.5 sm:left-3.5 flex items-end gap-2.5 transition-transform ${
@@ -513,7 +561,7 @@ export const GameHUD: React.FC<GameHUDProps> = memo(function GameHUD({
         >
           <div className="flex flex-col items-center gap-0.5">
             <div
-              className={`relative rounded-full border-2 border-[#0e0c0a]/85 shadow-[0_0_0_1.5px_rgba(226,165,74,0.55),0_4px_12px_rgba(0,0,0,0.6)] overflow-hidden bg-[#1b201c]/90 ${
+              className={`relative transform-gpu will-change-transform rounded-full border-2 border-[#0e0c0a]/85 shadow-[0_0_0_1.5px_rgba(226,165,74,0.55),0_4px_12px_rgba(0,0,0,0.6)] overflow-hidden bg-[#1b201c]/90 ${
                 worldUi.touchControlsVisible
                   ? 'w-[70px] h-[70px] sm:w-[84px] sm:h-[84px]'
                   : 'w-[92px] h-[92px] sm:w-[116px] sm:h-[116px]'
@@ -547,24 +595,61 @@ export const GameHUD: React.FC<GameHUDProps> = memo(function GameHUD({
           }`}
         >
           {worldUi.nearShop && !worldUi.activeShop && (
-            <button
-              type="button"
-              tabIndex={-1}
-              data-testid="enter-shop-prompt"
-              onClick={(e) => {
-                e.currentTarget.blur();
-                onOpenShop();
-              }}
-              className="pointer-events-auto px-3 py-1.5 bg-[#102416]/52 hover:bg-[#193822]/80 border border-[#49d478]/65 text-[#eefcf2] font-hud text-[11px] sm:text-xs tracking-wider cursor-pointer"
+            <div
+              data-testid="shop-register-prompt"
+              className="pointer-events-auto bg-[#0d0b09]/84 border border-[#e5a23c]/55 p-1.5 flex flex-col gap-1 min-w-[218px]"
             >
-              [F] {worldUi.nearShop.name}
-            </button>
+              <div className="flex items-center justify-between gap-2 px-1 text-[9px] font-hud tracking-[0.14em] uppercase text-[#e5a23c]">
+                <span className="truncate font-bold">{worldUi.nearShop.name}</span>
+                <span className="text-[#c9bda8] shrink-0">
+                  {worldUi.nearShop.venueMode === 'street_cart'
+                    ? 'PUESTO CALLEJERO'
+                    : worldUi.nearShop.venueMode === 'outdoor_bay'
+                      ? 'MOSTRADOR TALLER'
+                      : 'CAJA'}
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  data-testid="enter-shop-prompt"
+                  onClick={(e) => {
+                    e.currentTarget.blur();
+                    onOpenShop();
+                  }}
+                  className="flex-1 min-h-[44px] px-3 py-1.5 bg-[#164a25] hover:bg-[#1f6633] active:bg-[#2a8543] border border-[#49d478]/75 text-[#eefcf2] font-hud text-[11px] sm:text-xs font-bold tracking-wider cursor-pointer whitespace-nowrap"
+                >
+                  [F] COMPRAR
+                </button>
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  disabled={worldUi.nearShopCooldown > 0}
+                  data-testid="rob-shop-prompt"
+                  onClick={(e) => {
+                    e.currentTarget.blur();
+                    onRobNearestShop();
+                  }}
+                  className={`flex-1 min-h-[44px] px-3 py-1.5 border font-hud text-[11px] sm:text-xs font-bold tracking-wider whitespace-nowrap ${
+                    worldUi.nearShopCooldown > 0
+                      ? 'bg-[#241615]/85 border-white/15 text-[#9c7b77] cursor-not-allowed'
+                      : 'bg-[#7d1914] hover:bg-[#a1221b] active:bg-[#bd2a22] border-[#ff756b]/80 text-[#fff2f0] cursor-pointer'
+                  }`}
+                >
+                  {worldUi.nearShopCooldown > 0
+                    ? `CAJA VACÍA · ${worldUi.nearShopCooldown}s`
+                    : '[R] ATRACAR'}
+                </button>
+              </div>
+            </div>
           )}
 
           {!player.inVehicle && player.nearVehicleName && !worldUi.touchControlsVisible && (
             <button
               type="button"
               tabIndex={-1}
+              data-testid="enter-vehicle-prompt"
               onClick={(e) => {
                 e.currentTarget.blur();
                 onEnterExitVehicle();
@@ -577,19 +662,6 @@ export const GameHUD: React.FC<GameHUDProps> = memo(function GameHUD({
 
           {(player.inVehicle || player.nearVehicleName) && !worldUi.touchControlsVisible && (
             <div className="pointer-events-auto flex items-center gap-1">
-              <button
-                type="button"
-                tabIndex={-1}
-                data-testid="toggle-doors-btn"
-                title="Puertas de Mariposa [O]"
-                onClick={(e) => {
-                  e.currentTarget.blur();
-                  onToggleDoors();
-                }}
-                className="px-2 py-1 bg-[#12100d]/52 hover:bg-[#241e18]/80 border border-[#e5a23c]/45 text-[#f5ecd9] font-hud text-[10px] tracking-wider cursor-pointer"
-              >
-                [O] PUERTAS
-              </button>
               <button
                 type="button"
                 tabIndex={-1}
@@ -615,38 +687,39 @@ export const GameHUD: React.FC<GameHUDProps> = memo(function GameHUD({
       {/* ERGONOMIC, TRANSLUCENT NON-INTRUSIVE LANDSCAPE TOUCH CONTROLS */}
       {worldUi.touchControlsVisible && (!inRobbery || inRobberyBrawl) && (
         <>
-          {/* LEFT THUMB ZONE: Translucent Virtual Stick (On-Foot & Robbery Brawl) or Slim Steering Pads (Driving) */}
           <div className="pointer-events-auto fixed bottom-2.5 left-2.5 sm:bottom-3.5 sm:left-3.5 z-20">
             {player.inVehicle && !inRobbery ? (
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  aria-label="Girar izquierda"
-                  onPointerDown={(e) => {
-                    e.preventDefault();
-                    onTouchState({ steerLeft: true });
-                  }}
-                  onPointerUp={() => onTouchState({ steerLeft: false })}
-                  onPointerLeave={() => onTouchState({ steerLeft: false })}
-                  onPointerCancel={() => onTouchState({ steerLeft: false })}
-                  className="w-14 h-14 sm:w-16 sm:h-16 rounded-xl bg-[#100e0c]/26 active:bg-[#e5a23c]/70 active:text-[#110d09] border border-[#f2e8d6]/28 text-[#f5ede0]/85 flex items-center justify-center font-display text-xl"
-                >
+              <div
+                data-testid="touch-steer-slider"
+                role="slider"
+                aria-label="Dirección analógica"
+                aria-valuemin={-100}
+                aria-valuemax={100}
+                aria-valuenow={Math.round((steerSliderX / Math.max(1, steerTrackGeom.current.maxOffset)) * 100)}
+                onPointerDown={handleSteerSliderDown}
+                onPointerMove={handleSteerSliderMove}
+                onPointerUp={handleSteerSliderUp}
+                onPointerCancel={handleSteerSliderUp}
+                className="relative w-44 sm:w-52 min-h-[56px] touch-none bg-[#100e0c]/42 border border-[#f2e8d6]/32 flex items-center justify-center px-2 cursor-ew-resize overflow-hidden"
+              >
+                <div className="absolute inset-x-3 top-1/2 -translate-y-1/2 h-[2px] bg-[#f2e8d6]/25 pointer-events-none">
+                  <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[2px] h-3 bg-[#e5a23c]/75" />
+                </div>
+                <span className="absolute left-2.5 text-[10px] font-hud text-[#f2e8d6]/65 pointer-events-none">
                   ◀
-                </button>
-                <button
-                  type="button"
-                  aria-label="Girar derecha"
-                  onPointerDown={(e) => {
-                    e.preventDefault();
-                    onTouchState({ steerRight: true });
-                  }}
-                  onPointerUp={() => onTouchState({ steerRight: false })}
-                  onPointerLeave={() => onTouchState({ steerRight: false })}
-                  onPointerCancel={() => onTouchState({ steerRight: false })}
-                  className="w-14 h-14 sm:w-16 sm:h-16 rounded-xl bg-[#100e0c]/26 active:bg-[#e5a23c]/70 active:text-[#110d09] border border-[#f2e8d6]/28 text-[#f5ede0]/85 flex items-center justify-center font-display text-xl"
-                >
+                </span>
+                <span className="absolute right-2.5 text-[10px] font-hud text-[#f2e8d6]/65 pointer-events-none">
                   ▶
-                </button>
+                </span>
+                <div
+                  data-testid="touch-steer-thumb"
+                  className="relative z-10 w-12 h-12 bg-[#e5a23c]/85 border border-[#110d09]/70 flex items-center justify-center text-[#110d09] font-hud text-[11px] font-bold pointer-events-none shadow-sm"
+                  style={{
+                    transform: `translate3d(${steerSliderX}px, 0, 0)`,
+                  }}
+                >
+                  ⇄
+                </div>
               </div>
             ) : (
               <div
@@ -667,49 +740,53 @@ export const GameHUD: React.FC<GameHUDProps> = memo(function GameHUD({
             )}
           </div>
 
-          {/* RIGHT THUMB ZONE: Translucent Pedals (Driving) or Slim Action/Jump/Sprint (On-Foot) */}
           {!inRobbery && (
             <div className="pointer-events-auto fixed bottom-2.5 right-2.5 sm:bottom-3.5 sm:right-3.5 z-20 flex items-end gap-1.5">
               {worldUi.nearShop && !worldUi.activeShop && (
-                <button
-                  type="button"
-                  aria-label={`Entrar a ${worldUi.nearShop.name}`}
-                  onPointerDown={(e) => {
-                    e.preventDefault();
-                    onOpenShop();
-                  }}
-                  className="w-12 h-12 sm:w-14 sm:h-14 rounded-full bg-[#143d22]/36 active:bg-[#2ca358]/75 border border-[#49d478]/55 text-[#eefcf2]/90 font-hud text-[10px] font-bold tracking-wider flex items-center justify-center"
-                >
-                  TIENDA
-                </button>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    aria-label={`Comprar en ${worldUi.nearShop.name}`}
+                    onPointerDown={(e) => {
+                      e.preventDefault();
+                      onOpenShop();
+                    }}
+                    className="min-w-[60px] min-h-[48px] px-2.5 py-2 rounded-lg bg-[#143d22]/85 active:bg-[#2ca358] border border-[#49d478]/70 text-[#eefcf2] font-hud text-[10px] font-bold tracking-wider flex items-center justify-center"
+                  >
+                    COMPRAR
+                  </button>
+                  <button
+                    type="button"
+                    disabled={worldUi.nearShopCooldown > 0}
+                    aria-label={`Atracar ${worldUi.nearShop.name}`}
+                    onPointerDown={(e) => {
+                      e.preventDefault();
+                      if (worldUi.nearShopCooldown <= 0) onRobNearestShop();
+                    }}
+                    className={`min-w-[60px] min-h-[48px] px-2.5 py-2 rounded-lg border font-hud text-[10px] font-bold tracking-wider flex items-center justify-center ${
+                      worldUi.nearShopCooldown > 0
+                        ? 'bg-[#241615]/80 border-white/15 text-[#9c7b77]'
+                        : 'bg-[#7d1914]/88 active:bg-[#b82820] border-[#ff756b]/75 text-[#fff2f0]'
+                    }`}
+                  >
+                    {worldUi.nearShopCooldown > 0 ? `${worldUi.nearShopCooldown}s` : 'ATRACAR'}
+                  </button>
+                </div>
               )}
 
               {(player.inVehicle || player.nearVehicleName) && (
                 <>
-                  <div className="flex flex-col gap-1">
-                    <button
-                      type="button"
-                      aria-label="Abrir puertas de mariposa"
-                      onPointerDown={(e) => {
-                        e.preventDefault();
-                        onToggleDoors();
-                      }}
-                      className="w-11 h-7 rounded-lg bg-[#12100d]/42 active:bg-[#e5a23c]/75 border border-[#e5a23c]/50 text-[#f5ede0]/90 font-hud text-[9px] font-bold"
-                    >
-                      PUERTA
-                    </button>
-                    <button
-                      type="button"
-                      aria-label="Abrir capó delantero"
-                      onPointerDown={(e) => {
-                        e.preventDefault();
-                        onToggleFrunk();
-                      }}
-                      className="w-11 h-7 rounded-lg bg-[#12100d]/42 active:bg-[#e5a23c]/75 border border-[#f5ede0]/32 text-[#f5ede0]/90 font-hud text-[9px] font-bold"
-                    >
-                      CAPÓ
-                    </button>
-                  </div>
+                  <button
+                    type="button"
+                    aria-label="Abrir capó delantero"
+                    onPointerDown={(e) => {
+                      e.preventDefault();
+                      onToggleFrunk();
+                    }}
+                    className="w-11 h-11 rounded-lg bg-[#12100d]/42 active:bg-[#e5a23c]/75 border border-[#f5ede0]/32 text-[#f5ede0]/90 font-hud text-[9px] font-bold"
+                  >
+                    CAPÓ
+                  </button>
                   <button
                     type="button"
                     aria-label={player.inVehicle ? 'Salir del vehículo' : 'Subir al vehículo'}
@@ -819,6 +896,37 @@ export const GameHUD: React.FC<GameHUDProps> = memo(function GameHUD({
             </div>
           )}
         </>
+      )}
+      {/* BOTTOM-CENTER: Ambient Clerk Greeting Subtitle (click/tap or [Tab] to skip) */}
+      {!inRobbery && !worldUi.activeShop && worldUi.ambientDialogue && (
+        <button
+          type="button"
+          tabIndex={-1}
+          data-testid="ambient-subtitle"
+          onClick={(e) => {
+            e.currentTarget.blur();
+            onSkipDialogue();
+          }}
+          className={`pointer-events-auto fixed left-1/2 -translate-x-1/2 z-20 px-3.5 py-2 bg-[#0a0908]/88 hover:bg-[#171411]/95 border border-[#e5a23c]/35 text-center cursor-pointer w-[min(90vw,620px)] ${
+            worldUi.touchControlsVisible
+              ? 'bottom-24 sm:bottom-28 [@media(max-height:500px)]:bottom-16'
+              : 'bottom-6 sm:bottom-8'
+          }`}
+        >
+          <span
+            className={`font-hud text-xs sm:text-sm font-bold tracking-wider uppercase mr-2 ${
+              worldUi.ambientDialogue.role === 'cj' ? 'text-[#6ee089]' : 'text-[#f2c252]'
+            }`}
+          >
+            {worldUi.ambientDialogue.speaker}:
+          </span>
+          <span className="font-hud text-xs sm:text-sm text-[#f7f2e8] tracking-wide">
+            {worldUi.ambientDialogue.text}
+          </span>
+          <span className="ml-2.5 text-[10px] font-tech tracking-wider text-[#b5a894] uppercase">
+            [TAB] SALTAR
+          </span>
+        </button>
       )}
     </div>
   );

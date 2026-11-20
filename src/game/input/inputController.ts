@@ -19,24 +19,22 @@ export interface InputActionHooks {
   getRobberySession: () => RobberySession | null;
   hasNearShop: () => boolean;
   unlockAudio: () => void;
-  startGame: () => void;
   closeShop: () => void;
   togglePause: () => void;
   toggleMute: () => void;
   openNearestShop: () => void;
-  cycleWeather: () => void;
-  cycleTimePreset: () => void;
+  robNearestShop: () => void;
+  skipDialogue: () => boolean;
   cycleCameraMode: () => void;
   resetWorld: () => void;
-  toggleVehicleDoors: () => void;
   toggleVehicleFrunk: () => void;
   triggerRobberyAction: (action: RobberyActionType) => void;
 }
 
 /**
  * Decoupled keyboard + mobile touch input controller.
- * Manages key bindings by active gameplay context (title, shop modal,
- * interactive robbery, or open world) and produces normalized `ControlInput`.
+ * Manages key bindings by active gameplay context (shop modal, interactive
+ * robbery, or open world) and produces normalized `ControlInput`.
  */
 export class InputController {
   private readonly hooks: InputActionHooks;
@@ -135,14 +133,6 @@ export class InputController {
     const code = e.code;
     const phase = this.hooks.getPhase();
 
-    if (phase === 'title') {
-      if (code === 'Enter' || code === 'Space') {
-        e.preventDefault();
-        this.hooks.startGame();
-      }
-      return;
-    }
-
     if (code === 'Escape' || code === 'KeyP') {
       e.preventDefault();
       if (this.hooks.hasActiveShop()) {
@@ -166,13 +156,16 @@ export class InputController {
         code === 'ArrowDown' ||
         code === 'ArrowLeft' ||
         code === 'ArrowRight' ||
-        code === 'Space'
+        code === 'Space' ||
+        code === 'Tab'
       ) {
         e.preventDefault();
       }
       if (!this.keysHeld.has(code)) {
         const rp = robbery.phase;
-        if (code === 'KeyM') {
+        if (code === 'Tab') {
+          this.hooks.skipDialogue();
+        } else if (code === 'KeyM') {
           this.hooks.toggleMute();
         } else if (rp === 'intimidate') {
           if (code === 'Space') this.hooks.triggerRobberyAction('intimidate');
@@ -210,7 +203,11 @@ export class InputController {
     }
 
     if (!this.keysHeld.has(code)) {
-      if (code === 'KeyF') {
+      if (code === 'Tab') {
+        if (this.hooks.skipDialogue()) {
+          e.preventDefault();
+        }
+      } else if (code === 'KeyF') {
         if (this.hooks.hasNearShop()) {
           this.hooks.openNearestShop();
         } else {
@@ -220,20 +217,18 @@ export class InputController {
         this.enterVehicleQueued = true;
       } else if (code === 'Space') {
         this.jumpQueued = true;
-      } else if (code === 'KeyO') {
-        this.hooks.toggleVehicleDoors();
       } else if (code === 'KeyU') {
         this.hooks.toggleVehicleFrunk();
-      } else if (code === 'KeyV') {
-        this.hooks.cycleWeather();
-      } else if (code === 'KeyT') {
-        this.hooks.cycleTimePreset();
       } else if (code === 'KeyC') {
         this.hooks.cycleCameraMode();
       } else if (code === 'KeyM') {
         this.hooks.toggleMute();
       } else if (code === 'KeyR') {
-        this.hooks.resetWorld();
+        if (this.hooks.hasNearShop()) {
+          this.hooks.robNearestShop();
+        } else {
+          this.hooks.resetWorld();
+        }
       }
     }
 

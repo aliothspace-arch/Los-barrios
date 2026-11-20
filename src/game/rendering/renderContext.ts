@@ -1,5 +1,10 @@
 import * as THREE from 'three';
 import { CinematicPostProcessor } from '../postprocess';
+import {
+  createAdaptiveResolutionState,
+  stepAdaptiveResolutionScale,
+  type AdaptiveResolutionState,
+} from '../simulation/renderInterpolation';
 import type { WeatherType } from '../types';
 
 /**
@@ -21,6 +26,7 @@ export interface IRenderFrameParams {
   bloomStrength: number;
   nightFactor: number;
   warmth: number;
+  rainIntensity?: number;
 }
 
 export interface IRenderBackend {
@@ -30,6 +36,15 @@ export interface IRenderBackend {
   resize(width: number, height: number): void;
   renderFrame(params: IRenderFrameParams): void;
   getMemorySnapshot(): { geometries: number; textures: number; programs: number };
+  getRenderStats(): {
+    calls: number;
+    triangles: number;
+    mainCalls: number;
+    mainTriangles: number;
+    geometries: number;
+    textures: number;
+    programs: number;
+  };
   scheduleNextFrame(disposed: () => boolean, cb: () => void): number;
   cancelScheduledFrame(handle: number): void;
   dispose(): void;
@@ -58,6 +73,10 @@ export class WebGLRenderContext implements IRenderBackend {
   public readonly renderer: THREE.WebGLRenderer;
   public readonly postProcessor: CinematicPostProcessor;
   private readonly container: HTMLElement;
+  private readonly adaptiveRes: AdaptiveResolutionState = createAdaptiveResolutionState();
+  private lastWidth = 1;
+  private lastHeight = 1;
+  private lastRenderNowMs = 0;
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -65,13 +84,16 @@ export class WebGLRenderContext implements IRenderBackend {
 
     const width = Math.max(1, container.clientWidth || window.innerWidth);
     const height = Math.max(1, container.clientHeight || window.innerHeight);
+    this.lastWidth = width;
+    this.lastHeight = height;
 
+    // Scene renders into postProcessor.sceneTarget with MSAA; backbuffer only draws a fullscreen quad.
     this.renderer = new THREE.WebGLRenderer({
-      antialias: !this.isSoftwareGl,
+      antialias: false,
       powerPreference: 'high-performance',
       stencil: false,
     });
-    const maxDpr = this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 2);
+    const maxDpr = this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 1.5);
     this.renderer.setPixelRatio(maxDpr);
     this.renderer.setSize(width, height);
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -105,8 +127,15 @@ export class WebGLRenderContext implements IRenderBackend {
   }
 
   public resize(width: number, height: number): void {
-    this.renderer.setSize(width, height);
-    this.postProcessor.resize(this.renderer, width, height);
+    this.lastWidth = Math.max(1, width);
+    this.lastHeight = Math.max(1, height);
+    this.renderer.setSize(this.lastWidth, this.lastHeight);
+    this.postProcessor.resize(
+      this.renderer,
+      this.lastWidth,
+      this.lastHeight,
+      this.isSoftwareGl ? 1.0 : this.adaptiveRes.scale,
+    );
   }
 
   public renderFrame(params: IRenderFrameParams): void {
@@ -121,6 +150,7 @@ export class WebGLRenderContext implements IRenderBackend {
       bloomStrength,
       nightFactor,
       warmth,
+      rainIntensity,
     } = params;
 
     camera.getWorldDirection(_camFwd);
@@ -140,6 +170,20 @@ export class WebGLRenderContext implements IRenderBackend {
         : Math.max(0, Math.min(1, (sunDot - 0.15) * 1.45)) * (1 - nightFactor);
     }
 
+    if (!this.isSoftwareGl) {
+      const nowMs = nowSec * 1000;
+      if (this.lastRenderNowMs > 0) {
+        const frameMs = nowMs - this.lastRenderNowMs;
+        if (frameMs > 2 && frameMs < 150) {
+          const { scale, changed } = stepAdaptiveResolutionScale(this.adaptiveRes, frameMs, nowMs);
+          if (changed) {
+            this.postProcessor.resize(this.renderer, this.lastWidth, this.lastHeight, scale);
+          }
+        }
+      }
+      this.lastRenderNowMs = nowMs;
+    }
+
     this.postProcessor.render(this.renderer, scene, camera, {
       timeSec: nowSec,
       exposure: inInterior ? 1.08 : exposure,
@@ -150,11 +194,33 @@ export class WebGLRenderContext implements IRenderBackend {
       sunVisibility,
       warmth: inInterior ? 0.22 : warmth,
       sharpenStrength: this.isSoftwareGl ? 0.18 : 0.30,
+      rainIntensity: inInterior ? 0 : (rainIntensity ?? 0),
     });
   }
 
   public getMemorySnapshot(): { geometries: number; textures: number; programs: number } {
     return {
+      geometries: this.renderer.info.memory.geometries,
+      textures: this.renderer.info.memory.textures,
+      programs: this.renderer.info.programs?.length ?? 0,
+    };
+  }
+
+  public getRenderStats(): {
+    calls: number;
+    triangles: number;
+    mainCalls: number;
+    mainTriangles: number;
+    geometries: number;
+    textures: number;
+    programs: number;
+  } {
+    const main = this.postProcessor.getLastMainRenderStats();
+    return {
+      calls: this.renderer.info.render.calls,
+      triangles: this.renderer.info.render.triangles,
+      mainCalls: main.calls,
+      mainTriangles: main.triangles,
       geometries: this.renderer.info.memory.geometries,
       textures: this.renderer.info.memory.textures,
       programs: this.renderer.info.programs?.length ?? 0,
@@ -170,20 +236,21 @@ export class WebGLRenderContext implements IRenderBackend {
     if (gl && typeof gl.fenceSync === 'function') {
       const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
       gl.flush();
+      const startedAt = performance.now();
       const poll = (): void => {
         if (isDisposed()) {
           if (sync) gl.deleteSync(sync);
           return;
         }
         const status = sync && gl.getSyncParameter(sync, gl.SYNC_STATUS);
-        if (status === gl.UNSIGNALED) {
-          this.activeFrameHandle = window.setTimeout(poll, 5);
+        if (status === gl.UNSIGNALED && performance.now() - startedAt < 1200) {
+          this.activeFrameHandle = window.setTimeout(poll, 10);
         } else {
           if (sync) gl.deleteSync(sync);
           this.activeFrameHandle = window.setTimeout(cb, 80);
         }
       };
-      this.activeFrameHandle = window.setTimeout(poll, 5);
+      this.activeFrameHandle = window.setTimeout(poll, 10);
       return this.activeFrameHandle;
     }
     this.activeFrameHandle = window.setTimeout(cb, 90);

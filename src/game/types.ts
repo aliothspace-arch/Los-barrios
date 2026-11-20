@@ -1,8 +1,6 @@
-export type GamePhase = 'title' | 'playing' | 'paused' | 'gameover';
+export type GamePhase = 'playing' | 'paused' | 'gameover';
 
 export type WeatherType = 'golden' | 'clear' | 'rain' | 'storm' | 'fog';
-
-export type TimePreset = 'sunset' | 'noon' | 'night' | 'dawn';
 
 export type CameraMode = 'chase' | 'cinematic' | 'hood';
 
@@ -31,10 +29,26 @@ export interface ShopItem {
   requiresVehicle?: boolean;
 }
 
+export type ShopVenueMode = 'indoor' | 'street_cart' | 'outdoor_bay';
+
 export interface ShopSpec {
   id: string;
   name: string;
   category: 'market' | 'weapons' | 'clothing' | 'food' | 'customs';
+  venueMode: ShopVenueMode;
+  buildingId?: string;
+  originX: number;
+  originZ: number;
+  facingHeading: number; // local +Z faces out the door / street side
+  doorX?: number;
+  doorZ?: number;
+  counterLocalZ: number;
+  counterHalfW: number;
+  counterHalfD: number;
+  registerX: number;
+  registerZ: number;
+  clerkX: number;
+  clerkZ: number;
   x: number;
   z: number;
   accentHex: string;
@@ -89,9 +103,12 @@ export interface RoadSegment {
   orientation: 'ns' | 'ew' | 'plaza';
 }
 
+export type VehicleDrivetrain = 'RWD' | 'AWD';
+
 export interface VehicleSpec {
   kind: VehicleKind;
   name: string;
+  drivetrain: VehicleDrivetrain;
   mass: number;
   maxEngineForce: number;
   maxBrakeForce: number;
@@ -105,6 +122,19 @@ export interface VehicleSpec {
   length: number;
   width: number;
   radius: number;
+  wheelbase: number;
+  trackWidth: number;
+  frontWeightBias: number; // 0.42..0.56
+  cgHeight: number;
+  tireGripMu: number;
+  cornerStiffness: number;
+  gearRatios: readonly [number, number, number, number, number, number];
+  reverseGearRatio: number;
+  finalDrive: number;
+  redlineRpm: number;
+  suspensionFreq: number;
+  suspensionDamping: number;
+  assistStrength: number;
   primaryColor: number;
   secondaryColor: number;
   interiorColor: number;
@@ -122,13 +152,30 @@ export interface VehicleState {
   heading: number; // radians, 0 = +Z, Math.PI = -Z
   angularVel: number;
   steerAngle: number;
+  visualSteerAngle: number;
   speed: number; // signed forward speed m/s
   lateralSpeed: number;
-  rpm: number; // 900..7500
-  gear: number; // -1 = R, 1..5
+  longAccel: number;
+  latAccel: number;
+  rpm: number; // 900..7800
+  gear: number; // -1 = R, 1..6
   pitch: number; // suspension pitch
   roll: number; // suspension roll
+  chassisHeave: number;
+  chassisHeaveVel: number;
+  wheelCompression: [number, number, number, number]; // FL, FR, RL, RR
+  wheelCompressionVel: [number, number, number, number];
+  wheelGroundY: [number, number, number, number];
   wheelSpin: number;
+  frontWheelSpin: number;
+  rearWheelSpin: number;
+  rearSlipRatio: number; // 0..1 burnout / rear slip
+  frontSlipRatio: number; // 0..1 brake lockup / understeer
+  absActive: boolean;
+  shiftCutTimer: number;
+  shiftKickDir: number;
+  reverseHoldTimer: number;
+  curbImpactPulse: number;
   health: number; // 0..100
   nitro: number; // 0..100
   nitroActive: boolean;
@@ -141,6 +188,17 @@ export interface VehicleState {
   aiStuckTimer: number;
   damageFlash: number;
   customPaintHex?: number;
+}
+
+export interface VehicleTransitionState {
+  mode: 'none' | 'entering' | 'exiting';
+  vehicleId: string | null;
+  side: 1 | -1; // +1 = local +X (driver side), -1 = local -X (passenger side)
+  progress: number; // 0..1
+  duration: number; // seconds
+  startX: number;
+  startZ: number;
+  startHeading: number;
 }
 
 export interface PlayerState {
@@ -159,6 +217,7 @@ export interface PlayerState {
   health: number;
   armor: number;
   inVehicleId: string | null;
+  vehicleTransition: VehicleTransitionState;
   attackTimer: number;
   damageFlash: number;
   outfitId: PlayerOutfitId;
@@ -273,6 +332,7 @@ export interface RobberyHUDState {
   shopId: string;
   shopName: string;
   ownerName: string;
+  venueMode: ShopVenueMode;
   phase: RobberyPhase;
   outcome: RobberyOutcome;
   intimidation: number; // 0..100
@@ -301,7 +361,6 @@ export interface HUDState {
   wantedLevel: number; // 0..5
   district: string;
   weather: WeatherType;
-  timePreset: TimePreset;
   clockText: string;
   cameraMode: CameraMode;
   inVehicle: boolean;
@@ -311,8 +370,12 @@ export interface HUDState {
   rpmRatio: number;
   nitro: number;
   vehicleHealth: number;
+  tractionSlip: boolean;
+  absActive: boolean;
+  shiftFlash: boolean;
   nearVehicleName: string | null;
   nearShop: ShopSpec | null;
+  nearShopCooldown: number;
   activeShop: ShopSpec | null;
   activeShopCooldown: number;
   outfitId: PlayerOutfitId;
@@ -324,5 +387,6 @@ export interface HUDState {
   touchControlsVisible: boolean;
   runSummary: RunSummary | null;
   bannerText: string | null;
+  ambientDialogue: RobberyDialogueLine | null;
   robbery: RobberyHUDState | null;
 }

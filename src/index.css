@@ -43,3 +43,22 @@
   -webkit-text-stroke: 1.5px rgba(8, 7, 6, 0.9);
   text-shadow: 0 1px 4px rgba(0, 0, 0, 0.85);
 }
+
+@keyframes loading-bar-sweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(220%);
+  }
+}
+
+.loading-bar-sweep {
+  animation: loading-bar-sweep 1.35s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loading-bar-sweep {
+    animation: none;
+  }
+}

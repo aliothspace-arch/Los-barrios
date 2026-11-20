@@ -10,6 +10,7 @@ export interface PostProcessParams {
   sunVisibility: number;
   warmth: number;
   sharpenStrength: number;
+  rainIntensity: number;
 }
 
 /**
@@ -33,6 +34,8 @@ export class CinematicPostProcessor {
 
   private width: number;
   private height: number;
+  private lastMainCalls = 0;
+  private lastMainTriangles = 0;
 
   constructor(
     renderer: THREE.WebGLRenderer,
@@ -61,7 +64,7 @@ export class CinematicPostProcessor {
       magFilter: THREE.LinearFilter,
       depthBuffer: true,
       stencilBuffer: false,
-      samples: isWebGL2 && !isSoftwareGl ? 4 : 0,
+      samples: isWebGL2 && !isSoftwareGl ? (dpr > 1.25 ? 2 : 4) : 0,
     });
 
     const bloomOpts: THREE.RenderTargetOptions = {
@@ -163,6 +166,7 @@ export class CinematicPostProcessor {
         uWarmth: { value: 0.55 },
         uSharpen: { value: 0.32 },
         uTime: { value: 0.0 },
+        uRainIntensity: { value: 0.0 },
       },
       vertexShader: fsVertex,
       fragmentShader: /* glsl */ `
@@ -177,6 +181,7 @@ export class CinematicPostProcessor {
         uniform float uWarmth;
         uniform float uSharpen;
         uniform float uTime;
+        uniform float uRainIntensity;
         varying vec2 vUv;
 
         // Troy Sobotka AgX Filmic Tone Mapping (preserves warm sunset & Rosso Fuoco hues without ACES hue shift)
@@ -221,13 +226,14 @@ export class CinematicPostProcessor {
           // 1. Subtle Optical Radial Chromatic Aberration (only near far lens edges)
           vec2 fromCenter = vUv - 0.5;
           float r2 = dot(fromCenter, fromCenter);
-          vec2 caOff = fromCenter * r2 * 0.0018;
 
           vec3 cCenter = texture2D(tScene, vUv).rgb;
-          vec3 color;
-          color.r = texture2D(tScene, vUv + caOff).r;
-          color.g = cCenter.g;
-          color.b = texture2D(tScene, vUv - caOff).b;
+          vec3 color = cCenter;
+          if (r2 > 0.025) {
+            vec2 caOff = fromCenter * r2 * 0.0018;
+            color.r = texture2D(tScene, vUv + caOff).r;
+            color.b = texture2D(tScene, vUv - caOff).b;
+          }
 
           // 2. Contrast Adaptive Sharpening (CAS) — brings out carbon weave, forged rims & metallic flake crispness
           vec3 n = texture2D(tScene, vUv + vec2(0.0,  uTexelSize.y)).rgb;
@@ -242,9 +248,28 @@ export class CinematicPostProcessor {
           color = max(vec3(0.0), color + (color - avgNeighbors) * sharpWeight);
 
           // 3. Selective HDR Bloom (only true emissive LEDs and pure specular glints)
-          vec3 bloom = texture2D(tBloom, vUv).rgb;
-          vec3 halationTint = mix(vec3(1.02, 0.98, 0.94), vec3(0.94, 0.97, 1.06), uNightFactor);
-          color += bloom * halationTint * uBloomStrength;
+          float effectiveBloom = uBloomStrength + uRainIntensity * 0.08;
+          if (effectiveBloom > 0.001) {
+            vec3 bloom = texture2D(tBloom, vUv).rgb;
+            vec3 halationTint = mix(vec3(1.02, 0.98, 0.94), vec3(0.94, 0.97, 1.06), uNightFactor);
+            color += bloom * halationTint * effectiveBloom;
+          }
+
+          // 3b. Subtle Peripheral Lens Rain-Mist & Edge Droplet Bokeh (strictly outside center 75%)
+          if (uRainIntensity > 0.08) {
+            float edgeZone = smoothstep(0.10, 0.28, r2) * uRainIntensity;
+            vec2 dropGrid = vec2(vUv.x * 14.0, vUv.y * 8.5 + uTime * 0.22);
+            vec2 cell = floor(dropGrid);
+            vec2 f = fract(dropGrid) - 0.5;
+            float rnd = filmNoise(cell * 17.3);
+            if (rnd > 0.72) {
+              vec2 off = vec2(filmNoise(cell + 3.1), filmNoise(cell + 9.7)) - 0.5;
+              float d = length(f - off * 0.42);
+              float bead = smoothstep(0.24, 0.07, d) * edgeZone;
+              vec3 refr = texture2D(tBloom, clamp(vUv + (f - off) * 0.015, 0.01, 0.99)).rgb;
+              color += refr * bead * 0.55 + vec3(0.18, 0.24, 0.32) * bead * 0.08;
+            }
+          }
 
           // 4. Restrained Optical Sun-Veil (eliminates orange screen washout)
           if (uSunVisibility > 0.01) {
@@ -293,10 +318,16 @@ export class CinematicPostProcessor {
     this.quadScene.add(this.quadMesh);
   }
 
-  public resize(renderer: THREE.WebGLRenderer, width: number, height: number): void {
+  public resize(
+    renderer: THREE.WebGLRenderer,
+    width: number,
+    height: number,
+    renderScale = 1.0,
+  ): void {
     this.width = Math.max(1, width);
     this.height = Math.max(1, height);
-    const dpr = renderer.getPixelRatio();
+    const clampedScale = Math.max(0.75, Math.min(1.0, renderScale));
+    const dpr = renderer.getPixelRatio() * clampedScale;
     const rtW = Math.max(1, Math.floor(this.width * dpr));
     const rtH = Math.max(1, Math.floor(this.height * dpr));
     const bloomW = Math.max(1, Math.floor(rtW * 0.25));
@@ -324,22 +355,26 @@ export class CinematicPostProcessor {
     renderer.setRenderTarget(this.sceneTarget);
     renderer.clear();
     renderer.render(scene, camera);
+    this.lastMainCalls = renderer.info.render.calls;
+    this.lastMainTriangles = renderer.info.render.triangles;
 
-    // 2. Quarter-res selective HDR bloom extract
-    this.quadMesh.material = this.extractMat;
-    renderer.setRenderTarget(this.bloomTargetA);
-    renderer.render(this.quadScene, this.quadCamera);
+    // 2 & 3. Quarter-res selective HDR bloom extract + separable Gaussian blur (skipped when bloom is off)
+    const runBloom = params.bloomStrength > 0.001 || params.rainIntensity > 0.08;
+    if (runBloom) {
+      this.quadMesh.material = this.extractMat;
+      renderer.setRenderTarget(this.bloomTargetA);
+      renderer.render(this.quadScene, this.quadCamera);
 
-    // 3. Separable Gaussian blur H -> V
-    this.blurHMat.uniforms.tDiffuse.value = this.bloomTargetA.texture;
-    this.quadMesh.material = this.blurHMat;
-    renderer.setRenderTarget(this.bloomTargetB);
-    renderer.render(this.quadScene, this.quadCamera);
+      this.blurHMat.uniforms.tDiffuse.value = this.bloomTargetA.texture;
+      this.quadMesh.material = this.blurHMat;
+      renderer.setRenderTarget(this.bloomTargetB);
+      renderer.render(this.quadScene, this.quadCamera);
 
-    this.blurVMat.uniforms.tDiffuse.value = this.bloomTargetB.texture;
-    this.quadMesh.material = this.blurVMat;
-    renderer.setRenderTarget(this.bloomTargetA);
-    renderer.render(this.quadScene, this.quadCamera);
+      this.blurVMat.uniforms.tDiffuse.value = this.bloomTargetB.texture;
+      this.quadMesh.material = this.blurVMat;
+      renderer.setRenderTarget(this.bloomTargetA);
+      renderer.render(this.quadScene, this.quadCamera);
+    }
 
     // 4. Final cinematic composite to screen
     const cu = this.compositeMat.uniforms;
@@ -351,11 +386,19 @@ export class CinematicPostProcessor {
     cu.uWarmth.value = params.warmth;
     cu.uSharpen.value = params.sharpenStrength;
     cu.uTime.value = params.timeSec;
+    cu.uRainIntensity.value = params.rainIntensity;
 
     this.quadMesh.material = this.compositeMat;
     renderer.setRenderTarget(null);
     renderer.render(this.quadScene, this.quadCamera);
     renderer.toneMapping = prevToneMapping;
+  }
+
+  public getLastMainRenderStats(): { calls: number; triangles: number } {
+    return {
+      calls: this.lastMainCalls,
+      triangles: this.lastMainTriangles,
+    };
   }
 
   public dispose(): void {

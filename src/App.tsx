@@ -7,7 +7,6 @@ import {
 import type { GameHudStore } from './game/core/gameStore';
 import type { RobberyActionType } from './game/types';
 import { LoadingScreen } from './components/LoadingScreen';
-import { TitleOverlay } from './components/TitleOverlay';
 import { GameHUD } from './components/GameHUD';
 import { StatusModal } from './components/StatusModal';
 import { ShopModal } from './components/ShopModal';
@@ -22,38 +21,10 @@ const INITIAL_BOOT_STATE: BootProgressState = {
   stageDetail: 'Preparando pipeline HDR AgX y activos de Los Santos...',
 };
 
-const TitleOverlaySlot = memo(function TitleOverlaySlot({
-  hudStore,
-  isFullscreen,
-  onStart,
-  onCycleWeather,
-  onToggleFullscreen,
-}: {
-  hudStore: GameHudStore;
-  isFullscreen: boolean;
-  onStart: () => void;
-  onCycleWeather: () => void;
-  onToggleFullscreen: () => void;
-}) {
-  const worldUi = useSyncExternalStore(hudStore.subscribeWorldUi, hudStore.getWorldUi);
-  if (worldUi.phase !== 'title') return null;
-  return (
-    <TitleOverlay
-      weather={worldUi.weather}
-      isFullscreen={isFullscreen}
-      onStart={onStart}
-      onCycleWeather={onCycleWeather}
-      onToggleFullscreen={onToggleFullscreen}
-    />
-  );
-});
-
 const GameHUDSlot = memo(function GameHUDSlot({
   hudStore,
   isFullscreen,
   onMinimapMount,
-  onCycleWeather,
-  onCycleTime,
   onCycleCamera,
   onToggleMute,
   onTogglePause,
@@ -61,9 +32,10 @@ const GameHUDSlot = memo(function GameHUDSlot({
   onToggleTouchControls,
   onTouchState,
   onEnterExitVehicle,
-  onToggleDoors,
   onToggleFrunk,
   onOpenShop,
+  onRobNearestShop,
+  onSkipDialogue,
   onJumpOrAction,
   onCameraOrbit,
   onCameraOrbitActive,
@@ -71,8 +43,6 @@ const GameHUDSlot = memo(function GameHUDSlot({
   hudStore: GameHudStore;
   isFullscreen: boolean;
   onMinimapMount: (canvas: HTMLCanvasElement | null) => void;
-  onCycleWeather: () => void;
-  onCycleTime: () => void;
   onCycleCamera: () => void;
   onToggleMute: () => void;
   onTogglePause: () => void;
@@ -80,22 +50,19 @@ const GameHUDSlot = memo(function GameHUDSlot({
   onToggleTouchControls: () => void;
   onTouchState: (partial: Partial<TouchControlState>) => void;
   onEnterExitVehicle: () => void;
-  onToggleDoors: () => void;
   onToggleFrunk: () => void;
   onOpenShop: () => void;
+  onRobNearestShop: () => void;
+  onSkipDialogue: () => void;
   onJumpOrAction: () => void;
   onCameraOrbit: (dx: number, dy: number) => void;
   onCameraOrbitActive: (active: boolean) => void;
 }) {
-  const worldUi = useSyncExternalStore(hudStore.subscribeWorldUi, hudStore.getWorldUi);
-  if (worldUi.phase === 'title') return null;
   return (
     <GameHUD
       hudStore={hudStore}
       isFullscreen={isFullscreen}
       onMinimapMount={onMinimapMount}
-      onCycleWeather={onCycleWeather}
-      onCycleTime={onCycleTime}
       onCycleCamera={onCycleCamera}
       onToggleMute={onToggleMute}
       onTogglePause={onTogglePause}
@@ -103,9 +70,10 @@ const GameHUDSlot = memo(function GameHUDSlot({
       onToggleTouchControls={onToggleTouchControls}
       onTouchState={onTouchState}
       onEnterExitVehicle={onEnterExitVehicle}
-      onToggleDoors={onToggleDoors}
       onToggleFrunk={onToggleFrunk}
       onOpenShop={onOpenShop}
+      onRobNearestShop={onRobNearestShop}
+      onSkipDialogue={onSkipDialogue}
       onJumpOrAction={onJumpOrAction}
       onCameraOrbit={onCameraOrbit}
       onCameraOrbitActive={onCameraOrbitActive}
@@ -116,9 +84,11 @@ const GameHUDSlot = memo(function GameHUDSlot({
 const RobberyOverlaySlot = memo(function RobberyOverlaySlot({
   hudStore,
   onAction,
+  onSkipDialogue,
 }: {
   hudStore: GameHudStore;
   onAction: (action: RobberyActionType) => void;
+  onSkipDialogue: () => void;
 }) {
   const worldUi = useSyncExternalStore(hudStore.subscribeWorldUi, hudStore.getWorldUi);
   const activity = useSyncExternalStore(hudStore.subscribeActivity, hudStore.getActivity);
@@ -128,6 +98,7 @@ const RobberyOverlaySlot = memo(function RobberyOverlaySlot({
       robbery={activity.robbery}
       touchControlsVisible={worldUi.touchControlsVisible}
       onAction={onAction}
+      onSkipDialogue={onSkipDialogue}
     />
   );
 });
@@ -162,12 +133,10 @@ const StatusModalSlot = memo(function StatusModalSlot({
   hudStore,
   onResume,
   onRestart,
-  onReturnTitle,
 }: {
   hudStore: GameHudStore;
   onResume: () => void;
   onRestart: () => void;
-  onReturnTitle: () => void;
 }) {
   const worldUi = useSyncExternalStore(hudStore.subscribeWorldUi, hudStore.getWorldUi);
   const player = useSyncExternalStore(hudStore.subscribePlayer, hudStore.getPlayer);
@@ -180,7 +149,6 @@ const StatusModalSlot = memo(function StatusModalSlot({
       runSummary={worldUi.runSummary}
       onResume={onResume}
       onRestart={onRestart}
-      onReturnTitle={onReturnTitle}
     />
   );
 });
@@ -202,7 +170,7 @@ export default function App() {
     let hideTimer = 0;
 
     const params = new URLSearchParams(window.location.search);
-    const autostart = params.get('autostart') === '1';
+    const autostart = params.get('autostart') !== '0';
     const pauseLoader = params.get('pauseLoader') === '1';
     const rollParam = params.get('robberyRoll');
     const forcedRobberyRoll =
@@ -234,7 +202,7 @@ export default function App() {
         if (nextBoot.ready) {
           hideTimer = window.setTimeout(() => {
             if (!cancelled) setShowLoader(false);
-          }, 380);
+          }, 950);
         }
       },
     });
@@ -269,9 +237,7 @@ export default function App() {
       const req =
         rootEl.requestFullscreen?.() ?? rootEl.webkitRequestFullscreen?.();
       if (req && typeof req.catch === 'function') {
-        req.catch(() => {
-          // Graceful fallback if embedded iframe blocks fullscreen
-        });
+        req.catch(() => {});
       }
       const orient = screen.orientation as ScreenOrientation & {
         lock?: (mode: string) => Promise<void>;
@@ -287,18 +253,6 @@ export default function App() {
 
   const handleMinimapMount = useCallback((canvas: HTMLCanvasElement | null) => {
     engineRef.current?.setMinimapCanvas(canvas);
-  }, []);
-
-  const handleStart = useCallback(() => {
-    engineRef.current?.startGame();
-  }, []);
-
-  const handleCycleWeather = useCallback(() => {
-    engineRef.current?.cycleWeather();
-  }, []);
-
-  const handleCycleTime = useCallback(() => {
-    engineRef.current?.cycleTimePreset();
   }, []);
 
   const handleCycleCamera = useCallback(() => {
@@ -321,10 +275,6 @@ export default function App() {
     engineRef.current?.resetWorld();
   }, []);
 
-  const handleReturnTitle = useCallback(() => {
-    engineRef.current?.returnToTitle();
-  }, []);
-
   const handleTouchState = useCallback((partial: Partial<TouchControlState>) => {
     engineRef.current?.setTouchState(partial);
   }, []);
@@ -333,16 +283,20 @@ export default function App() {
     engineRef.current?.triggerEnterOrExitVehicle();
   }, []);
 
-  const handleToggleDoors = useCallback(() => {
-    engineRef.current?.toggleVehicleDoors();
-  }, []);
-
   const handleToggleFrunk = useCallback(() => {
     engineRef.current?.toggleVehicleFrunk();
   }, []);
 
   const handleOpenShop = useCallback(() => {
     engineRef.current?.openNearestShop();
+  }, []);
+
+  const handleRobNearestShop = useCallback(() => {
+    engineRef.current?.robNearestShop();
+  }, []);
+
+  const handleSkipDialogue = useCallback(() => {
+    engineRef.current?.skipActiveDialogue();
   }, []);
 
   const handleCloseShop = useCallback(() => {
@@ -382,24 +336,12 @@ export default function App() {
         className="fixed inset-0 w-full h-full"
       />
 
-      {showLoader && <LoadingScreen bootState={bootState} />}
-
       {hudStore && bootState.ready && (
         <>
-          <TitleOverlaySlot
-            hudStore={hudStore}
-            isFullscreen={isFullscreen}
-            onStart={handleStart}
-            onCycleWeather={handleCycleWeather}
-            onToggleFullscreen={handleToggleFullscreen}
-          />
-
           <GameHUDSlot
             hudStore={hudStore}
             isFullscreen={isFullscreen}
             onMinimapMount={handleMinimapMount}
-            onCycleWeather={handleCycleWeather}
-            onCycleTime={handleCycleTime}
             onCycleCamera={handleCycleCamera}
             onToggleMute={handleToggleMute}
             onTogglePause={handleTogglePause}
@@ -407,9 +349,10 @@ export default function App() {
             onToggleTouchControls={handleToggleTouchControls}
             onTouchState={handleTouchState}
             onEnterExitVehicle={handleEnterExitVehicle}
-            onToggleDoors={handleToggleDoors}
             onToggleFrunk={handleToggleFrunk}
             onOpenShop={handleOpenShop}
+            onRobNearestShop={handleRobNearestShop}
+            onSkipDialogue={handleSkipDialogue}
             onJumpOrAction={handleJumpOrAction}
             onCameraOrbit={handleCameraOrbit}
             onCameraOrbitActive={handleCameraOrbitActive}
@@ -418,6 +361,7 @@ export default function App() {
           <RobberyOverlaySlot
             hudStore={hudStore}
             onAction={handleRobberyAction}
+            onSkipDialogue={handleSkipDialogue}
           />
 
           <ShopModalSlot
@@ -431,10 +375,11 @@ export default function App() {
             hudStore={hudStore}
             onResume={handleTogglePause}
             onRestart={handleRestart}
-            onReturnTitle={handleReturnTitle}
           />
         </>
       )}
+
+      {showLoader && <LoadingScreen bootState={bootState} />}
     </main>
   );
 }

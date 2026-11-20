@@ -9,22 +9,28 @@ import type {
   RobberyActionType,
   RunSummary,
   ShopSpec,
-  TimePreset,
   VehicleState,
-  WeatherType,
 } from './types';
 import {
   buildStaticColliders,
   getDistrictName,
+  getShopRoofCeilingClampY,
   INITIAL_PEDS,
   INITIAL_VEHICLES,
   PLAYER_SPAWN,
+  shopLocalToWorld,
   SHOPS,
 } from './worldLayout';
 import { createVehicleState, findNearestEnterableVehicle } from './physics';
-import { evaluateShopPurchase, findNearestShop } from './shopSystem';
-import type { RobberyEvent, RobberySession } from './robberySystem';
-import { RobberyInteriorStage } from './robberyScene';
+import { evaluateShopPurchase, findNearestShopRegister } from './shopSystem';
+import {
+  getRobberyCjWorldTransform,
+  skipRobberyDialogue,
+  type RobberyEvent,
+  type RobberySession,
+} from './robberySystem';
+import { DialogueDirector } from './dialogueDirector';
+import { getShopAmbientGreeting, getShopOwnerProfile } from './data/robberyDialogues';
 import { createWeatherUniforms, HyperrealMaterialLibrary } from './textures';
 import { DynamicWeatherAndLighting } from './weatherAndLighting';
 import {
@@ -57,6 +63,7 @@ import { GameHudStore } from './core/gameStore';
 import { getOutfitPalette, RESPRAY_PALETTE } from './data/outfits';
 import { SpatialHashGrid } from './simulation/spatialHash';
 import { stepOpenWorldSimulation } from './simulation/worldSimulation';
+import { InstancedPedestrianCrowd } from './entities/instancedPedestrians';
 import {
   ActivityRegistry,
   type ActivityContext,
@@ -70,28 +77,11 @@ import {
 import { CameraController } from './camera/cameraController';
 import { MinimapRenderer } from './hud/minimapRenderer';
 import { ParticleSystem } from './entities/particleSystem';
-import { EntityAnimator } from './entities/entityAnimator';
+import { CLERK_PED_ID_BY_SHOP, EntityAnimator } from './entities/entityAnimator';
 import { WebGLRenderContext } from './rendering/renderContext';
+import { RenderPoseHistory } from './simulation/renderInterpolation';
 
 export type { TouchControlState, BootProgressState, BootProgressListener };
-
-const WEATHER_ORDER: WeatherType[] = ['golden', 'clear', 'rain', 'storm', 'fog'];
-const TIME_ORDER: TimePreset[] = ['sunset', 'noon', 'night', 'dawn'];
-
-const WEATHER_LABELS: Record<WeatherType, string> = {
-  golden: 'HORA DORADA CALIFORNIA',
-  clear: 'DESPEJADO LOS SANTOS',
-  rain: 'LLUVIA URBANA',
-  storm: 'TORMENTA ELÉCTRICA',
-  fog: 'NIEBLA COSTERA',
-};
-
-const TIME_LABELS: Record<TimePreset, string> = {
-  sunset: 'ATARDECER DORADO',
-  noon: 'MEDIODÍA SOLAR',
-  night: 'NOCHE DE NEÓN',
-  dawn: 'AMANECER CALIFORNIANO',
-};
 
 const CAMERA_LABELS: Record<CameraMode, string> = {
   chase: 'CÁMARA PERSECUCIÓN',
@@ -161,11 +151,21 @@ export class SanAndreasEngine {
   private materials!: HyperrealMaterialLibrary;
   private weatherSystem!: DynamicWeatherAndLighting;
   private readonly audio: ProceduralAudioEngine;
-  private robberyStage!: RobberyInteriorStage;
+  private readonly dialogueDirector = new DialogueDirector();
   private particleSystem!: ParticleSystem;
+  private readonly particleEnv = {
+    timeSec: 0,
+    sunColor: new THREE.Color(0xffe4c4),
+    fogColor: new THREE.Color(0x544849),
+    fogDensity: 0.0019,
+  };
   private readonly entityAnimator = new EntityAnimator();
+  private readonly poseHistory = new RenderPoseHistory();
   private readonly minimapRenderer = new MinimapRenderer();
   private inputController!: InputController;
+  private lastAudioThrottle = 0;
+  private lastAudioSkid = 0;
+  private lastAudioSiren = 0;
 
   // World Static Visuals & Spatial Broad-Phase Grid
   private worldVisuals!: WorldVisuals;
@@ -182,11 +182,10 @@ export class SanAndreasEngine {
   private readonly vehicles: VehicleState[] = [];
   private readonly vehicleRigs = new Map<string, VehicleRig>();
   private readonly peds: PedState[] = [];
-  private readonly pedRigs = new Map<string, CharacterRig>();
-  private readonly pedShadowActive = new Map<string, boolean>();
+  private pedCrowd!: InstancedPedestrianCrowd;
 
   // Gameplay Session State
-  private phase: GamePhase = 'title';
+  private phase: GamePhase = 'playing';
   private cash = 1250;
   private wantedLevel = 0;
   private peakWanted = 0;
@@ -199,6 +198,8 @@ export class SanAndreasEngine {
   private runSummary: RunSummary | null = null;
   private activeShop: ShopSpec | null = null;
   private readonly shopCooldowns = new Map<string, number>();
+  private readonly shopGreetingCooldowns = new Map<string, number>();
+  private greetingCounter = 0;
   private resprayIndex = 0;
   private hitstopTimer = 0;
 
@@ -211,6 +212,7 @@ export class SanAndreasEngine {
   private frameHandle = 0;
   private lastFrameMs = 0;
   private hudEmitAccum = 0;
+  private hudDirty = false;
   private fpsSmoothed = 60;
   private frameCounter = 0;
   private resizeObserver: ResizeObserver | null = null;
@@ -237,6 +239,9 @@ export class SanAndreasEngine {
     const h = Math.max(1, container.clientHeight || window.innerHeight);
     this.cameraController = new CameraController(w / h);
     this.audio = new ProceduralAudioEngine();
+    this.dialogueDirector.setSpeechHandler((line, opts) =>
+      this.audio.speakUtterance(line.text, line.pitch, line.rate, opts),
+    );
 
     const colliders = buildStaticColliders();
     this.spatialGrid = new SpatialHashGrid(colliders, 16);
@@ -251,22 +256,29 @@ export class SanAndreasEngine {
     if (options.spawnShopId) {
       const targetShop = SHOPS.find((s) => s.id === options.spawnShopId);
       if (targetShop) {
-        this.player.x = targetShop.x;
-        this.player.z = targetShop.z;
+        const spawnPt = shopLocalToWorld(
+          targetShop.originX,
+          targetShop.originZ,
+          targetShop.facingHeading,
+          0,
+          targetShop.venueMode === 'indoor' ? 7.6 : 2.35,
+        );
+        this.player.x = spawnPt.x;
+        this.player.z = spawnPt.z;
+        this.player.heading = targetShop.facingHeading + Math.PI;
       }
     }
 
     // Initialize HUD store immediately with safe initial snapshot
     this.hudStore = new GameHudStore({
-      phase: 'title',
+      phase: 'playing',
       cash: Math.round(this.cash),
       health: Math.round(this.player.health),
       armor: Math.round(this.player.armor),
       wantedLevel: 0,
       district: this.lastDistrict,
       weather: 'golden',
-      timePreset: 'sunset',
-      clockText: '18:20',
+      clockText: '17:30',
       cameraMode: this.cameraController.getMode(),
       inVehicle: false,
       vehicleName: '',
@@ -275,8 +287,12 @@ export class SanAndreasEngine {
       rpmRatio: 0,
       nitro: 100,
       vehicleHealth: 100,
+      tractionSlip: false,
+      absActive: false,
+      shiftFlash: false,
       nearVehicleName: null,
       nearShop: null,
+      nearShopCooldown: 0,
       activeShop: null,
       activeShopCooldown: 0,
       outfitId: this.player.outfitId,
@@ -288,6 +304,7 @@ export class SanAndreasEngine {
       touchControlsVisible: this.touchControlsVisible,
       runSummary: null,
       bannerText: null,
+      ambientDialogue: null,
       robbery: null,
     });
   }
@@ -419,8 +436,13 @@ export class SanAndreasEngine {
       isProtagonist: true,
     });
     this.scene.add(this.playerRig.root);
-    this.robberyStage = new RobberyInteriorStage(this.scene, this.materials);
-    this.particleSystem = new ParticleSystem(this.scene, 160);
+    this.pedCrowd = new InstancedPedestrianCrowd(this.materials, Math.max(160, INITIAL_PEDS.length + 16));
+    this.scene.add(this.pedCrowd.group);
+    this.particleSystem = new ParticleSystem(
+      this.scene,
+      this.materials.uniforms,
+      this.renderContext.isSoftwareGl,
+    );
     this.bindEventBus();
 
     await this.initEntitiesAsync((entityRatio) => {
@@ -459,16 +481,14 @@ export class SanAndreasEngine {
       getRobberySession: () => this.robberyActivity.currentSession,
       hasNearShop: () => this.findNearbyShop() !== null,
       unlockAudio: () => this.audio.unlock(),
-      startGame: () => this.startGame(),
       closeShop: () => this.closeShop(),
       togglePause: () => this.togglePause(),
       toggleMute: () => this.toggleMute(),
       openNearestShop: () => this.openNearestShop(),
-      cycleWeather: () => this.cycleWeather(),
-      cycleTimePreset: () => this.cycleTimePreset(),
+      robNearestShop: () => this.robNearestShop(),
+      skipDialogue: () => this.skipActiveDialogue(),
       cycleCameraMode: () => this.cycleCameraMode(),
       resetWorld: () => this.resetWorld(),
-      toggleVehicleDoors: () => this.toggleVehicleDoors(),
       toggleVehicleFrunk: () => this.toggleVehicleFrunk(),
       triggerRobberyAction: (action) => this.triggerRobberyAction(action),
     });
@@ -478,8 +498,47 @@ export class SanAndreasEngine {
 
     this.registerEngineDisposables();
 
-    // Use non-blocking compileAsync when running on hardware GPU
+    // Pre-sync crowd and rigs BEFORE compileAsync so instanced shaders pre-compile during boot
+    const preSyncSec = performance.now() * 0.001;
+    this.entityAnimator.sync({
+      dt: 0.016,
+      nowSec: preSyncSec,
+      frameCounter: 0,
+      phase: this.phase,
+      weather: this.weatherSystem.getWeather(),
+      nightFactor: this.weatherSystem.getNightFactor(),
+      player: this.player,
+      playerRig: this.playerRig,
+      vehicles: this.vehicles,
+      vehicleRigs: this.vehicleRigs,
+      peds: this.peds,
+      pedCrowd: this.pedCrowd,
+      birdFlock: this.worldVisuals.birdFlock,
+      dustMotes: this.worldVisuals.dustMotes,
+      shopMarkers: this.worldVisuals.shopMarkers,
+      shopVisuals: this.worldVisuals.shopVisuals,
+      robberySession: null,
+      shopCooldowns: this.shopCooldowns,
+      checkpointGroup: this.worldVisuals.checkpointGroup,
+      checkpointRing: this.worldVisuals.checkpointRing,
+    });
+
+    // Use non-blocking compileAsync when running on hardware GPU.
+    // Temporarily reveal hidden struts, headlight beams, nitro flames & GPU rain layers so their
+    // shaders pre-compile during boot instead of stalling mid-drive on rain/night or door transitions.
     if (!this.renderContext.isSoftwareGl) {
+      const heroRig = this.vehicleRigs.values().next().value as VehicleRig | undefined;
+      if (heroRig) {
+        heroRig.frunkBayGroup.visible = true;
+        heroRig.hypercar.doorLStrut.setVisible(true);
+        heroRig.hypercar.doorRStrut.setVisible(true);
+        heroRig.hypercar.frunkStrutL.setVisible(true);
+        heroRig.hypercar.frunkStrutR.setVisible(true);
+        heroRig.headlightBeam.visible = true;
+        heroRig.nitroFlameLeft.visible = true;
+        heroRig.nitroFlameRight.visible = true;
+      }
+      this.weatherSystem.setRainWarmupVisible(true);
       const rendererWithAsync = this.renderContext.renderer as THREE.WebGLRenderer & {
         compileAsync?: (scene: THREE.Object3D, camera: THREE.Camera) => Promise<unknown>;
       };
@@ -488,19 +547,52 @@ export class SanAndreasEngine {
       } else {
         this.renderContext.renderer.compile(this.scene, this.cameraController.camera);
       }
+      this.weatherSystem.setRainWarmupVisible(false);
+      if (heroRig) {
+        heroRig.frunkBayGroup.visible = false;
+        heroRig.hypercar.doorLStrut.setVisible(false);
+        heroRig.hypercar.doorRStrut.setVisible(false);
+        heroRig.hypercar.frunkStrutL.setVisible(false);
+        heroRig.hypercar.frunkStrutR.setVisible(false);
+        heroRig.headlightBeam.visible = false;
+        heroRig.nitroFlameLeft.visible = false;
+        heroRig.nitroFlameRight.visible = false;
+      }
     }
+    this.poseHistory.snapToCurrent(this.player, this.vehicles);
     if (this.disposed) return;
 
     this.installTestHook();
 
-    if (this.options.autostart) {
-      this.startGame();
-    } else {
-      this.setPhase('title');
-    }
-
     this.bootReady = true;
+    this.startGame();
     this.lastFrameMs = performance.now();
+
+    // Render initial live Grove Street frame before revealing canvas via smooth LoadingScreen fade-out
+    const bootSec = this.lastFrameMs * 0.001;
+    this.entityAnimator.sync({
+      dt: 0.016,
+      nowSec: bootSec,
+      frameCounter: 0,
+      phase: this.phase,
+      weather: this.weatherSystem.getWeather(),
+      nightFactor: this.weatherSystem.getNightFactor(),
+      player: this.player,
+      playerRig: this.playerRig,
+      vehicles: this.vehicles,
+      vehicleRigs: this.vehicleRigs,
+      peds: this.peds,
+      pedCrowd: this.pedCrowd,
+      birdFlock: this.worldVisuals.birdFlock,
+      dustMotes: this.worldVisuals.dustMotes,
+      shopMarkers: this.worldVisuals.shopMarkers,
+      shopVisuals: this.worldVisuals.shopVisuals,
+      robberySession: null,
+      shopCooldowns: this.shopCooldowns,
+      checkpointGroup: this.worldVisuals.checkpointGroup,
+      checkpointRing: this.worldVisuals.checkpointRing,
+    });
+    this.renderCurrentFrame(bootSec);
     this.emitHud();
     this.emitBootProgress(
       100,
@@ -520,6 +612,11 @@ export class SanAndreasEngine {
     (window as unknown as Record<string, unknown>).__SA_ENGINE_TEST__ = {
       isBootReady: () => this.bootReady,
       getMemory: () => this.getMemorySnapshot(),
+      getRenderStats: () => ({
+        ...this.renderContext.getRenderStats(),
+        visiblePeds: this.pedCrowd?.getLastVisibleCount() ?? 0,
+        crowdLayers: this.pedCrowd?.getDrawCallLayerCount() ?? 0,
+      }),
       resetWorld: () => this.resetWorld(),
       getPhase: () => this.phase,
       getVehicleCount: () => this.vehicles.length,
@@ -528,26 +625,150 @@ export class SanAndreasEngine {
         x: this.player.x,
         z: this.player.z,
         inVehicleId: this.player.inVehicleId,
+        vehicleTransition: { ...this.player.vehicleTransition },
         cash: this.cash,
       }),
+      getVehicleDoorState: (vehicleId?: string) => {
+        const id =
+          vehicleId ??
+          this.player.vehicleTransition.vehicleId ??
+          this.player.inVehicleId ??
+          this.vehicles[0]?.id;
+        const rig = id ? this.vehicleRigs.get(id) : undefined;
+        if (!rig) return null;
+        return {
+          vehicleId: id,
+          doorLValue: rig.hypercar.doorL.value,
+          doorLTarget: rig.hypercar.doorL.target,
+          doorRValue: rig.hypercar.doorR.value,
+          doorRTarget: rig.hypercar.doorR.target,
+          frunkValue: rig.hypercar.frunk.value,
+          playerRigPos: {
+            x: this.playerRig.root.position.x,
+            y: this.playerRig.root.position.y,
+            z: this.playerRig.root.position.z,
+          },
+        };
+      },
+      getAtmosphereState: () => ({
+        clockText: this.weatherSystem?.getClockText() ?? '17:30',
+        weather: this.weatherSystem?.getWeather() ?? 'golden',
+        nightFactor: this.weatherSystem?.getNightFactor() ?? 0.14,
+      }),
+      advanceAtmosphere: (seconds: number) => {
+        if (!this.weatherSystem) return;
+        this.weatherSystem.advanceTimeSeconds(seconds);
+        this.weatherSystem.syncToScene(
+          this.renderContext.renderer,
+          this.scene,
+          this.player.x,
+          this.player.z,
+        );
+        this.renderCurrentFrame(performance.now() * 0.001);
+        this.emitHud();
+      },
+      setAtmosphereForTest: (weather: 'golden' | 'clear' | 'fog' | 'rain' | 'storm', timeOfDayHours?: number) => {
+        if (!this.weatherSystem) return;
+        this.weatherSystem.setAtmosphereForTest(weather, timeOfDayHours);
+        this.weatherSystem.syncToScene(
+          this.renderContext.renderer,
+          this.scene,
+          this.player.x,
+          this.player.z,
+        );
+        const focusCar = this.getActivePlayerVehicle() ?? this.vehicles[0];
+        if (focusCar) {
+          this.weatherSystem.updateVehicleLightReflection(
+            focusCar.x,
+            focusCar.z,
+            focusCar.heading,
+            true,
+          );
+        }
+        this.entityAnimator.sync({
+          dt: 0.016,
+          nowSec: performance.now() * 0.001,
+          frameCounter: this.frameCounter,
+          phase: this.phase,
+          weather: this.weatherSystem.getWeather(),
+          nightFactor: this.weatherSystem.getNightFactor(),
+          player: this.player,
+          playerRig: this.playerRig,
+          vehicles: this.vehicles,
+          vehicleRigs: this.vehicleRigs,
+          peds: this.peds,
+          pedCrowd: this.pedCrowd,
+          birdFlock: this.worldVisuals.birdFlock,
+          dustMotes: this.worldVisuals.dustMotes,
+          shopMarkers: this.worldVisuals.shopMarkers,
+          shopVisuals: this.worldVisuals.shopVisuals,
+          robberySession: this.robberyActivity.currentSession,
+          shopCooldowns: this.shopCooldowns,
+          checkpointGroup: this.worldVisuals.checkpointGroup,
+          checkpointRing: this.worldVisuals.checkpointRing,
+        });
+        this.renderCurrentFrame(performance.now() * 0.001);
+        this.emitHud();
+      },
+      triggerEnterExit: () => this.triggerEnterOrExitVehicle(),
+      setPlayerPoseForTest: (x: number, z: number, heading?: number) => {
+        this.player.x = x;
+        this.player.z = z;
+        this.player.y = 0;
+        this.player.vx = 0;
+        this.player.vz = 0;
+        if (heading !== undefined) this.player.heading = heading;
+        this.poseHistory.snapToCurrent(this.player, this.vehicles);
+        this.cameraController.snapBehind(
+          this.player.heading,
+          this.player.x,
+          this.player.y,
+          this.player.z,
+          getShopRoofCeilingClampY(x, z) !== null ? 2.5 : 4.25,
+        );
+        this.emitHud();
+      },
       enterNearestVehicle: () => {
         const near = findNearestEnterableVehicle(this.player.x, this.player.z, this.vehicles, 12);
         if (!near) return null;
         near.driver = 'player';
         this.player.inVehicleId = near.id;
-        this.playerRig.root.visible = false;
+        this.player.vehicleTransition.mode = 'none';
+        this.player.vehicleTransition.vehicleId = null;
+        this.player.vehicleTransition.progress = 0;
         near.speed = 24;
         near.vz = -24;
         near.gear = 3;
         near.rpm = 4800;
+        this.poseHistory.snapToCurrent(this.player, this.vehicles);
         this.emitHud();
         return near.id;
+      },
+      getActiveCarTelemetry: () => {
+        const car = this.getActivePlayerVehicle();
+        if (!car) return null;
+        return {
+          id: car.id,
+          kind: car.spec.kind,
+          x: car.x,
+          z: car.z,
+          heading: car.heading,
+          speed: car.speed,
+          lateralSpeed: car.lateralSpeed,
+          angularVel: car.angularVel,
+          rearSlipRatio: car.rearSlipRatio,
+          frontSlipRatio: car.frontSlipRatio,
+          drifting: car.drifting,
+          rpm: car.rpm,
+          gear: car.gear,
+        };
       },
       openShopById: (shopId: string) => {
         const shop = SHOPS.find((s) => s.id === shopId);
         if (!shop) return false;
-        this.player.x = shop.x;
-        this.player.z = shop.z;
+        this.player.x = shop.registerX;
+        this.player.z = shop.registerZ;
+        this.player.heading = shop.facingHeading + Math.PI;
         this.activeShop = shop;
         this.emitHud();
         return true;
@@ -557,21 +778,46 @@ export class SanAndreasEngine {
         const nowSec = performance.now() * 0.001;
         const robberySession = this.robberyActivity.currentSession;
         if (robberySession) {
-          this.robberyStage.updateVisuals(robberySession, 0.016, nowSec);
+          this.entityAnimator.sync({
+            dt: 0.016,
+            nowSec,
+            frameCounter: this.frameCounter,
+            phase: this.phase,
+            weather: this.weatherSystem.getWeather(),
+            nightFactor: this.weatherSystem.getNightFactor(),
+            player: this.player,
+            playerRig: this.playerRig,
+            vehicles: this.vehicles,
+            vehicleRigs: this.vehicleRigs,
+            peds: this.peds,
+            pedCrowd: this.pedCrowd,
+            birdFlock: this.worldVisuals.birdFlock,
+            dustMotes: this.worldVisuals.dustMotes,
+            shopMarkers: this.worldVisuals.shopMarkers,
+            shopVisuals: this.worldVisuals.shopVisuals,
+            robberySession,
+            shopCooldowns: this.shopCooldowns,
+            checkpointGroup: this.worldVisuals.checkpointGroup,
+            checkpointRing: this.worldVisuals.checkpointRing,
+          });
           this.cameraController.update({
             dt: 0.016,
             nowSec,
-            phase: this.phase,
             player: this.player,
             activeCar: this.getActivePlayerVehicle(),
+            transitionCar: this.getTransitionVehicle(),
             robberySession,
-            robberyStage: this.robberyStage,
+            spatialGrid: this.spatialGrid,
           });
           this.renderCurrentFrame(nowSec);
         }
         return Boolean(robberySession);
       },
-      toggleVehicleDoors: () => this.toggleVehicleDoors(),
+      robNearestShop: () => {
+        this.robNearestShop();
+        return Boolean(this.robberyActivity.currentSession);
+      },
+      skipDialogue: () => this.skipActiveDialogue(),
       toggleVehicleFrunk: () => this.toggleVehicleFrunk(),
     };
   }
@@ -588,12 +834,15 @@ export class SanAndreasEngine {
     if (this.inputController) this.engineScope.track(this.inputController);
     this.engineScope.track(this.minimapRenderer);
     this.engineScope.track(this.audio);
-    if (this.robberyStage) this.engineScope.track(this.robberyStage);
+    this.engineScope.trackCleanup(() => this.dialogueDirector.clear(true));
     if (this.particleSystem) this.engineScope.track(this.particleSystem);
     if (this.playerRig) {
       this.engineScope.trackCleanup(() => {
         disposeCharacterRig(this.playerRig, true);
       });
+    }
+    if (this.pedCrowd) {
+      this.engineScope.track(this.pedCrowd);
     }
     if (this.worldVisuals) {
       this.engineScope.trackCleanup(() => {
@@ -629,8 +878,8 @@ export class SanAndreasEngine {
       this.applyPlayerDamage(amount);
     });
 
-    this.eventBus.on('particle:burst', ({ x, y, z, count, kind }) => {
-      this.particleSystem.spawnBurst(x, y, z, count, kind);
+    this.eventBus.on('particle:burst', ({ x, y, z, count, kind, vx, vy, vz, intensity }) => {
+      this.particleSystem.spawnBurst(x, y, z, count, kind, { vx, vy, vz, intensity });
     });
 
     this.eventBus.on('player:cash', ({ delta, reason }) => {
@@ -668,6 +917,15 @@ export class SanAndreasEngine {
           break;
         case 'door':
           this.audio.playDoorThud();
+          break;
+        case 'gear_shift':
+          this.audio.playGearShift(ev.up);
+          break;
+        case 'curb_bump':
+          this.audio.playSuspensionThump(ev.intensity);
+          break;
+        case 'scrape':
+          this.audio.playScrape(ev.intensity);
           break;
         case 'checkpoint':
           this.audio.playCheckpoint();
@@ -759,6 +1017,16 @@ export class SanAndreasEngine {
       health: 100,
       armor: 60,
       inVehicleId: null,
+      vehicleTransition: {
+        mode: 'none',
+        vehicleId: null,
+        side: 1,
+        progress: 0,
+        duration: 1.38,
+        startX: PLAYER_SPAWN.x,
+        startZ: PLAYER_SPAWN.z,
+        startHeading: PLAYER_SPAWN.heading,
+      },
       attackTimer: 0,
       damageFlash: 0,
       outfitId: 'classic_cj',
@@ -814,8 +1082,7 @@ export class SanAndreasEngine {
     this.entityScope = this.engineScope.createChildScope();
     this.vehicleRigs.clear();
     this.vehicles.length = 0;
-    this.pedRigs.clear();
-    this.pedShadowActive.clear();
+    this.pedCrowd?.clear();
     this.peds.length = 0;
   }
 
@@ -889,7 +1156,7 @@ export class SanAndreasEngine {
     };
     this.peds.push(state);
 
-    const rig = buildCharacterRig(this.materials, {
+    this.pedCrowd.registerPed(p.id, {
       shirtHex: p.shirt,
       pantsHex: p.pants,
       skinHex: p.skin,
@@ -900,20 +1167,6 @@ export class SanAndreasEngine {
       hasShades: p.hasShades,
       heightScale: p.heightScale,
     });
-    rig.root.position.set(p.x, 0, p.z);
-    rig.root.rotation.y = initialHeading;
-
-    const startDistSq = (p.x - PLAYER_SPAWN.x) ** 2 + (p.z - PLAYER_SPAWN.z) ** 2;
-    const castNow = startDistSq < 1156;
-    rig.root.traverse((obj) => {
-      if ((obj as THREE.Mesh).isMesh && obj.name !== 'contact_shadow') {
-        obj.castShadow = castNow;
-      }
-    });
-    this.pedShadowActive.set(p.id, castNow);
-    this.scene.add(rig.root);
-    this.pedRigs.set(p.id, rig);
-    this.entityScope.trackCleanup(() => disposeCharacterRig(rig, false));
   }
 
   public getMemorySnapshot(): { geometries: number; textures: number; programs: number } {
@@ -922,12 +1175,22 @@ export class SanAndreasEngine {
 
   public setMinimapCanvas(canvas: HTMLCanvasElement | null): void {
     this.minimapRenderer.setCanvas(canvas);
+    if (canvas && this.bootReady && !this.robberyActivity.isActive) {
+      this.minimapRenderer.draw({
+        phase: this.phase,
+        player: this.player,
+        cameraYaw: this.cameraController.getYaw(),
+        vehicles: this.vehicles,
+        activeCheckpoint: this.checkpointActivity.getCurrentCheckpoint(),
+        nowMs: performance.now(),
+      });
+    }
   }
 
   public setPhase(next: GamePhase): void {
     this.phase = next;
     document.body.dataset.state = next;
-    if (next === 'paused' || next === 'gameover' || next === 'title') {
+    if (next === 'paused' || next === 'gameover') {
       this.inputController?.clearTransientInput();
       this.audio.silenceLoops();
       if (document.pointerLockElement) {
@@ -957,7 +1220,7 @@ export class SanAndreasEngine {
       this.player.x,
       this.player.y,
       this.player.z,
-      7.5,
+      4.25,
     );
     this.showBanner('GROVE STREET · LOS SANTOS', 2.8);
     this.setPhase('playing');
@@ -967,6 +1230,7 @@ export class SanAndreasEngine {
     if (!this.bootReady) return;
     this.abortRobberyIfActive();
     this.simClock.reset();
+    this.weatherSystem?.resetCycle();
     this.player = this.createInitialPlayer();
     this.applyPlayerOutfit('classic_cj');
     this.cash = 1250;
@@ -980,8 +1244,11 @@ export class SanAndreasEngine {
     this.runSummary = null;
     this.activeShop = null;
     this.shopCooldowns.clear();
+    this.shopGreetingCooldowns.clear();
+    this.dialogueDirector.clear(true);
 
     this.initEntities();
+    this.poseHistory.snapToCurrent(this.player, this.vehicles);
     this.activityRegistry.cancelAll(this.buildActivityContext());
     this.activityRegistry.startActivity(
       this.checkpointActivity.id,
@@ -996,9 +1263,10 @@ export class SanAndreasEngine {
       this.player.x,
       this.player.y,
       this.player.z,
-      7.5,
+      4.25,
     );
     this.playerRig.root.visible = true;
+    this.playerRig.root.scale.setScalar(1);
     this.playerRig.root.position.set(this.player.x, 0, this.player.z);
     this.playerRig.root.rotation.y = this.player.heading;
     this.showBanner('GROVE STREET · LOS SANTOS', 2.4);
@@ -1013,35 +1281,6 @@ export class SanAndreasEngine {
       this.audio.unlock();
       this.setPhase('playing');
     }
-  }
-
-  public returnToTitle(): void {
-    if (!this.bootReady) return;
-    this.resetWorld();
-    this.setPhase('title');
-  }
-
-  public cycleWeather(): void {
-    if (!this.bootReady || !this.weatherSystem) return;
-    const idx = WEATHER_ORDER.indexOf(this.weatherSystem.getWeather());
-    this.setWeather(WEATHER_ORDER[(idx + 1) % WEATHER_ORDER.length]);
-  }
-
-  public setWeather(w: WeatherType): void {
-    if (!this.bootReady || !this.weatherSystem) return;
-    this.weatherSystem.setWeather(w);
-    this.eventBus.emit('weather:changed', { weather: w });
-    this.showBanner(`CLIMA: ${WEATHER_LABELS[w]}`, 2.2);
-    this.emitHud();
-  }
-
-  public cycleTimePreset(): void {
-    if (!this.bootReady || !this.weatherSystem) return;
-    const idx = TIME_ORDER.indexOf(this.weatherSystem.getTimePreset());
-    const next = TIME_ORDER[(idx + 1) % TIME_ORDER.length];
-    this.weatherSystem.setTimePreset(next);
-    this.showBanner(`HORA: ${TIME_LABELS[next]}`, 2.2);
-    this.emitHud();
   }
 
   public cycleCameraMode(): void {
@@ -1080,35 +1319,9 @@ export class SanAndreasEngine {
   private getTargetHypercarForArticulation(): VehicleState | null {
     return (
       this.getActivePlayerVehicle() ??
+      this.getTransitionVehicle() ??
       findNearestEnterableVehicle(this.player.x, this.player.z, this.vehicles, 7.5)
     );
-  }
-
-  public toggleVehicleDoors(): void {
-    if (this.phase !== 'playing') return;
-    this.audio.unlock();
-    const targetCar = this.getTargetHypercarForArticulation();
-    if (!targetCar) {
-      this.showBanner('ACÉRCATE A UN HYPERCAR PARA ABRIR LAS PUERTAS [O]', 1.8);
-      this.emitHud();
-      return;
-    }
-    const rig = this.vehicleRigs.get(targetCar.id);
-    if (!rig) return;
-    const hc = rig.hypercar;
-    const nextOpen = hc.doorL.target < 0.5 || hc.doorR.target < 0.5 ? 1 : 0;
-    hc.doorL.target = nextOpen;
-    hc.doorR.target = nextOpen;
-    hc.autoCloseTimer = 0;
-    hc.pulseTime = 0;
-    this.audio.playDoorThud();
-    this.showBanner(
-      nextOpen
-        ? `${targetCar.spec.name.toUpperCase()} · PUERTAS DIÉDRICAS ABIERTAS`
-        : `${targetCar.spec.name.toUpperCase()} · PUERTAS DIÉDRICAS CERRADAS`,
-      2.0,
-    );
-    this.emitHud();
   }
 
   public toggleVehicleFrunk(): void {
@@ -1145,8 +1358,55 @@ export class SanAndreasEngine {
   }
 
   private findNearbyShop(): ShopSpec | null {
-    const range = this.player.inVehicleId ? 9.5 : 7.0;
-    return findNearestShop(this.player.x, this.player.z, SHOPS, range);
+    return findNearestShopRegister(
+      this.player.x,
+      this.player.z,
+      Boolean(this.player.inVehicleId),
+      SHOPS,
+    );
+  }
+
+  private handleShopDoorOpened(shopId: string): void {
+    this.audio.playDoorChime();
+    this.triggerAmbientShopGreeting(shopId);
+  }
+
+  private triggerAmbientShopGreeting(shopId: string): void {
+    if (this.robberyActivity.isActive || this.activeShop) return;
+    if ((this.shopCooldowns.get(shopId) ?? 0) > 0) return;
+    if ((this.shopGreetingCooldowns.get(shopId) ?? 0) > 0) return;
+
+    const profile = getShopOwnerProfile(shopId);
+    const text = getShopAmbientGreeting(shopId, this.greetingCounter++);
+    const queued = this.dialogueDirector.enqueue({
+      speaker: profile.ownerName,
+      role: 'clerk',
+      text,
+      pitch: profile.voicePitch,
+      rate: profile.voiceRate,
+      priority: 'ambient',
+      pauseAfterSec: 0.2,
+    });
+    if (queued > 0) {
+      this.shopGreetingCooldowns.set(shopId, 24);
+      this.emitHud();
+    }
+  }
+
+  public skipActiveDialogue(): boolean {
+    if (this.robberyActivity.isActive) {
+      const s = this.robberyActivity.currentSession;
+      if (s && skipRobberyDialogue(s)) {
+        this.emitHud();
+        return true;
+      }
+      return false;
+    }
+    const skipped = this.dialogueDirector.skipCurrent();
+    if (skipped) {
+      this.emitHud();
+    }
+    return skipped;
   }
 
   public openNearestShop(): void {
@@ -1216,14 +1476,27 @@ export class SanAndreasEngine {
   private abortRobberyIfActive(): void {
     if (!this.robberyActivity.isActive) return;
     this.robberyActivity.cancel(this.buildActivityContext());
-    this.robberyStage.deactivate();
-    this.audio.cancelSpeech();
+    this.worldVisuals?.shopVisuals?.robberyKit.deactivate(
+      this.worldVisuals.shopVisuals.staticRegisterByShopId,
+    );
+    this.dialogueDirector.clear(true);
+  }
+
+  public robNearestShop(): void {
+    if (this.phase !== 'playing' || this.robberyActivity.isActive) return;
+    const near = this.activeShop ?? this.findNearbyShop();
+    if (!near) return;
+    this.startRobberyAtShop(near);
   }
 
   public robActiveShop(): void {
     if (!this.activeShop || this.robberyActivity.isActive) return;
+    this.startRobberyAtShop(this.activeShop);
+  }
+
+  private startRobberyAtShop(shop: ShopSpec): void {
+    if (this.robberyActivity.isActive) return;
     this.audio.unlock();
-    const shop = this.activeShop;
     const cd = this.shopCooldowns.get(shop.id) ?? 0;
     if (cd > 0) {
       this.showBanner(`Caja vacía · Espera ${Math.ceil(cd)}s`, 2.2);
@@ -1231,9 +1504,9 @@ export class SanAndreasEngine {
       return;
     }
 
-    // Park player car outside cleanly before entering interior robbery stage
-    if (this.player.inVehicleId) {
-      const car = this.getActivePlayerVehicle();
+    // Exit player car cleanly right where parked if robbing from inside a vehicle (e.g., LS Customs forecourt)
+    if (this.player.inVehicleId || this.player.vehicleTransition.mode !== 'none') {
+      const car = this.getActivePlayerVehicle() ?? this.getTransitionVehicle();
       if (car) {
         car.driver = 'none';
         car.speed = 0;
@@ -1241,9 +1514,13 @@ export class SanAndreasEngine {
         car.vz = 0;
       }
       this.player.inVehicleId = null;
+      this.player.vehicleTransition.mode = 'none';
+      this.player.vehicleTransition.vehicleId = null;
+      this.player.vehicleTransition.progress = 0;
       this.playerRig.root.visible = true;
-      this.player.x = shop.x;
-      this.player.z = shop.z;
+      this.playerRig.root.scale.setScalar(1);
+      this.player.x = shop.registerX;
+      this.player.z = shop.registerZ;
     }
 
     this.activeShop = null;
@@ -1252,26 +1529,68 @@ export class SanAndreasEngine {
 
     const started = this.activityRegistry.startActivity(
       this.robberyActivity.id,
-      { shop, forcedOutcomeRoll: this.forcedRobberyRoll },
+      {
+        shop,
+        forcedOutcomeRoll: this.forcedRobberyRoll,
+        startWorldX: this.player.x,
+        startWorldZ: this.player.z,
+        startHeading: this.player.heading,
+        dialogueDirector: this.dialogueDirector,
+      },
       this.buildActivityContext(),
     );
+
     if (started && this.robberyActivity.currentSession) {
       const session = this.robberyActivity.currentSession;
-      const nowSec = performance.now() * 0.001;
-      this.robberyStage.activateForSession(
-        session,
-        this.player.outfitId,
-        this.scene.environment,
+      this.worldVisuals.shopVisuals.robberyKit.activate(
+        shop,
+        this.worldVisuals.shopVisuals.staticRegisterByShopId,
       );
-      this.robberyStage.updateVisuals(session, 0.016, nowSec);
+
+      // Outdoor street cart & mechanic bay panic nearby pedestrians immediately
+      if (shop.venueMode !== 'indoor') {
+        for (const ped of this.peds) {
+          if (
+            (ped.role === 'civilian' || ped.role === 'grove') &&
+            Math.hypot(ped.x - shop.originX, ped.z - shop.originZ) < 16
+          ) {
+            ped.state = 'flee';
+            ped.stateTimer = 8.0;
+          }
+        }
+      }
+
+      const nowSec = performance.now() * 0.001;
+      this.entityAnimator.sync({
+        dt: 0.016,
+        nowSec,
+        frameCounter: this.frameCounter,
+        phase: this.phase,
+        weather: this.weatherSystem.getWeather(),
+        nightFactor: this.weatherSystem.getNightFactor(),
+        player: this.player,
+        playerRig: this.playerRig,
+        vehicles: this.vehicles,
+        vehicleRigs: this.vehicleRigs,
+        peds: this.peds,
+        pedCrowd: this.pedCrowd,
+        birdFlock: this.worldVisuals.birdFlock,
+        dustMotes: this.worldVisuals.dustMotes,
+        shopMarkers: this.worldVisuals.shopMarkers,
+        shopVisuals: this.worldVisuals.shopVisuals,
+        robberySession: session,
+        shopCooldowns: this.shopCooldowns,
+        checkpointGroup: this.worldVisuals.checkpointGroup,
+        checkpointRing: this.worldVisuals.checkpointRing,
+      });
       this.cameraController.update({
         dt: 0.016,
         nowSec,
-        phase: this.phase,
         player: this.player,
         activeCar: null,
+        transitionCar: null,
         robberySession: session,
-        robberyStage: this.robberyStage,
+        spatialGrid: this.spatialGrid,
       });
     }
     this.emitHud();
@@ -1294,12 +1613,17 @@ export class SanAndreasEngine {
   ): void {
     for (let i = 0; i < events.length; i++) {
       const ev = events[i];
-      if (ev.type === 'dialogue' && ev.dialogue) {
-        this.audio.speakDialogue(ev.dialogue.text, ev.dialogue.pitch, ev.dialogue.rate);
-      } else if (ev.type === 'hitstop' && ev.amount) {
+      if (ev.type === 'hitstop' && ev.amount) {
         this.hitstopTimer = Math.max(this.hitstopTimer, ev.amount);
       } else if (ev.type === 'bill_burst' && ev.amount) {
-        this.robberyStage.spawnBillBurst(ev.amount);
+        const w = shopLocalToWorld(
+          session.shop.originX,
+          session.shop.originZ,
+          session.shop.facingHeading,
+          0.25,
+          session.shop.counterLocalZ,
+        );
+        this.worldVisuals.shopVisuals.robberyKit.triggerBillBurst(ev.amount, w.x, w.z);
       } else if (ev.type === 'completed') {
         this.completeRobberySession(ev, session);
       }
@@ -1311,39 +1635,52 @@ export class SanAndreasEngine {
     const payout = Math.max(0, Math.round(ev.payout ?? session.bagCash));
     const stars = Math.min(5, Math.max(1, ev.wantedStars ?? shop.robWantedStars));
 
-    this.robberyStage.deactivate();
-    this.audio.cancelSpeech();
+    const exitWorld = getRobberyCjWorldTransform(session);
+    this.worldVisuals.shopVisuals.robberyKit.deactivate(
+      this.worldVisuals.shopVisuals.staticRegisterByShopId,
+    );
 
     this.cash += payout;
     this.shopCooldowns.set(shop.id, 45);
     this.raiseWantedLevel(Math.max(this.wantedLevel + 1, stars));
 
-    this.player.x = shop.x;
-    this.player.z = shop.z;
+    // Seamless in-world handoff at CJ's real world coordinates (ZERO teleport / ZERO black cut!)
+    this.player.x = exitWorld.x;
+    this.player.z = exitWorld.z;
     this.player.y = 0;
     this.player.vx = 0;
     this.player.vz = 0;
+    this.player.heading = exitWorld.heading;
     this.playerRig.root.visible = true;
     this.playerRig.root.position.set(this.player.x, 0, this.player.z);
-    this.cameraController.snapBehind(
-      this.player.heading,
-      this.player.x,
-      this.player.y,
-      this.player.z,
-      5.6,
-    );
+    this.playerRig.root.rotation.y = this.player.heading;
+    this.cameraController.alignBehindHeading(this.player.heading);
 
-    this.particleSystem.spawnBurst(shop.x, 1.4, shop.z, 18, 'spark');
+    this.particleSystem.spawnBurst(exitWorld.x, 1.2, exitWorld.z, 18, 'spark');
     if (payout > 0) {
       this.showBanner(`¡BOTÍN EN ${shop.name}! +$${payout} · ¡HUYE DE LA LSPD!`, 3.4);
     } else {
       this.showBanner(`¡ESCAPASTE DE ${shop.name}! · ¡LA LSPD VIENE!`, 3.2);
     }
 
+    const clerkPedId = CLERK_PED_ID_BY_SHOP[shop.id];
     for (const ped of this.peds) {
-      if (ped.role === 'clerk' && Math.hypot(ped.x - shop.x, ped.z - shop.z) < 12) {
-        ped.state = ev.clerkKo ? 'ko' : 'flee';
-        ped.stateTimer = 7.0;
+      if (ped.id === clerkPedId) {
+        if (ev.clerkKo) {
+          ped.state = 'ko';
+          ped.koTimer = 35;
+        } else if (shop.venueMode !== 'indoor') {
+          ped.state = 'flee';
+          ped.stateTimer = 8.0;
+        } else {
+          ped.state = 'walk';
+        }
+      } else if (
+        ped.role === 'civilian' &&
+        Math.hypot(ped.x - exitWorld.x, ped.z - exitWorld.z) < 15
+      ) {
+        ped.state = 'flee';
+        ped.stateTimer = 7.5;
       }
     }
     this.emitHud();
@@ -1422,40 +1759,57 @@ export class SanAndreasEngine {
     return null;
   }
 
+  private getTransitionVehicle(): VehicleState | null {
+    const vid = this.player.vehicleTransition.vehicleId;
+    if (this.player.vehicleTransition.mode === 'none' || !vid) return null;
+    for (let i = 0; i < this.vehicles.length; i++) {
+      if (this.vehicles[i].id === vid) {
+        return this.vehicles[i];
+      }
+    }
+    return null;
+  }
+
   private stepSimulation(dt: number): void {
-    // Tick down shop robbery cooldowns
-    for (const [id, secs] of this.shopCooldowns.entries()) {
-      if (secs > dt) {
-        this.shopCooldowns.set(id, secs - dt);
-      } else {
-        this.shopCooldowns.delete(id);
+    // Tick down shop robbery cooldowns & clerk greeting cooldowns (skip map iterator when empty)
+    if (this.shopCooldowns.size > 0) {
+      for (const [id, secs] of this.shopCooldowns) {
+        if (secs > dt) {
+          this.shopCooldowns.set(id, secs - dt);
+        } else {
+          this.shopCooldowns.delete(id);
+        }
+      }
+    }
+    if (this.shopGreetingCooldowns.size > 0) {
+      for (const [id, secs] of this.shopGreetingCooldowns) {
+        if (secs > dt) {
+          this.shopGreetingCooldowns.set(id, secs - dt);
+        } else {
+          this.shopGreetingCooldowns.delete(id);
+        }
       }
     }
 
     const input = this.inputController.sampleInput();
     this.elapsedPlayTime += dt;
 
-    // Exclusive Activity Branch (e.g. Interactive 3D Store Robbery)
+    // Exclusive Activity Branch (In-World Interactive Store / Street Cart Robbery)
     if (this.activityRegistry.hasExclusiveActive()) {
       this.activityRegistry.updateAll(dt, input, this.buildActivityContext());
-      this.audio.updateContinuous({
-        inVehicle: false,
-        rpm: 900,
-        throttle: 0,
-        nitroActive: false,
-        skidIntensity: 0,
-        weather: 'clear',
-        sirenIntensity: this.wantedLevel > 0 ? 0.2 : 0,
-        dt,
-      });
+      this.lastAudioThrottle = 0;
+      this.lastAudioSkid = 0;
+      this.lastAudioSiren = this.wantedLevel > 0 ? 0.25 : 0;
       return;
     }
+
+    // Advance ambient dialogue director when not in exclusive robbery
+    this.dialogueDirector.update(dt);
 
     // Apply pointer camera orbit delta
     this.cameraController.applyOrbitDelta(input.cameraOrbitDeltaX, input.cameraOrbitDeltaY);
 
-    // Headless Open-World Simulation Step (SpatialHashGrid + 3-Tier NPC LOD)
-    const prevVehicleId = this.player.inVehicleId;
+    // Headless Open-World Simulation Step (SpatialHashGrid + 3-Tier NPC LOD + AAA Entry/Exit)
     const weather = this.weatherSystem.getWeather();
     const simResult = stepOpenWorldSimulation({
       dt,
@@ -1481,36 +1835,33 @@ export class SanAndreasEngine {
     if (simResult.hitstopDelta > 0) {
       this.hitstopTimer = Math.max(this.hitstopTimer, simResult.hitstopDelta);
     }
-    if (simResult.vehicleEnteredOrExited) {
-      this.playerRig.root.visible = this.player.inVehicleId === null;
-      const interactedVehicleId = this.player.inVehicleId ?? prevVehicleId;
-      if (interactedVehicleId) {
-        const interactedRig = this.vehicleRigs.get(interactedVehicleId);
-        if (interactedRig) {
-          interactedRig.hypercar.doorL.target = 1;
-          interactedRig.hypercar.autoCloseTimer = 1.65;
-          interactedRig.hypercar.pulseTime = 0;
-        }
+    if (simResult.transitionDoorPulseVehicleId) {
+      const pulseRig = this.vehicleRigs.get(simResult.transitionDoorPulseVehicleId);
+      if (pulseRig) {
+        pulseRig.hypercar.pulseTime = 0;
       }
-      this.cameraController.requestAutoReturn();
-      this.emitHud();
+    }
+    if (simResult.vehicleEnteredOrExited) {
+      if (this.player.vehicleTransition.mode === 'none') {
+        this.cameraController.requestAutoReturn();
+      }
+      // Defer React HUD reconciliation until after WebGL frame submission to prevent micro-stutters
+      this.hudDirty = true;
+    }
+
+    // Greet player ambiently when stepping up to outdoor street cart / mechanic bay
+    const nearShop = this.findNearbyShop();
+    if (nearShop && nearShop.venueMode !== 'indoor') {
+      this.triggerAmbientShopGreeting(nearShop.id);
     }
 
     // Ambient Pluggable Activities (Checkpoints, Future Free-Roam Missions)
     this.activityRegistry.updateAll(dt, input, this.buildActivityContext());
 
-    // Continuous Procedural Web Audio
-    const playerCar = simResult.playerCar;
-    this.audio.updateContinuous({
-      inVehicle: Boolean(playerCar),
-      rpm: playerCar ? playerCar.rpm : 900,
-      throttle: input.forward,
-      nitroActive: playerCar ? playerCar.nitroActive : false,
-      skidIntensity: simResult.playerSkid,
-      weather,
-      sirenIntensity: simResult.sirenProximity,
-      dt,
-    });
+    // Cache continuous audio drivers for once-per-visual-frame Web Audio update in tick()
+    this.lastAudioThrottle = input.forward;
+    this.lastAudioSkid = simResult.playerSkid;
+    this.lastAudioSiren = simResult.sirenProximity;
   }
 
   private handleResize(): void {
@@ -1534,14 +1885,20 @@ export class SanAndreasEngine {
 
   private buildHudSnapshot(): HUDState {
     const activeCar = this.getActivePlayerVehicle();
-    const nearCar = activeCar
-      ? null
-      : findNearestEnterableVehicle(this.player.x, this.player.z, this.vehicles);
+    const isTransitioning = this.player.vehicleTransition.mode !== 'none';
+    const nearCar =
+      activeCar || isTransitioning
+        ? null
+        : findNearestEnterableVehicle(this.player.x, this.player.z, this.vehicles, 4.8);
     const nearShop = this.activeShop ? null : this.findNearbyShop();
+    const nearShopCooldown = nearShop
+      ? Math.ceil(this.shopCooldowns.get(nearShop.id) ?? 0)
+      : 0;
     const activeShopCooldown = this.activeShop
       ? Math.ceil(this.shopCooldowns.get(this.activeShop.id) ?? 0)
       : 0;
     const cpHud = this.checkpointActivity.getHudSlice();
+    const robbery = this.robberyActivity.getHudSlice();
 
     return {
       phase: this.phase,
@@ -1551,18 +1908,23 @@ export class SanAndreasEngine {
       wantedLevel: this.wantedLevel,
       district: this.lastDistrict,
       weather: this.weatherSystem ? this.weatherSystem.getWeather() : 'golden',
-      timePreset: this.weatherSystem ? this.weatherSystem.getTimePreset() : 'sunset',
-      clockText: this.weatherSystem ? this.weatherSystem.getClockText() : '18:20',
+      clockText: this.weatherSystem ? this.weatherSystem.getClockText() : '17:30',
       cameraMode: this.cameraController.getMode(),
       inVehicle: Boolean(activeCar),
       vehicleName: activeCar ? activeCar.spec.name : '',
       speedKmh: activeCar ? Math.round(Math.abs(activeCar.speed) * 3.6) : 0,
       gear: activeCar ? (activeCar.gear === -1 ? 'R' : String(activeCar.gear)) : '1',
-      rpmRatio: activeCar ? Math.min(1, Math.max(0, (activeCar.rpm - 900) / 6600)) : 0,
+      rpmRatio: activeCar
+        ? Math.min(1, Math.max(0, (activeCar.rpm - 900) / Math.max(1000, activeCar.spec.redlineRpm - 900)))
+        : 0,
       nitro: activeCar ? Math.round(activeCar.nitro) : 100,
       vehicleHealth: activeCar ? Math.round(activeCar.health) : 100,
+      tractionSlip: activeCar ? activeCar.rearSlipRatio > 0.25 || activeCar.drifting : false,
+      absActive: activeCar ? activeCar.absActive : false,
+      shiftFlash: activeCar ? activeCar.rpm >= activeCar.spec.redlineRpm * 0.87 : false,
       nearVehicleName: nearCar ? nearCar.spec.name : null,
       nearShop,
+      nearShopCooldown,
       activeShop: this.activeShop,
       activeShopCooldown,
       outfitId: this.player.outfitId,
@@ -1574,7 +1936,8 @@ export class SanAndreasEngine {
       touchControlsVisible: this.touchControlsVisible,
       runSummary: this.runSummary,
       bannerText: this.bannerTimer > 0 ? this.bannerText : null,
-      robbery: this.robberyActivity.getHudSlice(),
+      ambientDialogue: robbery ? null : this.dialogueDirector.getCurrentLine(),
+      robbery,
     };
   }
 
@@ -1585,19 +1948,24 @@ export class SanAndreasEngine {
   }
 
   private renderCurrentFrame(nowSec: number): void {
-    const inRobbery = this.robberyActivity.isActive;
-    const activeScene = inRobbery ? this.robberyStage.scene : this.scene;
+    const robbery = this.robberyActivity.currentSession;
+    const camPos = this.cameraController.camera.position;
+    const inInterior =
+      Boolean(robbery && !robbery.bounds.isOutdoor) ||
+      getShopRoofCeilingClampY(camPos.x, camPos.z) !== null;
+
     this.renderContext.renderFrame({
-      scene: activeScene,
+      scene: this.scene,
       camera: this.cameraController.camera,
       nowSec,
-      inInterior: inRobbery,
+      inInterior,
       sunDirection: this.weatherSystem.getSunDirection(),
       weather: this.weatherSystem.getWeather(),
       exposure: this.weatherSystem.getCurrentExposure(),
       bloomStrength: this.weatherSystem.getBloomStrength(),
       nightFactor: this.weatherSystem.getNightFactor(),
       warmth: this.weatherSystem.getWarmthFactor(),
+      rainIntensity: this.weatherSystem.getRainDensity(),
     });
   }
 
@@ -1627,70 +1995,178 @@ export class SanAndreasEngine {
         let rem = Math.min(Math.max(rawDt, 0.001), 0.16);
         while (rem > 0.0001 && this.robberyActivity.isActive) {
           const step = Math.min(rem, 0.05);
+          this.poseHistory.captureBeforeStep(this.player, this.vehicles);
           this.stepSimulation(step);
           rem -= step;
+        }
+      } else if (
+        this.player.vehicleTransition.mode !== 'none' &&
+        this.renderContext.isSoftwareGl
+      ) {
+        let rem = Math.min(Math.max(rawDt, 0.001), 0.28);
+        while (rem > 0.0001) {
+          const step = Math.min(rem, 1 / 60);
+          this.poseHistory.captureBeforeStep(this.player, this.vehicles);
+          this.stepSimulation(step);
+          rem -= step;
+          if ((this.player.vehicleTransition.mode as string) === 'none') break;
         }
       } else {
         this.simClock.advance(dt, (fixedDt) => {
           if (this.phase === 'playing' && !this.activeShop && this.hitstopTimer <= 0) {
+            this.poseHistory.captureBeforeStep(this.player, this.vehicles);
             this.stepSimulation(fixedDt);
           }
         });
       }
-      this.particleSystem.update(dt);
+      this.particleEnv.timeSec = nowSec;
+      this.particleEnv.sunColor.copy(this.weatherSystem.sunLight.color);
+      this.particleEnv.fogColor.copy(this.weatherSystem.fog.color);
+      this.particleEnv.fogDensity = this.weatherSystem.fog.density;
+      this.particleSystem.update(dt, this.particleEnv);
+
+      // Update continuous Web Audio once per visual frame (decoupled from 60Hz catch-up substeps)
+      const activeAudioCar = this.getActivePlayerVehicle();
+      const audioRobbery = this.robberyActivity.currentSession;
+      const audioWeather =
+        audioRobbery && !audioRobbery.bounds.isOutdoor
+          ? 'clear'
+          : this.weatherSystem.getWeather();
+      this.audio.updateContinuous({
+        inVehicle: Boolean(activeAudioCar) && !audioRobbery,
+        rpm: activeAudioCar ? activeAudioCar.rpm : 900,
+        throttle: this.lastAudioThrottle,
+        nitroActive: activeAudioCar ? activeAudioCar.nitroActive : false,
+        shiftCut: activeAudioCar ? activeAudioCar.shiftCutTimer > 0 : false,
+        speedKmh: activeAudioCar ? Math.abs(activeAudioCar.speed) * 3.6 : 0,
+        skidIntensity: audioRobbery ? 0 : this.lastAudioSkid,
+        weather: audioWeather,
+        sirenIntensity: this.lastAudioSiren,
+        dt,
+      });
     }
 
-    // 2. Sync 3D Presentation Layer & Camera
+    // 2. Sync 3D Presentation Layer & Camera (unified live Los Santos world even during robberies!)
     const robberySession = this.robberyActivity.currentSession;
     if (this.phase !== 'paused') {
-      if (robberySession) {
-        const visDt = this.renderContext.isSoftwareGl
-          ? Math.min(Math.max(rawDt, 0.001), 0.16)
-          : dt;
-        this.robberyStage.updateVisuals(robberySession, visDt, nowSec);
+      const visualDt = this.renderContext.isSoftwareGl
+        ? Math.min(Math.max(rawDt, 0.001), robberySession ? 0.16 : 1.0)
+        : dt;
+
+      if (!robberySession) {
+        const activeCar = this.getActivePlayerVehicle();
+        const heroCar =
+          activeCar ?? findNearestEnterableVehicle(this.player.x, this.player.z, this.vehicles, 28);
+        const wetness = this.weatherSystem.getWetness();
+        const nightFactor = this.weatherSystem.getNightFactor();
+        const lightsShouldReflect =
+          Boolean(heroCar) && (nightFactor > 0.35 || wetness > 0.04);
+        if (heroCar && lightsShouldReflect) {
+          this.weatherSystem.updateVehicleLightReflection(
+            heroCar.x,
+            heroCar.z,
+            heroCar.heading,
+            true,
+          );
+        } else {
+          this.weatherSystem.updateVehicleLightReflection(0, 0, 0, false);
+        }
+        this.weatherSystem.setCarSpeedNorm(activeCar ? Math.abs(activeCar.speed) / 38 : 0);
+
+        if (
+          activeCar &&
+          this.phase === 'playing' &&
+          wetness > 0.28 &&
+          Math.abs(activeCar.speed) > 7.0 &&
+          this.frameCounter % 2 === 0
+        ) {
+          const sinH = Math.sin(activeCar.heading);
+          const cosH = Math.cos(activeCar.heading);
+          const rearX = activeCar.x - sinH * 1.65;
+          const rearZ = activeCar.z - cosH * 1.65;
+          const sideX = cosH * 0.88;
+          const sideZ = -sinH * 0.88;
+          const sprayVx = activeCar.vx * 0.25 - sinH * 2.8;
+          const sprayVz = activeCar.vz * 0.25 - cosH * 2.8;
+          const sprayInt = Math.min(1, Math.abs(activeCar.speed) / 28);
+          this.particleSystem.spawnBurst(rearX + sideX, 0.16, rearZ + sideZ, 1, 'spray', {
+            vx: sprayVx + cosH * 0.6,
+            vy: 0.4,
+            vz: sprayVz - sinH * 0.6,
+            intensity: sprayInt,
+          });
+          this.particleSystem.spawnBurst(rearX - sideX, 0.16, rearZ - sideZ, 1, 'spray', {
+            vx: sprayVx - cosH * 0.6,
+            vy: 0.4,
+            vz: sprayVz + sinH * 0.6,
+            intensity: sprayInt,
+          });
+        }
       } else {
-        const visualDt = this.renderContext.isSoftwareGl
-          ? Math.min(Math.max(rawDt, 0.001), 1.0)
-          : dt;
-        this.weatherSystem.update(
-          visualDt,
-          this.player.x,
-          this.player.z,
-          this.renderContext.renderer,
-          this.scene,
-          () => this.audio.playThunder(),
-        );
-        this.entityAnimator.sync({
-          dt: visualDt,
-          nowSec,
-          frameCounter: this.frameCounter,
-          phase: this.phase,
-          weather: this.weatherSystem.getWeather(),
-          timePreset: this.weatherSystem.getTimePreset(),
-          nightFactor: this.weatherSystem.getNightFactor(),
-          player: this.player,
-          playerRig: this.playerRig,
-          vehicles: this.vehicles,
-          vehicleRigs: this.vehicleRigs,
-          peds: this.peds,
-          pedRigs: this.pedRigs,
-          pedShadowActive: this.pedShadowActive,
-          birdFlock: this.worldVisuals.birdFlock,
-          dustMotes: this.worldVisuals.dustMotes,
-          shopMarkers: this.worldVisuals.shopMarkers,
-          checkpointGroup: this.worldVisuals.checkpointGroup,
-          checkpointRing: this.worldVisuals.checkpointRing,
-        });
+        this.weatherSystem.updateVehicleLightReflection(0, 0, 0, false);
+        this.weatherSystem.setCarSpeedNorm(0);
       }
 
-      this.cameraController.update({
-        dt,
+      const focusPos = robberySession ? getRobberyCjWorldTransform(robberySession) : this.player;
+      this.weatherSystem.update(
+        visualDt,
+        focusPos.x,
+        focusPos.z,
+        this.renderContext.renderer,
+        this.scene,
+        this.handleThunderStrike,
+        this.handleWeatherChanged,
+      );
+
+      const trans = this.player.vehicleTransition;
+      const simAlpha = this.renderContext.isSoftwareGl ? 1 : this.simClock.alpha;
+      const transitionProgressOverride =
+        trans.mode !== 'none' && !this.renderContext.isSoftwareGl
+          ? Math.min(
+              1,
+              trans.progress +
+                (this.simClock.alpha * this.simClock.fixedDt) / Math.max(0.1, trans.duration),
+            )
+          : undefined;
+
+      this.entityAnimator.sync({
+        dt: visualDt,
         nowSec,
+        frameCounter: this.frameCounter,
         phase: this.phase,
+        weather: this.weatherSystem.getWeather(),
+        nightFactor: this.weatherSystem.getNightFactor(),
+        player: this.player,
+        playerRig: this.playerRig,
+        vehicles: this.vehicles,
+        vehicleRigs: this.vehicleRigs,
+        peds: this.peds,
+        pedCrowd: this.pedCrowd,
+        birdFlock: this.worldVisuals.birdFlock,
+        dustMotes: this.worldVisuals.dustMotes,
+        shopMarkers: this.worldVisuals.shopMarkers,
+        shopVisuals: this.worldVisuals.shopVisuals,
+        robberySession,
+        shopCooldowns: this.shopCooldowns,
+        onDoorOpened: this.handleDoorOpenedBound,
+        checkpointGroup: this.worldVisuals.checkpointGroup,
+        checkpointRing: this.worldVisuals.checkpointRing,
+        transitionProgressOverride,
+        poseHistory: this.poseHistory,
+        simAlpha,
+      });
+
+      this.cameraController.update({
+        dt: visualDt,
+        nowSec,
         player: this.player,
         activeCar: this.getActivePlayerVehicle(),
+        transitionCar: this.getTransitionVehicle(),
         robberySession,
-        robberyStage: this.robberyStage,
+        spatialGrid: this.spatialGrid,
+        transitionProgressOverride,
+        poseHistory: this.poseHistory,
+        simAlpha,
       });
     }
 
@@ -1711,16 +2187,31 @@ export class SanAndreasEngine {
 
     this.hudEmitAccum += dt;
     const hudInterval = robberySession ? 0.033 : 0.1;
-    if (this.hudEmitAccum >= hudInterval) {
+    if (this.hudDirty || this.hudEmitAccum >= hudInterval) {
+      this.hudDirty = false;
       this.hudEmitAccum = 0;
       this.emitHud();
     }
 
     this.frameHandle = this.renderContext.scheduleNextFrame(
-      () => this.disposed,
+      this.isDisposedBound,
       this.tick,
     );
   };
+
+  private readonly handleThunderStrike = (): void => {
+    this.audio.playThunder();
+  };
+
+  private readonly handleWeatherChanged = (nextWeather: 'golden' | 'clear' | 'fog' | 'rain' | 'storm'): void => {
+    this.eventBus.emit('weather:changed', { weather: nextWeather });
+  };
+
+  private readonly handleDoorOpenedBound = (shopId: string): void => {
+    this.handleShopDoorOpened(shopId);
+  };
+
+  private readonly isDisposedBound = (): boolean => this.disposed;
 
   public dispose(): void {
     this.disposed = true;

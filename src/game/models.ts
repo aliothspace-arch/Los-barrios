@@ -17,16 +17,20 @@ import {
   warmMasterHypercarAssets,
   type HypercarArticulation,
 } from './rendering/hypercarBuilders';
+import { mergeGeometryEntries, type GeometryMergeEntry } from './rendering/geometryFusion';
 import {
   CUL_DE_SAC,
   INTERSECTION_CENTERS,
   PALM_POSITIONS,
   ROAD_SEGMENTS,
   SHADE_TREE_POSITIONS,
-  SHOPS,
   STREETLAMP_POSITIONS,
   WORLD_HALF_SIZE,
 } from './worldLayout';
+import {
+  buildShopWorldExtensions,
+  type ShopWorldVisuals,
+} from './world/shopWorldBuilder';
 
 export {
   applyTriCoatColor,
@@ -41,8 +45,17 @@ export type { CharacterRig, CharacterBuildOptions, HypercarArticulation };
 export interface VehicleRig {
   root: THREE.Group;
   bodyGroup: THREE.Group;
+  frunkBayGroup: THREE.Group;
+  wheelsGroup: THREE.Group;
+  lod1Group: THREE.Group;
+  lod1BodyGroup: THREE.Group;
+  lod1Wheels: THREE.Group[];
+  lod2Group: THREE.Group;
+  setLodMode: (useLod1: boolean) => void;
+  setLodLevel: (level: 0 | 1 | 2) => void;
   frontLeftPivot: THREE.Group;
   frontRightPivot: THREE.Group;
+  wheelCornerRoots: [THREE.Group, THREE.Group, THREE.Group, THREE.Group];
   wheels: THREE.Group[];
   headlightMat: THREE.MeshStandardMaterial;
   taillightMat: THREE.MeshStandardMaterial;
@@ -53,6 +66,7 @@ export interface VehicleRig {
   nitroFlameLeft: THREE.Mesh;
   nitroFlameRight: THREE.Mesh;
   hypercar: HypercarArticulation;
+  shadowCastMeshes: THREE.Mesh[];
 }
 
 export function buildVehicleRig(
@@ -106,6 +120,7 @@ export interface WorldVisuals {
   checkpointRing: THREE.Mesh;
   checkpointColumn: THREE.Mesh;
   shopMarkers: THREE.Group[];
+  shopVisuals: ShopWorldVisuals;
   birdFlock: {
     leftWings: THREE.InstancedMesh;
     rightWings: THREE.InstancedMesh;
@@ -197,17 +212,37 @@ export function buildLosSantosWorld(
   sidewalkBase.receiveShadow = true;
   worldGroup.add(sidewalkBase);
 
-  // 3. Paved Los Santos Avenues + Grove Street Cul-de-Sac + Weathered Zebra Crosswalks + 4-Way Traffic Light Gantries
+  // 3. Paved Los Santos Avenues (fused into 2 orientation batches: NS + EW -> 11 draw calls collapsed to 2!)
+  const roadEntriesNS: GeometryMergeEntry[] = [];
+  const roadEntriesEW: GeometryMergeEntry[] = [];
+  const roadTempGeos: THREE.BufferGeometry[] = [];
   for (let i = 0; i < ROAD_SEGMENTS.length; i++) {
     const r = ROAD_SEGMENTS[i];
     const geo = new THREE.PlaneGeometry(r.w, r.d);
     geo.rotateX(-Math.PI * 0.5);
-    const mat = r.orientation === 'ns' ? mats.roadNS : mats.roadEW;
-    const road = new THREE.Mesh(geo, mat);
-    road.position.set(r.x, r.orientation === 'ns' ? 0.02 : 0.035, r.z);
-    road.receiveShadow = true;
-    worldGroup.add(road);
+    roadTempGeos.push(geo);
+    const mat4 = new THREE.Matrix4().makeTranslation(
+      r.x,
+      r.orientation === 'ns' ? 0.02 : 0.035,
+      r.z,
+    );
+    if (r.orientation === 'ns') {
+      roadEntriesNS.push({ geo, matrix: mat4 });
+    } else {
+      roadEntriesEW.push({ geo, matrix: mat4 });
+    }
   }
+  if (roadEntriesNS.length > 0) {
+    const roadNS = new THREE.Mesh(mergeGeometryEntries(roadEntriesNS), mats.roadNS);
+    roadNS.receiveShadow = true;
+    worldGroup.add(roadNS);
+  }
+  if (roadEntriesEW.length > 0) {
+    const roadEW = new THREE.Mesh(mergeGeometryEntries(roadEntriesEW), mats.roadEW);
+    roadEW.receiveShadow = true;
+    worldGroup.add(roadEW);
+  }
+  for (const g of roadTempGeos) g.dispose();
 
   const culGeo = new THREE.CircleGeometry(CUL_DE_SAC.radius, 40);
   culGeo.rotateX(-Math.PI * 0.5);
@@ -339,8 +374,9 @@ export function buildLosSantosWorld(
   drainInst.computeBoundingSphere();
   worldGroup.add(curbInst, redCurbInst, drainInst);
 
-  // Pillar 6: Upgraded Authentic Los Angeles Traffic Light Gantries (Galvanized Mast, Yellow-Border Backplates,
-  // Hanging Green Street-Name Plaques, Pedestrian Signal Boxes & Sidewalk Controller Cabinets) + Zebra Crosswalks
+  // Pillar 6: Hyperrealistic Caltrans / LADOT Traffic Signal Gantries (Tapered Mast Pole, Bolted Elbow Saddle,
+  // Curved Parabolic Cantilever Arm, Dual 3-Aspect Signal Heads + Side-Mount Head, 3D Tunnel Visors, Louvered
+  // Retroreflective Yellow-Border Backplates, Illuminated Street-Name Blades, Pedestrian Countdown Signals & NEMA Cabinets)
   const cwGeo = new THREE.PlaneGeometry(12.2, 2.7);
   cwGeo.rotateX(-Math.PI * 0.5);
   const cwInst = new THREE.InstancedMesh(
@@ -351,65 +387,310 @@ export function buildLosSantosWorld(
   const cwDummy = new THREE.Object3D();
   let cwIdx = 0;
 
-  const tlPoleGeo = new THREE.CylinderGeometry(0.15, 0.22, 6.7, 10);
-  tlPoleGeo.translate(0, 3.35, 0);
-  const tlBaseGeo = new THREE.CylinderGeometry(0.32, 0.36, 0.42, 10);
-  tlBaseGeo.translate(0, 0.21, 0);
-  const tlArmGeo = new THREE.CylinderGeometry(0.09, 0.14, 5.2, 8);
-  tlArmGeo.rotateZ(Math.PI * 0.5);
-  tlArmGeo.translate(2.6, 6.3, 0);
-  const tlBackplateGeo = new THREE.BoxGeometry(0.68, 1.38, 0.12);
-  const tlBoxGeo = new THREE.BoxGeometry(0.46, 1.16, 0.38);
-  const tlStreetSignGeo = new THREE.BoxGeometry(1.85, 0.38, 0.08);
-  const tlCabinetGeo = new THREE.BoxGeometry(0.76, 1.35, 0.56);
-  tlCabinetGeo.translate(0, 0.68, 0);
+  // 1) Galvanized Steel Gantry Structure (fused into 1 InstancedMesh)
+  const tlPartsGalv: Array<{ geo: THREE.BufferGeometry }> = [];
+  const pushGalv = (geo: THREE.BufferGeometry): void => {
+    tlPartsGalv.push({ geo });
+  };
 
-  const tlBackplateMat = new THREE.MeshStandardMaterial({
-    color: 0x181a1d,
-    roughness: 0.6,
-    metalness: 0.3,
-  });
-  const tlStreetSignMat = new THREE.MeshStandardMaterial({
-    color: 0x165e3a,
-    emissive: new THREE.Color(0x1f7a4c),
-    emissiveIntensity: 0.45,
-    roughness: 0.35,
-  });
-  const tlGreenMat = new THREE.MeshStandardMaterial({
-    color: 0x35e06d,
-    emissive: new THREE.Color(0x2be066),
-    emissiveIntensity: 1.4,
-    roughness: 0.2,
-  });
-  const tlRedMat = new THREE.MeshStandardMaterial({
-    color: 0xf0382b,
-    emissive: new THREE.Color(0xff2a1e),
-    emissiveIntensity: 1.4,
-    roughness: 0.2,
-  });
+  // Vertical tapered pole + top finial dome + base flange plate + 6 anchor bolts + maintenance hatch
+  const tlMainMast = new THREE.CylinderGeometry(0.135, 0.21, 6.75, 14);
+  tlMainMast.translate(0, 3.375, 0);
+  pushGalv(tlMainMast);
+  const tlMastTopCap = new THREE.SphereGeometry(0.145, 10, 6, 0, Math.PI * 2, 0, Math.PI * 0.55);
+  tlMastTopCap.translate(0, 6.74, 0);
+  pushGalv(tlMastTopCap);
+  const tlFlangeRing = new THREE.CylinderGeometry(0.28, 0.30, 0.08, 12);
+  tlFlangeRing.translate(0, 0.44, 0);
+  pushGalv(tlFlangeRing);
+  for (let b = 0; b < 6; b++) {
+    const ang = (b / 6) * Math.PI * 2;
+    const bolt = new THREE.CylinderGeometry(0.024, 0.024, 0.09, 6);
+    bolt.translate(Math.cos(ang) * 0.24, 0.48, Math.sin(ang) * 0.24);
+    pushGalv(bolt);
+  }
+  const tlAccessDoor = new THREE.BoxGeometry(0.14, 0.46, 0.04);
+  tlAccessDoor.translate(0, 1.35, 0.195);
+  pushGalv(tlAccessDoor);
+
+  // Heavy gusseted mast-arm knuckle saddle at Y=5.85..6.35m
+  const tlSaddleCollar = new THREE.CylinderGeometry(0.185, 0.195, 0.52, 12);
+  tlSaddleCollar.translate(0, 6.08, 0);
+  pushGalv(tlSaddleCollar);
+  const tlSaddlePlate = new THREE.BoxGeometry(0.32, 0.54, 0.28);
+  tlSaddlePlate.translate(0.16, 6.08, 0);
+  pushGalv(tlSaddlePlate);
+  const tlUnderGusset = new THREE.BoxGeometry(0.65, 0.09, 0.14);
+  tlUnderGusset.rotateZ(0.46);
+  tlUnderGusset.translate(0.38, 5.84, 0);
+  pushGalv(tlUnderGusset);
+
+  // Graceful parabolic LADOT cantilever mast arm reaching X = 5.45m over traffic lanes
+  const tlArmCurve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(0.12, 6.05, 0),
+    new THREE.Vector3(1.55, 6.26, 0),
+    new THREE.Vector3(3.45, 6.38, 0),
+    new THREE.Vector3(5.45, 6.34, 0),
+  ]);
+  const tlArmTube = new THREE.TubeGeometry(tlArmCurve, 14, 0.095, 10, false);
+  pushGalv(tlArmTube);
+  const tlArmTipCap = new THREE.SphereGeometry(0.10, 8, 6);
+  tlArmTipCap.translate(5.45, 6.34, 0);
+  pushGalv(tlArmTipCap);
+
+  // Structural reinforcement tie-rod cable from upper mast peak (0.14, 6.66) to mid-arm (2.85, 6.36)
+  const tlTieCurve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(0.13, 6.66, 0),
+    new THREE.Vector3(2.85, 6.37, 0),
+  ]);
+  pushGalv(new THREE.TubeGeometry(tlTieCurve, 4, 0.022, 6, false));
+
+  // Street-name sign suspension clamps & drop hangers at X = 1.50m and X = 2.40m
+  for (const sx of [1.50, 2.40]) {
+    const clampRing = new THREE.CylinderGeometry(0.115, 0.115, 0.08, 10);
+    clampRing.rotateZ(Math.PI * 0.5);
+    clampRing.translate(sx, 6.30, 0);
+    pushGalv(clampRing);
+    const dropRod = new THREE.CylinderGeometry(0.022, 0.022, 0.24, 6);
+    dropRod.translate(sx, 6.16, 0);
+    pushGalv(dropRod);
+  }
+
+  // Dual overhead signal head drop-pipe elevator brackets at X = 3.55m and X = 5.20m
+  const headPositionsX = [3.55, 5.20];
+  const headCenterY = 5.66;
+  for (const hx of headPositionsX) {
+    const collar = new THREE.CylinderGeometry(0.115, 0.115, 0.12, 10);
+    collar.rotateZ(Math.PI * 0.5);
+    collar.translate(hx, 6.36, 0);
+    pushGalv(collar);
+    const dropPipe = new THREE.CylinderGeometry(0.036, 0.036, 0.42, 8);
+    dropPipe.translate(hx, 6.18, 0);
+    pushGalv(dropPipe);
+  }
+
+  // Side-mount secondary pole signal pipe brackets (upper & lower elbows on pole at X = -0.26m)
+  for (const by of [4.26, 3.10]) {
+    const sideArm = new THREE.CylinderGeometry(0.032, 0.032, 0.36, 8);
+    sideArm.rotateZ(Math.PI * 0.5);
+    sideArm.translate(-0.18, by, 0);
+    pushGalv(sideArm);
+  }
+
+  // Traffic optical enforcement camera & radar detector pod mounted at X = 2.75m
+  const camStem = new THREE.CylinderGeometry(0.024, 0.024, 0.34, 6);
+  camStem.translate(2.75, 6.54, 0);
+  pushGalv(camStem);
+  const camBody = new THREE.BoxGeometry(0.18, 0.14, 0.32);
+  camBody.rotateX(0.24);
+  camBody.translate(2.75, 6.72, 0.06);
+  pushGalv(camBody);
+
+  // Pedestrian push-button stations on vertical pole at Y = 1.15m
+  const pushBtnBox = new THREE.BoxGeometry(0.14, 0.24, 0.12);
+  pushBtnBox.translate(0, 1.18, 0.20);
+  pushGalv(pushBtnBox);
+
+  const tlPoleArmGeo = mergeGeometryEntries(tlPartsGalv);
+  for (const p of tlPartsGalv) p.geo.dispose();
+
+  // 2) Molded Concrete Pier Foundation Pedestal
+  const tlBaseLower = new THREE.CylinderGeometry(0.33, 0.37, 0.34, 12);
+  tlBaseLower.translate(0, 0.17, 0);
+  const tlBaseChamfer = new THREE.CylinderGeometry(0.27, 0.33, 0.10, 12);
+  tlBaseChamfer.translate(0, 0.39, 0);
+  const tlBaseGeo = mergeGeometryEntries([{ geo: tlBaseLower }, { geo: tlBaseChamfer }]);
+  tlBaseLower.dispose();
+  tlBaseChamfer.dispose();
+
+  // 3) Dual Overhead Louvered Backplates (with yellow safety border texture)
+  const tlBackplateParts: Array<{ geo: THREE.BufferGeometry }> = [];
+  for (const hx of headPositionsX) {
+    const bp = new THREE.BoxGeometry(0.76, 1.48, 0.048);
+    bp.translate(hx, headCenterY, -0.01);
+    tlBackplateParts.push({ geo: bp });
+  }
+  const tlBackplateGeo = mergeGeometryEntries(tlBackplateParts);
+  for (const p of tlBackplateParts) p.geo.dispose();
+
+  // 4) Polycarbonate Signal Housings + 3D Cutaway Tunnel Sun Visors + Pedestrian Walk/Don't-Walk Heads
+  const tlHousingParts: Array<{ geo: THREE.BufferGeometry }> = [];
+  const pushHousing = (geo: THREE.BufferGeometry): void => {
+    tlHousingParts.push({ geo });
+  };
+  const lensOffsetsY = [0.36, 0.0, -0.36]; // Red (top), Amber (mid), Green (bottom)
+
+  // Overhead 2x 3-aspect heads + side-mount pole 3-aspect head at (-0.28, 3.68, 0)
+  const allSignalHeads = [
+    { x: headPositionsX[0], y: headCenterY, scale: 1.0 },
+    { x: headPositionsX[1], y: headCenterY, scale: 1.0 },
+    { x: -0.28, y: 3.68, scale: 0.86 },
+  ];
+  for (const sh of allSignalHeads) {
+    const s = sh.scale;
+    // Vertical rear structural mounting spine
+    const spine = new THREE.BoxGeometry(0.14 * s, 1.18 * s, 0.36 * s);
+    spine.translate(sh.x, sh.y, 0.02 * s);
+    pushHousing(spine);
+
+    // 3 modular stacked die-cast signal sections with front bezel frames
+    for (const ly of lensOffsetsY) {
+      const cellY = sh.y + ly * s;
+      const cellBox = new THREE.BoxGeometry(0.42 * s, 0.34 * s, 0.32 * s);
+      cellBox.translate(sh.x, cellY, 0.04 * s);
+      pushHousing(cellBox);
+
+      // Front and rear 3D cutaway tunnel sun visors (top-arch hood shielding each lens along ±Z)
+      for (const zSign of [1, -1]) {
+        const visor = new THREE.CylinderGeometry(
+          0.146 * s,
+          0.156 * s,
+          0.26 * s,
+          12,
+          1,
+          true,
+          -Math.PI * 0.65,
+          Math.PI * 1.30,
+        );
+        // Rotate cylinder axis to Z, with arch crest at +Y (top of lens)
+        visor.rotateY(Math.PI * 0.5);
+        visor.rotateZ(Math.PI * 0.5);
+        visor.rotateX(Math.PI * 0.5);
+        visor.translate(sh.x, cellY + 0.015 * s, (0.04 + zSign * 0.27) * s);
+        pushHousing(visor);
+      }
+    }
+    // Top & bottom weatherproofing end caps
+    const topCap = new THREE.BoxGeometry(0.46 * s, 0.055 * s, 0.36 * s);
+    topCap.translate(sh.x, sh.y + 0.545 * s, 0.04 * s);
+    pushHousing(topCap);
+    const botCap = new THREE.BoxGeometry(0.46 * s, 0.055 * s, 0.36 * s);
+    botCap.translate(sh.x, sh.y - 0.545 * s, 0.04 * s);
+    pushHousing(botCap);
+  }
+
+  // Dual Pedestrian Countdown Signal Clamshell Boxes at Y = 2.55m on pole (facing both crosswalk axes)
+  const pedHeadA = new THREE.BoxGeometry(0.36, 0.48, 0.28);
+  pedHeadA.translate(0.24, 2.55, 0.14);
+  pushHousing(pedHeadA);
+  const pedVisorA = new THREE.BoxGeometry(0.38, 0.06, 0.16);
+  pedVisorA.translate(0.24, 2.77, 0.28);
+  pushHousing(pedVisorA);
+  const pedHeadB = new THREE.BoxGeometry(0.28, 0.48, 0.36);
+  pedHeadB.translate(-0.14, 2.55, 0.24);
+  pushHousing(pedHeadB);
+
+  const tlBoxGeo = mergeGeometryEntries(tlHousingParts);
+  for (const p of tlHousingParts) p.geo.dispose();
+
+  // 5) Illuminated Hanging Street-Name Sign Blade at X = 1.95m, Y = 5.98m
+  const tlStreetSignGeo = new THREE.BoxGeometry(1.92, 0.42, 0.075);
+  tlStreetSignGeo.translate(1.95, 5.98, 0);
+
+  // 6) Detailed Sidewalk NEMA Traffic Signal Controller Cabinet (sloped rain roof, louvers, door handle, concrete pad)
+  const cabPad = new THREE.BoxGeometry(0.92, 0.12, 0.68);
+  cabPad.translate(0, 0.06, 0);
+  const cabBody = new THREE.BoxGeometry(0.78, 1.32, 0.54);
+  cabBody.translate(0, 0.78, 0);
+  const cabRoof = new THREE.CylinderGeometry(0.40, 0.46, 0.12, 4);
+  cabRoof.rotateY(Math.PI * 0.25);
+  cabRoof.scale(1.25, 1.0, 0.88);
+  cabRoof.translate(0, 1.49, 0);
+  const cabDoorSeam = new THREE.BoxGeometry(0.66, 1.14, 0.565);
+  cabDoorSeam.translate(0, 0.78, 0);
+  const cabHandle = new THREE.BoxGeometry(0.05, 0.18, 0.61);
+  cabHandle.translate(0.24, 0.78, 0);
+  const tlCabinetGeo = mergeGeometryEntries([
+    { geo: cabPad },
+    { geo: cabBody },
+    { geo: cabRoof },
+    { geo: cabDoorSeam },
+    { geo: cabHandle },
+  ]);
+  cabPad.dispose();
+  cabBody.dispose();
+  cabRoof.dispose();
+  cabDoorSeam.dispose();
+  cabHandle.dispose();
+
+  // 7) 3-Aspect Signal Lenses (Front & Rear discs on all 3 signal heads + Pedestrian Countdown Symbol)
+  const buildSignalLensCluster = (offsetYRatio: number, includePedLens: boolean): THREE.BufferGeometry => {
+    const parts: Array<{ geo: THREE.BufferGeometry }> = [];
+    for (const sh of allSignalHeads) {
+      const s = sh.scale;
+      const ly = sh.y + offsetYRatio * s;
+      const discF = new THREE.CylinderGeometry(0.132 * s, 0.132 * s, 0.04 * s, 14);
+      discF.rotateX(Math.PI * 0.5);
+      discF.translate(sh.x, ly, 0.215 * s);
+      parts.push({ geo: discF });
+
+      const discB = new THREE.CylinderGeometry(0.132 * s, 0.132 * s, 0.04 * s, 14);
+      discB.rotateX(Math.PI * 0.5);
+      discB.translate(sh.x, ly, -0.115 * s);
+      parts.push({ geo: discB });
+    }
+    if (includePedLens) {
+      const pedLens = new THREE.BoxGeometry(0.26, 0.34, 0.03);
+      pedLens.translate(0.24, 2.55, 0.28);
+      parts.push({ geo: pedLens });
+    }
+    const merged = mergeGeometryEntries(parts);
+    for (const p of parts) p.geo.dispose();
+    return merged;
+  };
+
+  // Active Green / Active Red / Dark Standby Amber lens geometries in gantry-local space
+  const tlGreenActiveLensGeo = buildSignalLensCluster(-0.36, true);
+  const tlRedActiveLensGeo = buildSignalLensCluster(0.36, true);
+  const tlAmberStandbyGeo = buildSignalLensCluster(0.0, false);
+  const tlTopDarkGeo = buildSignalLensCluster(0.36, false);
+  const tlBotDarkGeo = buildSignalLensCluster(-0.36, false);
+  const tlAmberForGreenGantryGeo = mergeGeometryEntries([
+    { geo: tlAmberStandbyGeo },
+    { geo: tlTopDarkGeo },
+  ]);
+  const tlAmberForRedGantryGeo = mergeGeometryEntries([
+    { geo: tlAmberStandbyGeo },
+    { geo: tlBotDarkGeo },
+  ]);
+  tlAmberStandbyGeo.dispose();
+  tlTopDarkGeo.dispose();
+  tlBotDarkGeo.dispose();
 
   const tlCount = INTERSECTION_CENTERS.length * 2;
-  const tlPoleInst = new THREE.InstancedMesh(tlPoleGeo, mats.brushedMetal, tlCount);
+  const tlPoleInst = new THREE.InstancedMesh(tlPoleArmGeo, mats.brushedMetal, tlCount);
   const tlBaseInst = new THREE.InstancedMesh(tlBaseGeo, mats.curbConcrete, tlCount);
-  const tlArmInst = new THREE.InstancedMesh(tlArmGeo, mats.brushedMetal, tlCount);
-  const tlBackplateInst = new THREE.InstancedMesh(tlBackplateGeo, tlBackplateMat, tlCount);
-  const tlBoxInst = new THREE.InstancedMesh(tlBoxGeo, mats.darkChrome, tlCount);
-  const tlSignInst = new THREE.InstancedMesh(tlStreetSignGeo, tlStreetSignMat, tlCount);
+  const tlBackplateInst = new THREE.InstancedMesh(tlBackplateGeo, mats.trafficBackplateMat, tlCount);
+  const tlBoxInst = new THREE.InstancedMesh(tlBoxGeo, mats.trafficHousingMat, tlCount);
+  const tlSignInst = new THREE.InstancedMesh(tlStreetSignGeo, mats.trafficStreetSignMat, tlCount);
   const tlCabinetInst = new THREE.InstancedMesh(
     tlCabinetGeo,
     mats.brushedMetal,
     INTERSECTION_CENTERS.length,
   );
   const tlBulbGreenInst = new THREE.InstancedMesh(
-    new THREE.SphereGeometry(0.12, 8, 8),
-    tlGreenMat,
+    tlGreenActiveLensGeo,
+    mats.trafficLensGreenMat,
     INTERSECTION_CENTERS.length,
   );
   const tlBulbRedInst = new THREE.InstancedMesh(
-    new THREE.SphereGeometry(0.12, 8, 8),
-    tlRedMat,
+    tlRedActiveLensGeo,
+    mats.trafficLensRedMat,
     INTERSECTION_CENTERS.length,
   );
+  const tlBulbOffGreenGantryInst = new THREE.InstancedMesh(
+    tlAmberForGreenGantryGeo,
+    mats.trafficLensAmberOffMat,
+    INTERSECTION_CENTERS.length,
+  );
+  const tlBulbOffRedGantryInst = new THREE.InstancedMesh(
+    tlAmberForRedGantryGeo,
+    mats.trafficLensAmberOffMat,
+    INTERSECTION_CENTERS.length,
+  );
+  tlPoleInst.castShadow = true;
+  tlBoxInst.castShadow = true;
+  tlCabinetInst.castShadow = true;
 
   for (let i = 0; i < INTERSECTION_CENTERS.length; i++) {
     const ic = INTERSECTION_CENTERS[i];
@@ -428,7 +709,7 @@ export function buildLosSantosWorld(
       cwInst.setMatrixAt(cwIdx++, cwDummy.matrix);
     }
 
-    // 2 Diagonal Sidewalk-Corner Traffic Light Gantries (placed at ±8.6m, well outside ±7m road lanes!)
+    // 2 Diagonal Sidewalk-Corner Traffic Light Gantries (placed at ±8.6m, clear of ±7m road lanes)
     const corners = [
       { x: ic.x - 8.6, z: ic.z - 8.6, rot: 0, isGreen: true },
       { x: ic.x + 8.6, z: ic.z + 8.6, rot: Math.PI, isGreen: false },
@@ -440,75 +721,58 @@ export function buildLosSantosWorld(
       cwDummy.rotation.set(0, cn.rot, 0);
       cwDummy.scale.set(1, 1, 1);
       cwDummy.updateMatrix();
+
       tlPoleInst.setMatrixAt(idx, cwDummy.matrix);
       tlBaseInst.setMatrixAt(idx, cwDummy.matrix);
-      tlArmInst.setMatrixAt(idx, cwDummy.matrix);
+      tlBackplateInst.setMatrixAt(idx, cwDummy.matrix);
+      tlBoxInst.setMatrixAt(idx, cwDummy.matrix);
+      tlSignInst.setMatrixAt(idx, cwDummy.matrix);
 
-      // Galvanized Traffic Signal Controller Cabinet tucked behind corner pole
+      if (cn.isGreen) {
+        tlBulbGreenInst.setMatrixAt(i, cwDummy.matrix);
+        tlBulbOffGreenGantryInst.setMatrixAt(i, cwDummy.matrix);
+      } else {
+        tlBulbRedInst.setMatrixAt(i, cwDummy.matrix);
+        tlBulbOffRedGantryInst.setMatrixAt(i, cwDummy.matrix);
+      }
+
+      // Galvanized Traffic Signal NEMA Controller Cabinet tucked behind corner pole
       if (c === 0) {
         cwDummy.position.set(cn.x - 1.15, 0, cn.z - 0.85);
         cwDummy.rotation.set(0, 0, 0);
         cwDummy.updateMatrix();
         tlCabinetInst.setMatrixAt(i, cwDummy.matrix);
       }
-
-      // Hanging green LA street-name sign midway along mast arm
-      const sx = cn.x + Math.cos(cn.rot) * 1.95;
-      const sz = cn.z - Math.sin(cn.rot) * 1.95;
-      cwDummy.position.set(sx, 6.08, sz);
-      cwDummy.rotation.set(0, cn.rot, 0);
-      cwDummy.updateMatrix();
-      tlSignInst.setMatrixAt(idx, cwDummy.matrix);
-
-      // Signal housing + dark contrast backplate
-      const bx = cn.x + Math.cos(cn.rot) * 4.1;
-      const bz = cn.z - Math.sin(cn.rot) * 4.1;
-      cwDummy.position.set(bx, 5.82, bz);
-      cwDummy.rotation.set(0, cn.rot, 0);
-      cwDummy.updateMatrix();
-      tlBoxInst.setMatrixAt(idx, cwDummy.matrix);
-      tlBackplateInst.setMatrixAt(idx, cwDummy.matrix);
-
-      cwDummy.position.set(bx, cn.isGreen ? 5.48 : 6.14, bz + (cn.isGreen ? 0.21 : -0.21));
-      cwDummy.updateMatrix();
-      if (cn.isGreen) {
-        tlBulbGreenInst.setMatrixAt(i, cwDummy.matrix);
-      } else {
-        tlBulbRedInst.setMatrixAt(i, cwDummy.matrix);
-      }
     }
   }
-  cwInst.instanceMatrix.needsUpdate = true;
-  cwInst.computeBoundingSphere();
-  tlPoleInst.instanceMatrix.needsUpdate = true;
-  tlPoleInst.computeBoundingSphere();
-  tlBaseInst.instanceMatrix.needsUpdate = true;
-  tlBaseInst.computeBoundingSphere();
-  tlArmInst.instanceMatrix.needsUpdate = true;
-  tlArmInst.computeBoundingSphere();
-  tlBackplateInst.instanceMatrix.needsUpdate = true;
-  tlBackplateInst.computeBoundingSphere();
-  tlBoxInst.instanceMatrix.needsUpdate = true;
-  tlBoxInst.computeBoundingSphere();
-  tlSignInst.instanceMatrix.needsUpdate = true;
-  tlSignInst.computeBoundingSphere();
-  tlCabinetInst.instanceMatrix.needsUpdate = true;
-  tlCabinetInst.computeBoundingSphere();
-  tlBulbGreenInst.instanceMatrix.needsUpdate = true;
-  tlBulbGreenInst.computeBoundingSphere();
-  tlBulbRedInst.instanceMatrix.needsUpdate = true;
-  tlBulbRedInst.computeBoundingSphere();
-  worldGroup.add(
+  for (const inst of [
     cwInst,
     tlPoleInst,
     tlBaseInst,
-    tlArmInst,
     tlBackplateInst,
     tlBoxInst,
     tlSignInst,
     tlCabinetInst,
     tlBulbGreenInst,
     tlBulbRedInst,
+    tlBulbOffGreenGantryInst,
+    tlBulbOffRedGantryInst,
+  ]) {
+    inst.instanceMatrix.needsUpdate = true;
+    inst.computeBoundingSphere();
+  }
+  worldGroup.add(
+    cwInst,
+    tlPoleInst,
+    tlBaseInst,
+    tlBackplateInst,
+    tlBoxInst,
+    tlSignInst,
+    tlCabinetInst,
+    tlBulbGreenInst,
+    tlBulbRedInst,
+    tlBulbOffGreenGantryInst,
+    tlBulbOffRedGantryInst,
   );
 
   // 4. All 52 Hyperrealistic Los Santos Buildings across 19+ Distinct Procedural Architectural Archetypes
@@ -698,47 +962,33 @@ export function buildLosSantosWorld(
 
   const trunkGeoA = buildSculptedPalmTrunkGeometry(trunkCurveA, 40, 14);
   const trunkGeoB = buildSculptedPalmTrunkGeometry(trunkCurveB, 40, 14);
-  const countA = Math.ceil(palmCount / 2);
-  const countB = palmCount - countA;
-
-  const trunkInstA = new THREE.InstancedMesh(trunkGeoA, mats.palmBark, countA);
-  trunkInstA.castShadow = true;
-  trunkInstA.receiveShadow = true;
-  const trunkInstB = new THREE.InstancedMesh(trunkGeoB, mats.palmBark, countB);
-  trunkInstB.castShadow = true;
-  trunkInstB.receiveShadow = true;
-
-  // Grounded dark planter soil/mulch collar anchoring every flared root base cleanly to the sidewalk/grass
   const rootSoilGeo = new THREE.CylinderGeometry(0.46, 0.64, 0.08, 12);
   rootSoilGeo.translate(0, 0.04, 0);
-  const rootSoilInst = new THREE.InstancedMesh(rootSoilGeo, mats.palmSoilMat, palmCount);
-  rootSoilInst.receiveShadow = true;
-
   const deadSkirtPerPalm = 9;
   const deadSkirtGeo = buildDeadSkirtFrondGeometry();
-  const deadSkirtInst = new THREE.InstancedMesh(
-    deadSkirtGeo,
-    mats.palmDeadFrond,
-    palmCount * deadSkirtPerPalm,
-  );
-  deadSkirtInst.castShadow = true;
-
   const dateClustersPerPalm = 3;
   const dateGeo = buildDateClusterGeometry();
-  const dateInst = new THREE.InstancedMesh(
-    dateGeo,
-    mats.palmDateMat,
-    palmCount * dateClustersPerPalm,
-  );
-
   const frondsPerPalm = 22;
   const frondGeo = buildSculptedPalmFrondGeometry();
-  const frondInst = new THREE.InstancedMesh(
-    frondGeo,
-    mats.palmFrond,
-    palmCount * frondsPerPalm,
-  );
-  frondInst.castShadow = true;
+
+  // Compute balanced city centroid to partition palms into 4 spatial quadrants (NW, NE, SW, SE).
+  // Tight per-quadrant bounding spheres allow Three.js to frustum-cull ~65-75% of all 330K palm
+  // triangles outside the camera and sun shadow frustums with 100% identical botanical geometry.
+  let sumPalmX = 0;
+  let sumPalmZ = 0;
+  for (let i = 0; i < palmCount; i++) {
+    sumPalmX += PALM_POSITIONS[i].x;
+    sumPalmZ += PALM_POSITIONS[i].z;
+  }
+  const splitX = palmCount > 0 ? sumPalmX / palmCount : 0;
+  const splitZ = palmCount > 0 ? sumPalmZ / palmCount : 0;
+
+  const quadrants: number[][] = [[], [], [], []];
+  for (let i = 0; i < palmCount; i++) {
+    const p = PALM_POSITIONS[i];
+    const qIdx = (p.x >= splitX ? 1 : 0) + (p.z >= splitZ ? 2 : 0);
+    quadrants[qIdx].push(i);
+  }
 
   const dummy = new THREE.Object3D();
   const tint = new THREE.Color();
@@ -747,160 +997,204 @@ export function buildLosSantosWorld(
   const topLocalB = trunkCurveB.getPointAt(0.985);
   const crownPos = new THREE.Vector3();
 
-  let idxA = 0;
-  let idxB = 0;
-  let deadIdx = 0;
-  let dateIdx = 0;
-  let frondIdx = 0;
+  for (let q = 0; q < quadrants.length; q++) {
+    const indices = quadrants[q];
+    const qCount = indices.length;
+    if (qCount === 0) continue;
 
-  for (let i = 0; i < palmCount; i++) {
-    const p = PALM_POSITIONS[i];
-    const isB = i % 2 === 1;
-    const scale = 0.86 + ((i * 37) % 100) * 0.0032;
-    const girthScale = scale * (0.94 + ((i * 19) % 13) * 0.01);
-    const rotY = (i * 2.399963) % (Math.PI * 2);
-
-    dummy.position.set(p.x, 0, p.z);
-    dummy.rotation.set(0, rotY, 0);
-    dummy.scale.set(girthScale, scale, girthScale);
-    dummy.updateMatrix();
-    if (isB) {
-      trunkInstB.setMatrixAt(idxB++, dummy.matrix);
-    } else {
-      trunkInstA.setMatrixAt(idxA++, dummy.matrix);
+    let qCountA = 0;
+    let qCountB = 0;
+    for (let k = 0; k < qCount; k++) {
+      if (indices[k] % 2 === 1) qCountB++;
+      else qCountA++;
     }
 
-    // Grounded root-soil collar
-    dummy.position.set(p.x, 0, p.z);
-    dummy.rotation.set(0, rotY, 0);
-    dummy.scale.set(girthScale, 1, girthScale);
-    dummy.updateMatrix();
-    rootSoilInst.setMatrixAt(i, dummy.matrix);
+    const trunkInstA =
+      qCountA > 0 ? new THREE.InstancedMesh(trunkGeoA, mats.palmBark, qCountA) : null;
+    if (trunkInstA) {
+      trunkInstA.castShadow = true;
+      trunkInstA.receiveShadow = true;
+    }
+    const trunkInstB =
+      qCountB > 0 ? new THREE.InstancedMesh(trunkGeoB, mats.palmBark, qCountB) : null;
+    if (trunkInstB) {
+      trunkInstB.castShadow = true;
+      trunkInstB.receiveShadow = true;
+    }
 
-    // Exact world-space crown heart position matching the curved trunk tip
-    crownPos.copy(isB ? topLocalB : topLocalA);
-    crownPos.set(crownPos.x * girthScale, crownPos.y * scale, crownPos.z * girthScale);
-    crownPos.applyAxisAngle(upAxis, rotY);
-    const cx = p.x + crownPos.x;
-    const cy = crownPos.y;
-    const cz = p.z + crownPos.z;
+    const rootSoilInst = new THREE.InstancedMesh(rootSoilGeo, mats.palmSoilMat, qCount);
+    rootSoilInst.receiveShadow = true;
 
-    // Shaggy Layered Dried-Frond Petticoat Skirt (9 organic drooping ragged dried fronds per palm)
-    for (let d = 0; d < deadSkirtPerPalm; d++) {
-      const da = rotY + (d / deadSkirtPerPalm) * Math.PI * 2 + ((i + d) % 3) * 0.14;
-      const dScaleY = scale * (0.82 + ((i * 7 + d * 13) % 10) * 0.042);
-      const dScaleX = scale * (0.86 + (d % 3) * 0.12);
-      const flarePitch = -0.06 - (d % 3) * 0.09;
-      dummy.position.set(cx, cy - 0.14 * scale - (d % 2) * 0.18 * scale, cz);
-      dummy.rotation.set(flarePitch, da, ((d % 3) - 1) * 0.08);
-      dummy.scale.set(dScaleX, dScaleY, dScaleX);
+    const deadSkirtInst = new THREE.InstancedMesh(
+      deadSkirtGeo,
+      mats.palmDeadFrond,
+      qCount * deadSkirtPerPalm,
+    );
+    deadSkirtInst.castShadow = false;
+
+    const dateInst = new THREE.InstancedMesh(
+      dateGeo,
+      mats.palmDateMat,
+      qCount * dateClustersPerPalm,
+    );
+
+    const frondInst = new THREE.InstancedMesh(
+      frondGeo,
+      mats.palmFrond,
+      qCount * frondsPerPalm,
+    );
+    frondInst.castShadow = true;
+
+    let idxA = 0;
+    let idxB = 0;
+    let deadIdx = 0;
+    let dateIdx = 0;
+    let frondIdx = 0;
+
+    for (let k = 0; k < qCount; k++) {
+      const i = indices[k];
+      const p = PALM_POSITIONS[i];
+      const isB = i % 2 === 1;
+      const scale = 0.86 + ((i * 37) % 100) * 0.0032;
+      const girthScale = scale * (0.94 + ((i * 19) % 13) * 0.01);
+      const rotY = (i * 2.399963) % (Math.PI * 2);
+
+      dummy.position.set(p.x, 0, p.z);
+      dummy.rotation.set(0, rotY, 0);
+      dummy.scale.set(girthScale, scale, girthScale);
       dummy.updateMatrix();
-      deadSkirtInst.setMatrixAt(deadIdx, dummy.matrix);
-      tint.setHSL(
-        0.09 + ((i + d) % 4) * 0.01,
-        0.34 + (d % 2) * 0.08,
-        0.42 + ((i + d) % 3) * 0.065,
-      );
-      deadSkirtInst.setColorAt(deadIdx, tint);
-      deadIdx++;
-    }
-
-    // Hanging Golden Date Panicles tucked below the lower green petioles
-    for (let dc = 0; dc < dateClustersPerPalm; dc++) {
-      const dca = rotY + (dc / dateClustersPerPalm) * Math.PI * 2 + 0.5;
-      dummy.position.set(cx, cy - 0.18 * scale, cz);
-      dummy.rotation.set(0.28, dca, 0);
-      dummy.scale.setScalar(scale * (0.85 + (dc % 2) * 0.2));
-      dummy.updateMatrix();
-      dateInst.setMatrixAt(dateIdx++, dummy.matrix);
-    }
-
-    // 22 Lush 3D Sculpted Fronds arranged in 4 Botanical Phyllotactic Fibonacci Tiers
-    for (let f = 0; f < frondsPerPalm; f++) {
-      let tier: number;
-      let pitch: number;
-      let fScale: number;
-      let yOff: number;
-      let hue: number;
-      let sat: number;
-      let light: number;
-
-      if (f < 4) {
-        // Tier 0: 4 Young Central Erect Spear Fronds (bright fresh chartreuse-emerald)
-        tier = 0;
-        pitch = -0.94 + (f / 4) * 0.28;
-        fScale = scale * (0.68 + (f % 2) * 0.09);
-        yOff = 0.28 * scale;
-        hue = 0.235 + ((i + f) % 3) * 0.012;
-        sat = 0.44;
-        light = 0.46 + (f % 2) * 0.04;
-      } else if (f < 10) {
-        // Tier 1: 6 Upper Crown Sweeping Fronds (rich sunlit California green)
-        tier = 1;
-        pitch = -0.46 + ((f - 4) / 6) * 0.26;
-        fScale = scale * (0.88 + (f % 3) * 0.06);
-        yOff = 0.14 * scale;
-        hue = 0.255 + ((i + f) % 4) * 0.011;
-        sat = 0.38;
-        light = 0.40 + (f % 3) * 0.035;
-      } else if (f < 17) {
-        // Tier 2: 7 Full Mid Canopy Arching Fronds (broad iconic Los Santos silhouette)
-        tier = 2;
-        pitch = -0.06 + ((f - 10) / 7) * 0.24;
-        fScale = scale * (1.02 + (f % 3) * 0.065);
-        yOff = 0.0;
-        hue = 0.265 + ((i + f) % 5) * 0.01;
-        sat = 0.34;
-        light = 0.35 + (f % 3) * 0.03;
-      } else {
-        // Tier 3: 5 Mature Lower Weeping Outer Fronds (sun-kissed warm olive-emerald)
-        tier = 3;
-        pitch = 0.26 + ((f - 17) / 5) * 0.26;
-        fScale = scale * (0.96 + (f % 2) * 0.09);
-        yOff = -0.14 * scale;
-        hue = 0.215 + ((i + f) % 4) * 0.012;
-        sat = 0.32;
-        light = 0.33 + (f % 3) * 0.03;
+      if (isB && trunkInstB) {
+        trunkInstB.setMatrixAt(idxB++, dummy.matrix);
+      } else if (trunkInstA) {
+        trunkInstA.setMatrixAt(idxA++, dummy.matrix);
       }
 
-      // True Fibonacci golden-angle phyllotaxis so fronds fan naturally in 3D with zero artificial symmetry
-      const fa = rotY + f * 2.399963 + tier * 0.22;
-      const roll = (((i * 13 + f * 7) % 11) - 5) * 0.032;
-
-      dummy.position.set(cx, cy + yOff, cz);
-      dummy.rotation.set(pitch, fa, roll);
-      dummy.scale.set(fScale, fScale, fScale);
+      // Grounded root-soil collar
+      dummy.position.set(p.x, 0, p.z);
+      dummy.rotation.set(0, rotY, 0);
+      dummy.scale.set(girthScale, 1, girthScale);
       dummy.updateMatrix();
-      frondInst.setMatrixAt(frondIdx, dummy.matrix);
-      tint.setHSL(hue, sat, light);
-      frondInst.setColorAt(frondIdx, tint);
-      frondIdx++;
+      rootSoilInst.setMatrixAt(k, dummy.matrix);
+
+      // Exact world-space crown heart position matching the curved trunk tip
+      crownPos.copy(isB ? topLocalB : topLocalA);
+      crownPos.set(crownPos.x * girthScale, crownPos.y * scale, crownPos.z * girthScale);
+      crownPos.applyAxisAngle(upAxis, rotY);
+      const cx = p.x + crownPos.x;
+      const cy = crownPos.y;
+      const cz = p.z + crownPos.z;
+
+      // Shaggy Layered Dried-Frond Petticoat Skirt (9 organic drooping ragged dried fronds per palm)
+      for (let d = 0; d < deadSkirtPerPalm; d++) {
+        const da = rotY + (d / deadSkirtPerPalm) * Math.PI * 2 + ((i + d) % 3) * 0.14;
+        const dScaleY = scale * (0.82 + ((i * 7 + d * 13) % 10) * 0.042);
+        const dScaleX = scale * (0.86 + (d % 3) * 0.12);
+        const flarePitch = -0.06 - (d % 3) * 0.09;
+        dummy.position.set(cx, cy - 0.14 * scale - (d % 2) * 0.18 * scale, cz);
+        dummy.rotation.set(flarePitch, da, ((d % 3) - 1) * 0.08);
+        dummy.scale.set(dScaleX, dScaleY, dScaleX);
+        dummy.updateMatrix();
+        deadSkirtInst.setMatrixAt(deadIdx, dummy.matrix);
+        tint.setHSL(
+          0.09 + ((i + d) % 4) * 0.01,
+          0.34 + (d % 2) * 0.08,
+          0.42 + ((i + d) % 3) * 0.065,
+        );
+        deadSkirtInst.setColorAt(deadIdx, tint);
+        deadIdx++;
+      }
+
+      // Hanging Golden Date Panicles tucked below the lower green petioles
+      for (let dc = 0; dc < dateClustersPerPalm; dc++) {
+        const dca = rotY + (dc / dateClustersPerPalm) * Math.PI * 2 + 0.5;
+        dummy.position.set(cx, cy - 0.18 * scale, cz);
+        dummy.rotation.set(0.28, dca, 0);
+        dummy.scale.setScalar(scale * (0.85 + (dc % 2) * 0.2));
+        dummy.updateMatrix();
+        dateInst.setMatrixAt(dateIdx++, dummy.matrix);
+      }
+
+      // 22 Lush 3D Sculpted Fronds arranged in 4 Botanical Phyllotactic Fibonacci Tiers
+      for (let f = 0; f < frondsPerPalm; f++) {
+        let tier: number;
+        let pitch: number;
+        let fScale: number;
+        let yOff: number;
+        let hue: number;
+        let sat: number;
+        let light: number;
+
+        if (f < 4) {
+          tier = 0;
+          pitch = -0.94 + (f / 4) * 0.28;
+          fScale = scale * (0.68 + (f % 2) * 0.09);
+          yOff = 0.28 * scale;
+          hue = 0.235 + ((i + f) % 3) * 0.012;
+          sat = 0.44;
+          light = 0.46 + (f % 2) * 0.04;
+        } else if (f < 10) {
+          tier = 1;
+          pitch = -0.46 + ((f - 4) / 6) * 0.26;
+          fScale = scale * (0.88 + (f % 3) * 0.06);
+          yOff = 0.14 * scale;
+          hue = 0.255 + ((i + f) % 4) * 0.011;
+          sat = 0.38;
+          light = 0.40 + (f % 3) * 0.035;
+        } else if (f < 17) {
+          tier = 2;
+          pitch = -0.06 + ((f - 10) / 7) * 0.24;
+          fScale = scale * (1.02 + (f % 3) * 0.065);
+          yOff = 0.0;
+          hue = 0.265 + ((i + f) % 5) * 0.01;
+          sat = 0.34;
+          light = 0.35 + (f % 3) * 0.03;
+        } else {
+          tier = 3;
+          pitch = 0.26 + ((f - 17) / 5) * 0.26;
+          fScale = scale * (0.96 + (f % 2) * 0.09);
+          yOff = -0.14 * scale;
+          hue = 0.215 + ((i + f) % 4) * 0.012;
+          sat = 0.32;
+          light = 0.33 + (f % 3) * 0.03;
+        }
+
+        const fa = rotY + f * 2.399963 + tier * 0.22;
+        const roll = (((i * 13 + f * 7) % 11) - 5) * 0.032;
+
+        dummy.position.set(cx, cy + yOff, cz);
+        dummy.rotation.set(pitch, fa, roll);
+        dummy.scale.set(fScale, fScale, fScale);
+        dummy.updateMatrix();
+        frondInst.setMatrixAt(frondIdx, dummy.matrix);
+        tint.setHSL(hue, sat, light);
+        frondInst.setColorAt(frondIdx, tint);
+        frondIdx++;
+      }
     }
+
+    if (trunkInstA) {
+      trunkInstA.instanceMatrix.needsUpdate = true;
+      trunkInstA.computeBoundingSphere();
+      worldGroup.add(trunkInstA);
+    }
+    if (trunkInstB) {
+      trunkInstB.instanceMatrix.needsUpdate = true;
+      trunkInstB.computeBoundingSphere();
+      worldGroup.add(trunkInstB);
+    }
+    rootSoilInst.instanceMatrix.needsUpdate = true;
+    rootSoilInst.computeBoundingSphere();
+    deadSkirtInst.instanceMatrix.needsUpdate = true;
+    if (deadSkirtInst.instanceColor) deadSkirtInst.instanceColor.needsUpdate = true;
+    deadSkirtInst.computeBoundingSphere();
+    dateInst.instanceMatrix.needsUpdate = true;
+    dateInst.computeBoundingSphere();
+    frondInst.instanceMatrix.needsUpdate = true;
+    if (frondInst.instanceColor) frondInst.instanceColor.needsUpdate = true;
+    frondInst.computeBoundingSphere();
+
+    worldGroup.add(rootSoilInst, deadSkirtInst, dateInst, frondInst);
   }
-
-  trunkInstA.instanceMatrix.needsUpdate = true;
-  trunkInstA.computeBoundingSphere();
-  trunkInstB.instanceMatrix.needsUpdate = true;
-  trunkInstB.computeBoundingSphere();
-  rootSoilInst.instanceMatrix.needsUpdate = true;
-  rootSoilInst.computeBoundingSphere();
-  deadSkirtInst.instanceMatrix.needsUpdate = true;
-  if (deadSkirtInst.instanceColor) deadSkirtInst.instanceColor.needsUpdate = true;
-  deadSkirtInst.computeBoundingSphere();
-  dateInst.instanceMatrix.needsUpdate = true;
-  dateInst.computeBoundingSphere();
-  frondInst.instanceMatrix.needsUpdate = true;
-  if (frondInst.instanceColor) frondInst.instanceColor.needsUpdate = true;
-  frondInst.computeBoundingSphere();
-
-  worldGroup.add(
-    trunkInstA,
-    trunkInstB,
-    rootSoilInst,
-    deadSkirtInst,
-    dateInst,
-    frondInst,
-  );
 
   // 6. Lush Branching California Shade & Jacaranda Street Trees (Instanced Multi-Card Botanical Foliage Canopies)
   // Batches 420 individual tree meshes into 4 high-speed InstancedMeshes with 100% identical geometry & transforms!
@@ -983,17 +1277,144 @@ export function buildLosSantosWorld(
   shadeLeafJacarandaInst.computeBoundingSphere();
   worldGroup.add(shadeTrunkInst, shadeBranchInst, shadeLeafGreenInst, shadeLeafJacarandaInst);
 
-  // 7. Instanced Los Santos Gooseneck Streetlamps + Urban Street Props (Fire Hydrants & Benches)
+  // 7. Hyperrealistic LADWP / California Cobra-Head Gooseneck Streetlamps (Octagonal Flanged Base,
+  //    Anchor Bolts, Tapered Mast, Gusseted Under-Brace Strut, Die-Cast Finned Cobra-Head Luminaire,
+  //    Top NEMA Twist-Lock Photocell Sensor & Prismatic Multi-Cell LED Refractor Lens) + Fire Hydrants
   const lampCount = STREETLAMP_POSITIONS.length;
-  const lampCurve = new THREE.CatmullRomCurve3([
-    new THREE.Vector3(0, 0, 0),
-    new THREE.Vector3(0, 6.2, 0),
-    new THREE.Vector3(0, 7.6, 0.9),
-    new THREE.Vector3(0, 7.4, 2.3),
+
+  // A) Brushed Galvanized Mast, Fluted Pedestal Base, Anchor Bolts & Cantilever Arm
+  const lampPoleParts: Array<{ geo: THREE.BufferGeometry }> = [];
+  const pushLampPole = (geo: THREE.BufferGeometry): void => {
+    lampPoleParts.push({ geo });
+  };
+
+  // Octagonal concrete/steel foundation plinth + anchor bolt flange + 4 anchor nuts
+  const lampBasePlinth = new THREE.CylinderGeometry(0.24, 0.29, 0.34, 8);
+  lampBasePlinth.translate(0, 0.17, 0);
+  pushLampPole(lampBasePlinth);
+  const lampFlangePlate = new THREE.CylinderGeometry(0.22, 0.24, 0.06, 8);
+  lampFlangePlate.translate(0, 0.37, 0);
+  pushLampPole(lampFlangePlate);
+  for (let b = 0; b < 4; b++) {
+    const ang = (b + 0.5) * Math.PI * 0.5;
+    const nut = new THREE.CylinderGeometry(0.024, 0.024, 0.07, 6);
+    nut.translate(Math.cos(ang) * 0.175, 0.41, Math.sin(ang) * 0.175);
+    pushLampPole(nut);
+  }
+
+  // Sculpted decorative cast transition skirt (0.38m -> 1.15m) + electrical service access hatch
+  const lampSkirt = new THREE.CylinderGeometry(0.115, 0.195, 0.78, 10);
+  lampSkirt.translate(0, 0.77, 0);
+  pushLampPole(lampSkirt);
+  const lampNeckCollar = new THREE.CylinderGeometry(0.135, 0.135, 0.09, 10);
+  lampNeckCollar.translate(0, 1.16, 0);
+  pushLampPole(lampNeckCollar);
+  const lampAccessDoor = new THREE.BoxGeometry(0.10, 0.34, 0.035);
+  lampAccessDoor.translate(0, 0.78, -0.155);
+  pushLampPole(lampAccessDoor);
+
+  // Tapered vertical steel column up to Y = 6.55m + top pole finial cap
+  const lampShaft = new THREE.CylinderGeometry(0.076, 0.112, 5.42, 12);
+  lampShaft.translate(0, 3.86, 0);
+  pushLampPole(lampShaft);
+  const lampPoleCap = new THREE.SphereGeometry(0.084, 10, 6, 0, Math.PI * 2, 0, Math.PI * 0.55);
+  lampPoleCap.translate(0, 6.57, 0);
+  pushLampPole(lampPoleCap);
+
+  // Double clamp collar at Y = 6.15m & Y = 5.42m where arm & gusset brace bolt onto the mast
+  for (const cy of [6.15, 5.42]) {
+    const clamp = new THREE.CylinderGeometry(0.105, 0.105, 0.12, 10);
+    clamp.translate(0, cy, 0);
+    pushLampPole(clamp);
+  }
+
+  // Sweeping architectural gooseneck davit arm curving out to (0, 7.42, 1.98)
+  const lampArmCurve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(0, 6.14, 0.04),
+    new THREE.Vector3(0, 6.86, 0.45),
+    new THREE.Vector3(0, 7.36, 1.18),
+    new THREE.Vector3(0, 7.42, 1.98),
   ]);
-  const poleGeo = new THREE.TubeGeometry(lampCurve, 12, 0.11, 8, false);
-  const poleInst = new THREE.InstancedMesh(poleGeo, mats.darkChrome, lampCount);
-  const bulbGeo = new THREE.BoxGeometry(0.45, 0.16, 0.65);
+  pushLampPole(new THREE.TubeGeometry(lampArmCurve, 14, 0.052, 8, false));
+
+  // Diagonal under-brace scroll strut + twin truss web rings for authentic Los Angeles municipal tensile support
+  const lampBraceCurve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(0, 5.42, 0.05),
+    new THREE.Vector3(0, 6.18, 0.46),
+    new THREE.Vector3(0, 7.08, 1.05),
+  ]);
+  pushLampPole(new THREE.TubeGeometry(lampBraceCurve, 8, 0.028, 6, false));
+  const trussRingA = new THREE.TorusGeometry(0.16, 0.018, 6, 12);
+  trussRingA.rotateY(Math.PI * 0.5);
+  trussRingA.translate(0, 6.32, 0.26);
+  pushLampPole(trussRingA);
+  const trussRingB = new THREE.TorusGeometry(0.11, 0.016, 6, 12);
+  trussRingB.rotateY(Math.PI * 0.5);
+  trussRingB.translate(0, 6.84, 0.66);
+  pushLampPole(trussRingB);
+
+  const poleGeo = mergeGeometryEntries(lampPoleParts);
+  for (const p of lampPoleParts) p.geo.dispose();
+  const poleInst = new THREE.InstancedMesh(poleGeo, mats.brushedMetal, lampCount);
+
+  // B) Die-Cast Dark-Anodized Aerodynamic Cobra-Head Luminaire Housing, Heat-Sink Fins & Photocell
+  const lampHeadParts: Array<{ geo: THREE.BufferGeometry }> = [];
+  const pushLampHead = (geo: THREE.BufferGeometry): void => {
+    lampHeadParts.push({ geo });
+  };
+
+  // Slip-fitter tenon coupling sleeve at Z = 1.98m
+  const slipFitter = new THREE.CylinderGeometry(0.068, 0.072, 0.22, 8);
+  slipFitter.rotateX(Math.PI * 0.5);
+  slipFitter.translate(0, 7.41, 1.96);
+  pushLampHead(slipFitter);
+
+  // Rear driver electronics compartment & tapered aerodynamic cobra upper shell
+  const driverDeck = new THREE.BoxGeometry(0.32, 0.13, 0.30);
+  driverDeck.translate(0, 7.42, 2.08);
+  pushLampHead(driverDeck);
+  const cobraShell = new THREE.BoxGeometry(0.38, 0.11, 0.54);
+  cobraShell.rotateX(0.03);
+  cobraShell.translate(0, 7.41, 2.34);
+  pushLampHead(cobraShell);
+  const cobraNose = new THREE.CylinderGeometry(0.17, 0.19, 0.11, 10);
+  cobraNose.scale(1.0, 1.0, 0.75);
+  cobraNose.translate(0, 7.40, 2.61);
+  pushLampHead(cobraNose);
+
+  // 5 dorsal thermal dissipation heat-sink fins along upper luminaire back
+  for (let f = -2; f <= 2; f++) {
+    const fin = new THREE.BoxGeometry(0.022, 0.045, 0.42);
+    fin.translate(f * 0.068, 7.48, 2.34);
+    pushLampHead(fin);
+  }
+
+  // NEMA twist-lock daylight photocell sensor dome on top of driver housing
+  const photocellBase = new THREE.CylinderGeometry(0.042, 0.046, 0.055, 8);
+  photocellBase.translate(0, 7.51, 2.08);
+  pushLampHead(photocellBase);
+  const photocellCap = new THREE.SphereGeometry(0.042, 8, 5, 0, Math.PI * 2, 0, Math.PI * 0.55);
+  photocellCap.translate(0, 7.535, 2.08);
+  pushLampHead(photocellCap);
+
+  // Deep glare-cutoff bezel skirt framing the recessed LED refractor lens at (0, 7.31, 2.34)
+  const bezelFrame = new THREE.BoxGeometry(0.36, 0.06, 0.52);
+  bezelFrame.translate(0, 7.34, 2.34);
+  pushLampHead(bezelFrame);
+
+  const lampHeadGeo = mergeGeometryEntries(lampHeadParts);
+  for (const p of lampHeadParts) p.geo.dispose();
+  const lampHeadInst = new THREE.InstancedMesh(lampHeadGeo, mats.darkChrome, lampCount);
+
+  // C) Prismatic Multi-Cell LED Refractor Drop-Lens & Internal Reflector Cavity (centered at 0, 7.30, 2.30)
+  const lensPrism = new THREE.BoxGeometry(0.31, 0.055, 0.46);
+  lensPrism.translate(0, 7.31, 2.32);
+  const lensDropDome = new THREE.SphereGeometry(0.15, 12, 8);
+  lensDropDome.scale(0.92, 0.36, 1.38);
+  lensDropDome.translate(0, 7.285, 2.32);
+  const bulbGeo = mergeGeometryEntries([{ geo: lensPrism }, { geo: lensDropDome }]);
+  lensPrism.dispose();
+  lensDropDome.dispose();
   const bulbInst = new THREE.InstancedMesh(bulbGeo, mats.streetlampGlow, lampCount);
 
   // Multi-Part Weathered Cast-Iron Fire Hydrants near sidewalk curbs (flanged barrel, bonnet dome, side nozzles + contact shadow!)
@@ -1046,21 +1467,25 @@ export function buildLosSantosWorld(
     dummy.scale.set(1, 1, 1);
     dummy.updateMatrix();
     poleInst.setMatrixAt(i, dummy.matrix);
-
-    const bulbOff = new THREE.Vector3(0, 7.3, 2.3).applyAxisAngle(
-      new THREE.Vector3(0, 1, 0),
-      l.rotY,
-    );
-    dummy.position.set(l.x + bulbOff.x, bulbOff.y, l.z + bulbOff.z);
-    dummy.updateMatrix();
+    lampHeadInst.setMatrixAt(i, dummy.matrix);
     bulbInst.setMatrixAt(i, dummy.matrix);
   }
   poleInst.castShadow = true;
+  lampHeadInst.castShadow = true;
   poleInst.instanceMatrix.needsUpdate = true;
   poleInst.computeBoundingSphere();
+  lampHeadInst.instanceMatrix.needsUpdate = true;
+  lampHeadInst.computeBoundingSphere();
   bulbInst.instanceMatrix.needsUpdate = true;
   bulbInst.computeBoundingSphere();
-  worldGroup.add(poleInst, bulbInst, hydrantBarrelInst, hydrantCapInst, hydrantNozzleInst);
+  worldGroup.add(
+    poleInst,
+    lampHeadInst,
+    bulbInst,
+    hydrantBarrelInst,
+    hydrantCapInst,
+    hydrantNozzleInst,
+  );
 
   // Pillar 6: California Sidewalk Urban Street Furniture (Glass Bus Shelters, Multi-Part Slatted Benches,
   // Weathered Newspaper Boxes, Municipal Trash Cans, Café Umbrellas, Concrete Planters, Manholes & Ground Contact Shadows!)
@@ -1080,41 +1505,79 @@ export function buildLosSantosWorld(
     { x: -24, z: -105.4, rotY: 0 },
     { x: -56.6, z: -22, rotY: Math.PI * 0.5 },
   ];
-  for (const bs of busShelters) {
-    const sg = new THREE.Group();
-    sg.position.set(bs.x, 0, bs.z);
-    sg.rotation.y = bs.rotY;
 
-    const roof = new THREE.Mesh(new THREE.BoxGeometry(3.4, 0.14, 1.45), mats.darkChrome);
-    roof.position.set(0, 2.48, 0);
-    roof.rotation.x = 0.06;
-    roof.castShadow = true;
-    const glassBack = new THREE.Mesh(new THREE.BoxGeometry(3.15, 2.15, 0.06), mats.carGlass);
-    glassBack.position.set(0, 1.25, -0.62);
-    const adBox = new THREE.Mesh(new THREE.BoxGeometry(0.16, 2.15, 1.32), mats.darkChrome);
-    adBox.position.set(1.62, 1.25, 0);
-    adBox.castShadow = true;
-    const adF = new THREE.Mesh(new THREE.PlaneGeometry(1.18, 1.92), mats.busAdMat);
-    adF.position.set(1.71, 1.25, 0);
-    adF.rotation.y = Math.PI * 0.5;
-    const adB = new THREE.Mesh(new THREE.PlaneGeometry(1.18, 1.92), mats.busAdMat);
-    adB.position.set(1.53, 1.25, 0);
-    adB.rotation.y = -Math.PI * 0.5;
-    for (const px of [-1.58, 0, 1.58]) {
-      const post = new THREE.Mesh(new THREE.CylinderGeometry(0.055, 0.06, 2.46, 8), mats.darkChrome);
-      post.position.set(px, 1.23, -0.62);
-      sg.add(post);
-    }
-    const seat = new THREE.Mesh(new THREE.BoxGeometry(2.15, 0.1, 0.48), mats.woodPorch);
-    seat.position.set(-0.22, 0.52, -0.26);
-    const legL = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.52, 0.44), mats.darkChrome);
-    legL.position.set(-1.12, 0.26, -0.26);
-    const legR = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.52, 0.44), mats.darkChrome);
-    legR.position.set(0.68, 0.26, -0.26);
-    sg.add(roof, glassBack, adBox, adF, adB, seat, legL, legR);
-    worldGroup.add(sg);
+  // GPU-Instanced Bus Shelters (collapses 66 meshes & 66 geometries -> 4 InstancedMeshes!)
+  const bsRoofGeo = new THREE.BoxGeometry(3.4, 0.14, 1.45);
+  const bsRoofMat4 = new THREE.Matrix4()
+    .makeTranslation(0, 2.48, 0)
+    .multiply(new THREE.Matrix4().makeRotationX(0.06));
+  const bsAdBoxGeo = new THREE.BoxGeometry(0.16, 2.15, 1.32);
+  const bsPostGeo = new THREE.CylinderGeometry(0.055, 0.06, 2.46, 8);
+  const bsLegGeo = new THREE.BoxGeometry(0.08, 0.52, 0.44);
+  const bsFrameGeo = mergeGeometryEntries([
+    { geo: bsRoofGeo, matrix: bsRoofMat4 },
+    { geo: bsAdBoxGeo, matrix: new THREE.Matrix4().makeTranslation(1.62, 1.25, 0) },
+    { geo: bsPostGeo, matrix: new THREE.Matrix4().makeTranslation(-1.58, 1.23, -0.62) },
+    { geo: bsPostGeo, matrix: new THREE.Matrix4().makeTranslation(0, 1.23, -0.62) },
+    { geo: bsPostGeo, matrix: new THREE.Matrix4().makeTranslation(1.58, 1.23, -0.62) },
+    { geo: bsLegGeo, matrix: new THREE.Matrix4().makeTranslation(-1.12, 0.26, -0.26) },
+    { geo: bsLegGeo, matrix: new THREE.Matrix4().makeTranslation(0.68, 0.26, -0.26) },
+  ]);
+  bsRoofGeo.dispose();
+  bsAdBoxGeo.dispose();
+  bsPostGeo.dispose();
+  bsLegGeo.dispose();
+
+  const bsGlassGeo = new THREE.BoxGeometry(3.15, 2.15, 0.06);
+  bsGlassGeo.translate(0, 1.25, -0.62);
+
+  const bsAdPlaneGeo = new THREE.PlaneGeometry(1.18, 1.92);
+  const bsAdGeo = mergeGeometryEntries([
+    {
+      geo: bsAdPlaneGeo,
+      matrix: new THREE.Matrix4()
+        .makeTranslation(1.71, 1.25, 0)
+        .multiply(new THREE.Matrix4().makeRotationY(Math.PI * 0.5)),
+    },
+    {
+      geo: bsAdPlaneGeo,
+      matrix: new THREE.Matrix4()
+        .makeTranslation(1.53, 1.25, 0)
+        .multiply(new THREE.Matrix4().makeRotationY(-Math.PI * 0.5)),
+    },
+  ]);
+  bsAdPlaneGeo.dispose();
+
+  const bsSeatGeo = new THREE.BoxGeometry(2.15, 0.1, 0.48);
+  bsSeatGeo.translate(-0.22, 0.52, -0.26);
+
+  const bsFrameInst = new THREE.InstancedMesh(bsFrameGeo, mats.darkChrome, busShelters.length);
+  bsFrameInst.castShadow = true;
+  const bsGlassInst = new THREE.InstancedMesh(bsGlassGeo, mats.carGlass, busShelters.length);
+  const bsAdInst = new THREE.InstancedMesh(bsAdGeo, mats.busAdMat, busShelters.length);
+  const bsSeatInst = new THREE.InstancedMesh(bsSeatGeo, mats.woodPorch, busShelters.length);
+
+  for (let i = 0; i < busShelters.length; i++) {
+    const bs = busShelters[i];
+    dummy.position.set(bs.x, 0, bs.z);
+    dummy.rotation.set(0, bs.rotY, 0);
+    dummy.scale.set(1, 1, 1);
+    dummy.updateMatrix();
+    bsFrameInst.setMatrixAt(i, dummy.matrix);
+    bsGlassInst.setMatrixAt(i, dummy.matrix);
+    bsAdInst.setMatrixAt(i, dummy.matrix);
+    bsSeatInst.setMatrixAt(i, dummy.matrix);
     propShadowSpots.push({ x: bs.x, z: bs.z, sx: 3.9, sz: 2.1 });
   }
+  bsFrameInst.instanceMatrix.needsUpdate = true;
+  bsFrameInst.computeBoundingSphere();
+  bsGlassInst.instanceMatrix.needsUpdate = true;
+  bsGlassInst.computeBoundingSphere();
+  bsAdInst.instanceMatrix.needsUpdate = true;
+  bsAdInst.computeBoundingSphere();
+  bsSeatInst.instanceMatrix.needsUpdate = true;
+  bsSeatInst.computeBoundingSphere();
+  worldGroup.add(bsFrameInst, bsGlassInst, bsAdInst, bsSeatInst);
 
   // Instanced Multi-Part Sidewalk Benches (with real iron legs & armrests), Weathered Trash Cans & Newspaper Racks
   const streetPropSpots = [
@@ -1126,7 +1589,7 @@ export function buildLosSantosWorld(
     { x: -16, z: -33.2, rotY: Math.PI },
     { x: 18, z: -33.2, rotY: Math.PI },
     { x: -34, z: -51.0, rotY: 0 },
-    { x: 34, z: -51.0, rotY: 0 },
+    { x: 43, z: -51.0, rotY: 0 },
     { x: -57.2, z: -30, rotY: Math.PI * 0.5 },
     { x: 57.2, z: -30, rotY: -Math.PI * 0.5 },
     { x: -16, z: -87.2, rotY: Math.PI },
@@ -1142,18 +1605,23 @@ export function buildLosSantosWorld(
   const trashRimInst = new THREE.InstancedMesh(trashRimGeo, mats.brushedMetal, streetPropSpots.length);
   trashInst.castShadow = true;
 
-  const benchSeatGeo = new THREE.BoxGeometry(1.78, 0.09, 0.52);
-  benchSeatGeo.translate(0, 0.46, 0);
-  const benchBackGeo = new THREE.BoxGeometry(1.78, 0.40, 0.07);
-  benchBackGeo.translate(0, 0.84, -0.23);
+  const benchSeatRawGeo = new THREE.BoxGeometry(1.78, 0.09, 0.52);
+  benchSeatRawGeo.translate(0, 0.46, 0);
+  const benchBackRawGeo = new THREE.BoxGeometry(1.78, 0.40, 0.07);
+  benchBackRawGeo.translate(0, 0.84, -0.23);
+  const benchWoodGeo = mergeGeometryEntries([
+    { geo: benchSeatRawGeo },
+    { geo: benchBackRawGeo },
+  ]);
+  benchSeatRawGeo.dispose();
+  benchBackRawGeo.dispose();
+
   const benchLegGeo = new THREE.BoxGeometry(0.08, 0.64, 0.50);
   benchLegGeo.translate(0, 0.32, 0);
 
-  const benchSeatInst = new THREE.InstancedMesh(benchSeatGeo, mats.woodPorch, streetPropSpots.length);
-  const benchBackInst = new THREE.InstancedMesh(benchBackGeo, mats.woodPorch, streetPropSpots.length);
+  const benchWoodInst = new THREE.InstancedMesh(benchWoodGeo, mats.woodPorch, streetPropSpots.length);
   const benchLegInst = new THREE.InstancedMesh(benchLegGeo, mats.darkChrome, streetPropSpots.length * 2);
-  benchSeatInst.castShadow = true;
-  benchBackInst.castShadow = true;
+  benchWoodInst.castShadow = true;
 
   const newsGeo = new THREE.BoxGeometry(0.46, 1.04, 0.42);
   newsGeo.translate(0, 0.52, 0);
@@ -1163,49 +1631,44 @@ export function buildLosSantosWorld(
   const newsGlassInst = new THREE.InstancedMesh(newsGlassGeo, mats.carGlass, streetPropSpots.length);
   newsInst.castShadow = true;
 
+  const propOffsetVec = new THREE.Vector3();
   for (let i = 0; i < streetPropSpots.length; i++) {
     const sp = streetPropSpots[i];
     dummy.position.set(sp.x, 0, sp.z);
     dummy.rotation.set(0, sp.rotY, 0);
     dummy.scale.set(1, 1, 1);
     dummy.updateMatrix();
-    benchSeatInst.setMatrixAt(i, dummy.matrix);
-    benchBackInst.setMatrixAt(i, dummy.matrix);
+    benchWoodInst.setMatrixAt(i, dummy.matrix);
     propShadowSpots.push({ x: sp.x, z: sp.z, sx: 2.05, sz: 0.92 });
 
     // Real iron bench leg frames on both ends
     for (let li = 0; li < 2; li++) {
-      const legOff = new THREE.Vector3(li === 0 ? -0.76 : 0.76, 0, 0).applyAxisAngle(
-        new THREE.Vector3(0, 1, 0),
-        sp.rotY,
-      );
-      dummy.position.set(sp.x + legOff.x, 0, sp.z + legOff.z);
+      propOffsetVec.set(li === 0 ? -0.76 : 0.76, 0, 0).applyAxisAngle(upAxis, sp.rotY);
+      dummy.position.set(sp.x + propOffsetVec.x, 0, sp.z + propOffsetVec.z);
       dummy.updateMatrix();
       benchLegInst.setMatrixAt(i * 2 + li, dummy.matrix);
     }
 
-    const sideOff = new THREE.Vector3(1.28, 0, 0).applyAxisAngle(new THREE.Vector3(0, 1, 0), sp.rotY);
-    dummy.position.set(sp.x + sideOff.x, 0, sp.z + sideOff.z);
+    propOffsetVec.set(1.28, 0, 0).applyAxisAngle(upAxis, sp.rotY);
+    dummy.position.set(sp.x + propOffsetVec.x, 0, sp.z + propOffsetVec.z);
     dummy.updateMatrix();
     trashInst.setMatrixAt(i, dummy.matrix);
     trashRimInst.setMatrixAt(i, dummy.matrix);
-    propShadowSpots.push({ x: sp.x + sideOff.x, z: sp.z + sideOff.z, sx: 0.78, sz: 0.78 });
+    propShadowSpots.push({ x: sp.x + propOffsetVec.x, z: sp.z + propOffsetVec.z, sx: 0.78, sz: 0.78 });
 
-    const newsOff = new THREE.Vector3(-1.28, 0, 0).applyAxisAngle(new THREE.Vector3(0, 1, 0), sp.rotY);
-    dummy.position.set(sp.x + newsOff.x, 0, sp.z + newsOff.z);
+    propOffsetVec.set(-1.28, 0, 0).applyAxisAngle(upAxis, sp.rotY);
+    dummy.position.set(sp.x + propOffsetVec.x, 0, sp.z + propOffsetVec.z);
     dummy.updateMatrix();
     newsInst.setMatrixAt(i, dummy.matrix);
     newsGlassInst.setMatrixAt(i, dummy.matrix);
-    propShadowSpots.push({ x: sp.x + newsOff.x, z: sp.z + newsOff.z, sx: 0.86, sz: 0.82 });
+    propShadowSpots.push({ x: sp.x + propOffsetVec.x, z: sp.z + propOffsetVec.z, sx: 0.86, sz: 0.82 });
   }
   trashInst.instanceMatrix.needsUpdate = true;
   trashInst.computeBoundingSphere();
   trashRimInst.instanceMatrix.needsUpdate = true;
   trashRimInst.computeBoundingSphere();
-  benchSeatInst.instanceMatrix.needsUpdate = true;
-  benchSeatInst.computeBoundingSphere();
-  benchBackInst.instanceMatrix.needsUpdate = true;
-  benchBackInst.computeBoundingSphere();
+  benchWoodInst.instanceMatrix.needsUpdate = true;
+  benchWoodInst.computeBoundingSphere();
   benchLegInst.instanceMatrix.needsUpdate = true;
   benchLegInst.computeBoundingSphere();
   newsInst.instanceMatrix.needsUpdate = true;
@@ -1340,29 +1803,39 @@ export function buildLosSantosWorld(
   propShadowInst.instanceMatrix.needsUpdate = true;
   propShadowInst.computeBoundingSphere();
 
-  // California Octagonal STOP Signs at secondary sidewalk corners
+  // California Octagonal STOP Signs at secondary sidewalk corners (GPU-Instanced!)
   const stopSpots = [
     { x: -8.3, z: -13.5, rotY: 0 },
     { x: 8.3, z: -13.5, rotY: Math.PI },
     { x: -8.3, z: 45.2, rotY: 0 },
     { x: 8.3, z: 62.8, rotY: Math.PI },
   ];
-  for (const ss of stopSpots) {
-    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.045, 2.55, 6), mats.brushedMetal);
-    pole.position.set(ss.x, 1.28, ss.z);
-    pole.castShadow = true;
-    const plate = new THREE.Mesh(new THREE.BoxGeometry(0.66, 0.66, 0.05), mats.stopSignMat);
-    plate.position.set(ss.x, 2.42, ss.z);
-    plate.rotation.y = ss.rotY;
-    plate.castShadow = true;
-    worldGroup.add(pole, plate);
+  const stopPoleGeo = new THREE.CylinderGeometry(0.04, 0.045, 2.55, 6);
+  stopPoleGeo.translate(0, 1.28, 0);
+  const stopPlateGeo = new THREE.BoxGeometry(0.66, 0.66, 0.05);
+  stopPlateGeo.translate(0, 2.42, 0);
+  const stopPoleInst = new THREE.InstancedMesh(stopPoleGeo, mats.brushedMetal, stopSpots.length);
+  stopPoleInst.castShadow = true;
+  const stopPlateInst = new THREE.InstancedMesh(stopPlateGeo, mats.stopSignMat, stopSpots.length);
+  stopPlateInst.castShadow = true;
+  for (let i = 0; i < stopSpots.length; i++) {
+    const ss = stopSpots[i];
+    dummy.position.set(ss.x, 0, ss.z);
+    dummy.rotation.set(0, ss.rotY, 0);
+    dummy.scale.set(1, 1, 1);
+    dummy.updateMatrix();
+    stopPoleInst.setMatrixAt(i, dummy.matrix);
+    stopPlateInst.setMatrixAt(i, dummy.matrix);
   }
+  stopPoleInst.instanceMatrix.needsUpdate = true;
+  stopPoleInst.computeBoundingSphere();
+  stopPlateInst.instanceMatrix.needsUpdate = true;
+  stopPlateInst.computeBoundingSphere();
 
   worldGroup.add(
     trashInst,
     trashRimInst,
-    benchSeatInst,
-    benchBackInst,
+    benchWoodInst,
     benchLegInst,
     newsInst,
     newsGlassInst,
@@ -1373,6 +1846,8 @@ export function buildLosSantosWorld(
     cafeUmbrellaInst,
     manholeInst,
     propShadowInst,
+    stopPoleInst,
+    stopPlateInst,
   );
 
   // 7B. Living Atmospheric Wildlife: 24 Soaring California Seagulls / Urban Birds + 180 Golden Sunset Dust Motes
@@ -1430,58 +1905,9 @@ export function buildLosSantosWorld(
   dustMotes.frustumCulled = false;
   scene.add(dustMotes);
 
-  // 8. Interactive Shop Entrance Markers (Glowing GTA Storefront Entry Halos)
+  // 8. Real Walk-In Retail Interiors, Automatic Sliding Doors, Street Cart, & Unified Robbery Kit
   const shopMarkers: THREE.Group[] = [];
-  for (const shop of SHOPS) {
-    const marker = new THREE.Group();
-    marker.position.set(shop.x, 0.08, shop.z);
-    const accent = new THREE.Color(shop.accentHex);
-
-    const ring = new THREE.Mesh(
-      new THREE.RingGeometry(1.05, 1.38, 28),
-      new THREE.MeshBasicMaterial({
-        color: accent,
-        side: THREE.DoubleSide,
-        transparent: true,
-        opacity: 0.9,
-        depthWrite: false,
-      }),
-    );
-    ring.rotation.x = -Math.PI * 0.5;
-    marker.add(ring);
-
-    const innerGlow = new THREE.Mesh(
-      new THREE.CylinderGeometry(1.0, 1.15, 1.45, 20, 1, true),
-      new THREE.MeshBasicMaterial({
-        color: accent,
-        transparent: true,
-        opacity: 0.09,
-        side: THREE.DoubleSide,
-        depthWrite: false,
-        blending: THREE.AdditiveBlending,
-      }),
-    );
-    innerGlow.position.y = 0.72;
-    marker.add(innerGlow);
-
-    // Floating spinning diamond token at eye level
-    const icon = new THREE.Mesh(
-      new THREE.OctahedronGeometry(0.32, 0),
-      new THREE.MeshStandardMaterial({
-        color: accent,
-        emissive: accent,
-        emissiveIntensity: 0.9,
-        roughness: 0.25,
-        metalness: 0.5,
-      }),
-    );
-    icon.position.y = 1.55;
-    icon.name = 'shop_icon';
-    marker.add(icon);
-
-    worldGroup.add(marker);
-    shopMarkers.push(marker);
-  }
+  const shopVisuals = buildShopWorldExtensions(scene, worldGroup, mats);
 
   // 9. Pillar 4: Refined Ground-Hugging Street Checkpoint Objective Beacon (sleek, never obtrusive!)
   const checkpointGroup = new THREE.Group();
@@ -1517,7 +1943,6 @@ export function buildLosSantosWorld(
   // Freeze static world matrices once so Three.js never recomputes 1,200+ static building/road/prop transforms every frame!
   worldGroup.updateMatrixWorld(true);
   worldGroup.traverse((obj) => {
-    if (obj.name === 'shop_icon') return;
     obj.matrixAutoUpdate = false;
   });
 
@@ -1527,6 +1952,7 @@ export function buildLosSantosWorld(
     checkpointRing,
     checkpointColumn,
     shopMarkers,
+    shopVisuals,
     birdFlock: {
       leftWings: birdLeftWings,
       rightWings: birdRightWings,

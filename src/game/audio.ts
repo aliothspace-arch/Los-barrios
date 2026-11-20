@@ -5,6 +5,7 @@ export class ProceduralAudioEngine {
   private masterGain: GainNode | null = null;
   private engineOsc1: OscillatorNode | null = null;
   private engineOsc2: OscillatorNode | null = null;
+  private engineOsc3: OscillatorNode | null = null;
   private engineFilter: BiquadFilterNode | null = null;
   private engineGain: GainNode | null = null;
 
@@ -60,15 +61,26 @@ export class ProceduralAudioEngine {
       osc2.type = 'triangle';
       osc2.frequency.value = 24;
 
+      const osc3 = ctx.createOscillator();
+      osc3.type = 'sawtooth';
+      osc3.frequency.value = 72;
+
+      const osc3Gain = ctx.createGain();
+      osc3Gain.gain.value = 0.28;
+
       osc1.connect(engFilter);
       osc2.connect(engFilter);
+      osc3.connect(osc3Gain);
+      osc3Gain.connect(engFilter);
       engFilter.connect(engGain);
       engGain.connect(master);
       osc1.start();
       osc2.start();
+      osc3.start();
 
       this.engineOsc1 = osc1;
       this.engineOsc2 = osc2;
+      this.engineOsc3 = osc3;
       this.engineFilter = engFilter;
       this.engineGain = engGain;
 
@@ -162,6 +174,17 @@ export class ProceduralAudioEngine {
     return this.muted;
   }
 
+  private lastEngineFreq = -1;
+  private lastEngineFilter = -1;
+  private lastEngineGain = -1;
+  private lastSkidGain = -1;
+  private lastSkidFreq = -1;
+  private lastRainGain = -1;
+  private lastRainFreq = -1;
+  private lastSirenGain = -1;
+  private lastCurbThumpTime = -1;
+  private lastScrapeTime = -1;
+
   public silenceLoops(): void {
     if (!this.ctx) return;
     const t = this.ctx.currentTime;
@@ -169,6 +192,10 @@ export class ProceduralAudioEngine {
     this.rainGain?.gain.setTargetAtTime(0, t, 0.05);
     this.skidGain?.gain.setTargetAtTime(0, t, 0.05);
     this.sirenGain?.gain.setTargetAtTime(0, t, 0.05);
+    this.lastEngineGain = 0;
+    this.lastRainGain = 0;
+    this.lastSkidGain = 0;
+    this.lastSirenGain = 0;
   }
 
   public updateContinuous(params: {
@@ -176,6 +203,8 @@ export class ProceduralAudioEngine {
     rpm: number;
     throttle: number;
     nitroActive: boolean;
+    shiftCut?: boolean;
+    speedKmh?: number;
     skidIntensity: number;
     weather: WeatherType;
     sirenIntensity: number; // 0..1
@@ -184,36 +213,50 @@ export class ProceduralAudioEngine {
     if (!this.initialized || !this.ctx || this.muted) return;
     const t = this.ctx.currentTime;
 
-    // Engine synth
+    // Engine synth (3-harmonic V8/V12 rumble + shift cut ignition dip)
     if (this.engineOsc1 && this.engineOsc2 && this.engineFilter && this.engineGain) {
       if (params.inVehicle) {
-        const baseFreq = 34 + (params.rpm / 7500) * 145 + (params.nitroActive ? 28 : 0);
-        this.engineOsc1.frequency.setTargetAtTime(baseFreq, t, 0.04);
-        this.engineOsc2.frequency.setTargetAtTime(baseFreq * 0.502, t, 0.04);
-        this.engineFilter.frequency.setTargetAtTime(
-          160 + (params.rpm / 7500) * 850 + params.throttle * 260,
-          t,
-          0.05,
-        );
-        this.engineGain.gain.setTargetAtTime(
-          0.11 + params.throttle * 0.1 + (params.nitroActive ? 0.08 : 0),
-          t,
-          0.06,
-        );
-      } else {
+        const rpmRatio = Math.max(0, Math.min(1.05, params.rpm / 7800));
+        const baseFreq = 32 + rpmRatio * 158 + (params.nitroActive ? 30 : 0);
+        if (Math.abs(baseFreq - this.lastEngineFreq) > 0.35) {
+          this.lastEngineFreq = baseFreq;
+          this.engineOsc1.frequency.setTargetAtTime(baseFreq, t, 0.035);
+          this.engineOsc2.frequency.setTargetAtTime(baseFreq * 0.502, t, 0.035);
+          this.engineOsc3?.frequency.setTargetAtTime(baseFreq * 1.498, t, 0.035);
+        }
+        const cutMult = params.shiftCut ? 0.52 : 1.0;
+        const filterFreq = (155 + rpmRatio * 960 + params.throttle * 310) * cutMult;
+        if (Math.abs(filterFreq - this.lastEngineFilter) > 4.0) {
+          this.lastEngineFilter = filterFreq;
+          this.engineFilter.frequency.setTargetAtTime(filterFreq, t, 0.04);
+        }
+        const targetGain =
+          (0.1 + params.throttle * 0.11 + rpmRatio * 0.03 + (params.nitroActive ? 0.075 : 0)) *
+          (params.shiftCut ? 0.65 : 1.0);
+        if (Math.abs(targetGain - this.lastEngineGain) > 0.004) {
+          this.lastEngineGain = targetGain;
+          this.engineGain.gain.setTargetAtTime(targetGain, t, 0.045);
+        }
+      } else if (this.lastEngineGain !== 0) {
+        this.lastEngineGain = 0;
         this.engineGain.gain.setTargetAtTime(0, t, 0.08);
       }
     }
 
-    // Tire screech
+    // Tire screech / wet hydroplane hiss
     if (this.skidGain && this.skidFilter) {
-      const targetSkid = params.inVehicle ? params.skidIntensity * 0.14 : 0;
-      this.skidGain.gain.setTargetAtTime(targetSkid, t, 0.04);
-      this.skidFilter.frequency.setTargetAtTime(
-        params.weather === 'rain' || params.weather === 'storm' ? 1250 : 1950,
-        t,
-        0.08,
-      );
+      const targetSkid = params.inVehicle ? params.skidIntensity * 0.15 : 0;
+      if (Math.abs(targetSkid - this.lastSkidGain) > 0.003) {
+        this.lastSkidGain = targetSkid;
+        this.skidGain.gain.setTargetAtTime(targetSkid, t, 0.035);
+      }
+      const isWet = params.weather === 'rain' || params.weather === 'storm';
+      const speedShift = Math.min(350, (params.speedKmh ?? 0) * 2.4);
+      const targetSkidFreq = (isWet ? 1180 : 1840) + speedShift;
+      if (Math.abs(targetSkidFreq - this.lastSkidFreq) > 12) {
+        this.lastSkidFreq = targetSkidFreq;
+        this.skidFilter.frequency.setTargetAtTime(targetSkidFreq, t, 0.07);
+      }
     }
 
     // Rain / ambient wind
@@ -230,8 +273,14 @@ export class ProceduralAudioEngine {
         targetRain = 0.04;
         freq = 480;
       }
-      this.rainGain.gain.setTargetAtTime(targetRain, t, 0.2);
-      this.rainFilter.frequency.setTargetAtTime(freq, t, 0.2);
+      if (targetRain !== this.lastRainGain) {
+        this.lastRainGain = targetRain;
+        this.rainGain.gain.setTargetAtTime(targetRain, t, 0.2);
+      }
+      if (freq !== this.lastRainFreq) {
+        this.lastRainFreq = freq;
+        this.rainFilter.frequency.setTargetAtTime(freq, t, 0.2);
+      }
     }
 
     // Police siren wail
@@ -240,8 +289,13 @@ export class ProceduralAudioEngine {
         this.sirenPhase += params.dt * 4.4;
         const wail = 690 + Math.sin(this.sirenPhase) * 280;
         this.sirenOsc.frequency.setTargetAtTime(wail, t, 0.03);
-        this.sirenGain.gain.setTargetAtTime(params.sirenIntensity * 0.09, t, 0.08);
-      } else {
+        const sGain = params.sirenIntensity * 0.09;
+        if (Math.abs(sGain - this.lastSirenGain) > 0.002) {
+          this.lastSirenGain = sGain;
+          this.sirenGain.gain.setTargetAtTime(sGain, t, 0.08);
+        }
+      } else if (this.lastSirenGain !== 0) {
+        this.lastSirenGain = 0;
         this.sirenGain.gain.setTargetAtTime(0, t, 0.1);
       }
     }
@@ -265,6 +319,54 @@ export class ProceduralAudioEngine {
     g.connect(this.masterGain);
     osc.start(t);
     osc.stop(t + 0.26);
+  }
+
+  public playGearShift(upshift: boolean): void {
+    if (!this.initialized || !this.ctx || !this.masterGain || this.muted) return;
+    const t = this.ctx.currentTime;
+    // Sequential gearbox mechanical clack + subtle exhaust burble on upshift
+    const osc = this.ctx.createOscillator();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(upshift ? 135 : 175, t);
+    osc.frequency.exponentialRampToValueAtTime(upshift ? 52 : 76, t + 0.065);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.14, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.075);
+    osc.connect(g);
+    g.connect(this.masterGain);
+    osc.start(t);
+    osc.stop(t + 0.08);
+    if (upshift) {
+      this.playFilteredNoiseBurst(420, 1.8, 0.055, 0.11, 180);
+    }
+  }
+
+  public playSuspensionThump(intensity: number): void {
+    if (!this.initialized || !this.ctx || !this.masterGain || this.muted) return;
+    const t = this.ctx.currentTime;
+    if (t - this.lastCurbThumpTime < 0.095) return;
+    this.lastCurbThumpTime = t;
+    const amp = Math.min(1, Math.max(0.18, intensity));
+    const osc = this.ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(88 + amp * 24, t);
+    osc.frequency.exponentialRampToValueAtTime(32, t + 0.11);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.24 * amp, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
+    osc.connect(g);
+    g.connect(this.masterGain);
+    osc.start(t);
+    osc.stop(t + 0.13);
+  }
+
+  public playScrape(intensity: number): void {
+    if (!this.initialized || !this.ctx || !this.masterGain || this.muted) return;
+    const t = this.ctx.currentTime;
+    if (t - this.lastScrapeTime < 0.075) return;
+    this.lastScrapeTime = t;
+    const amp = Math.min(1, Math.max(0.15, intensity));
+    this.playFilteredNoiseBurst(2600 + Math.random() * 600, 3.8, 0.085, 0.18 * amp, 1200);
   }
 
   public playThunder(): void {
@@ -554,26 +656,47 @@ export class ProceduralAudioEngine {
     osc.stop(t + 0.25);
   }
 
-  public speakDialogue(text: string, pitch = 1.0, rate = 1.04): void {
-    if (this.muted) return;
-    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+  public speakUtterance(
+    text: string,
+    pitch = 1.0,
+    rate = 0.98,
+    options?: { interrupt?: boolean; onEnd?: () => void },
+  ): boolean {
+    if (this.muted) return false;
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return false;
     try {
       const synth = window.speechSynthesis;
-      synth.cancel();
+      if (options?.interrupt) {
+        synth.cancel();
+      }
       const utter = new SpeechSynthesisUtterance(text);
       utter.lang = 'es-ES';
-      utter.pitch = Math.max(0.5, Math.min(1.6, pitch));
-      utter.rate = Math.max(0.75, Math.min(1.35, rate));
-      utter.volume = 0.85;
+      utter.pitch = Math.max(0.65, Math.min(1.45, pitch));
+      utter.rate = Math.max(0.9, Math.min(1.04, rate));
+      utter.volume = 0.88;
       const voices = synth.getVoices?.() ?? [];
       const esVoice =
         voices.find((v) => /^es(-ES|-MX|-US|-419)?/i.test(v.lang)) ??
         voices.find((v) => v.lang.toLowerCase().startsWith('es'));
       if (esVoice) utter.voice = esVoice;
+
+      let settled = false;
+      const settle = () => {
+        if (settled) return;
+        settled = true;
+        options?.onEnd?.();
+      };
+      utter.onend = settle;
+      utter.onerror = settle;
       synth.speak(utter);
+      return true;
     } catch {
-      // Gracefully ignore in restricted / headless browsers
+      return false;
     }
+  }
+
+  public speakDialogue(text: string, pitch = 1.0, rate = 0.98): void {
+    this.speakUtterance(text, pitch, rate, { interrupt: false });
   }
 
   public cancelSpeech(): void {

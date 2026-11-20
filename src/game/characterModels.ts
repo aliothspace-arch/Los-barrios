@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import type { HyperrealMaterialLibrary, SharedWeatherUniforms } from './textures';
+import { mergeGeometryEntries } from './rendering/geometryFusion';
 
 export interface CharacterRig {
   root: THREE.Group;
@@ -2406,8 +2407,14 @@ export function applyPhotorealSkinShader(
       .replace(
         '#include <worldpos_vertex>',
         `#include <worldpos_vertex>
-        vBioWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
-        vBioWorldNormal = normalize(mat3(modelMatrix) * objectNormal);`,
+        #ifdef USE_INSTANCING
+          mat4 bioWorldMat = modelMatrix * instanceMatrix;
+          vBioWorldPos = (bioWorldMat * vec4(transformed, 1.0)).xyz;
+          vBioWorldNormal = normalize(mat3(bioWorldMat) * objectNormal);
+        #else
+          vBioWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
+          vBioWorldNormal = normalize(mat3(modelMatrix) * objectNormal);
+        #endif`,
       );
 
     shader.fragmentShader = shader.fragmentShader
@@ -2439,26 +2446,23 @@ export function applyPhotorealSkinShader(
         totalEmissiveRadiance += sssTerm + peachFuzzRim;`,
       );
   };
-  material.customProgramCacheKey = () => `photoreal_skin_sss_v2_${cacheTag}`;
+  void cacheTag;
+  material.customProgramCacheKey = () => 'photoreal_skin_sss_v3';
 }
 
 // ============================================================================
 // 8. SHARED MASTER CHARACTER ASSET CACHE (BUILT ONCE FOR ALL 120 CHARACTERS!)
 // ============================================================================
 
-interface MasterCharacterAssets {
-  // Sculpted Anatomical Geometries (100% shared across protagonist + all 118+ NPCs!)
+export interface MasterCharacterAssets {
+  // Sculpted Anatomical Geometries (fused by rigid sub-assembly; 100% shared across CJ + all 118+ NPCs!)
   headGeo: THREE.BufferGeometry;
-  leftEarGeo: THREE.BufferGeometry;
-  rightEarGeo: THREE.BufferGeometry;
+  neckAndEarsGeo: THREE.BufferGeometry;
   hairGeo: THREE.BufferGeometry;
-  eyeGeo: THREE.BufferGeometry;
-  neckGeo: THREE.BufferGeometry;
+  eyesPairGeo: THREE.BufferGeometry;
   upperYokeSkinGeo: THREE.BufferGeometry;
-  tankTorsoGeo: THREE.BufferGeometry;
-  teeTorsoGeo: THREE.BufferGeometry;
-  tankCollarGeo: THREE.BufferGeometry;
-  teeCollarGeo: THREE.BufferGeometry;
+  tankTorsoWithCollarGeo: THREE.BufferGeometry;
+  teeTorsoWithCollarGeo: THREE.BufferGeometry;
   pelvisGeo: THREE.BufferGeometry;
   beltAndLoopsGeo: THREE.BufferGeometry;
   buckleGeo: THREE.BufferGeometry;
@@ -2466,10 +2470,8 @@ interface MasterCharacterAssets {
   rightUpperArmGeo: THREE.BufferGeometry;
   leftSleeveGeo: THREE.BufferGeometry;
   rightSleeveGeo: THREE.BufferGeometry;
-  leftForearmGeo: THREE.BufferGeometry;
-  rightForearmGeo: THREE.BufferGeometry;
-  leftHandGeo: THREE.BufferGeometry;
-  rightHandGeo: THREE.BufferGeometry;
+  leftForearmAndHandGeo: THREE.BufferGeometry;
+  rightForearmAndHandGeo: THREE.BufferGeometry;
   leftThighGeo: THREE.BufferGeometry;
   rightThighGeo: THREE.BufferGeometry;
   leftCalfGeo: THREE.BufferGeometry;
@@ -2523,16 +2525,12 @@ export function disposeMasterCharacterAssets(): void {
 
   const geos: THREE.BufferGeometry[] = [
     assets.headGeo,
-    assets.leftEarGeo,
-    assets.rightEarGeo,
+    assets.neckAndEarsGeo,
     assets.hairGeo,
-    assets.eyeGeo,
-    assets.neckGeo,
+    assets.eyesPairGeo,
     assets.upperYokeSkinGeo,
-    assets.tankTorsoGeo,
-    assets.teeTorsoGeo,
-    assets.tankCollarGeo,
-    assets.teeCollarGeo,
+    assets.tankTorsoWithCollarGeo,
+    assets.teeTorsoWithCollarGeo,
     assets.pelvisGeo,
     assets.beltAndLoopsGeo,
     assets.buckleGeo,
@@ -2540,10 +2538,8 @@ export function disposeMasterCharacterAssets(): void {
     assets.rightUpperArmGeo,
     assets.leftSleeveGeo,
     assets.rightSleeveGeo,
-    assets.leftForearmGeo,
-    assets.rightForearmGeo,
-    assets.leftHandGeo,
-    assets.rightHandGeo,
+    assets.leftForearmAndHandGeo,
+    assets.rightForearmAndHandGeo,
     assets.leftThighGeo,
     assets.rightThighGeo,
     assets.leftCalfGeo,
@@ -2600,7 +2596,7 @@ export function warmMasterCharacterAssets(mats: HyperrealMaterialLibrary): void 
   getMasterCharacterAssets(mats);
 }
 
-function getMasterCharacterAssets(mats: HyperrealMaterialLibrary): MasterCharacterAssets {
+export function getMasterCharacterAssets(mats: HyperrealMaterialLibrary): MasterCharacterAssets {
   if (cachedMasterAssets && cachedLibraryRef === mats) {
     return cachedMasterAssets;
   }
@@ -2635,9 +2631,80 @@ function getMasterCharacterAssets(mats: HyperrealMaterialLibrary): MasterCharact
     leatherNormalMap,
   };
 
-  // Orient sphere eyeball so u=0.5, v=0.5 (iris center) faces strictly +Z forward
+  // Orient sphere eyeball so u=0.5, v=0.5 (iris center) faces strictly +Z forward, then fuse L+R pair
   const eyeGeo = new THREE.SphereGeometry(0.0148, 16, 12);
   eyeGeo.rotateY(-Math.PI * 0.5);
+  const eyePhi = (FACE_LANDMARKS.EYE_V - 0.5) * Math.PI * 0.985;
+  const eyeY = FACE_LANDMARKS.HEAD_CENTER_Y + FACE_LANDMARKS.HEAD_RY * Math.sin(eyePhi);
+  const eyesPairGeo = mergeGeometryEntries(
+    [
+      { geo: eyeGeo, matrix: new THREE.Matrix4().makeTranslation(-0.0365, eyeY, 0.0885) },
+      { geo: eyeGeo, matrix: new THREE.Matrix4().makeTranslation(0.0365, eyeY, 0.0885) },
+    ],
+    { markShared: true },
+  );
+  eyeGeo.dispose();
+
+  // Fuse neck + left/right sculpted ears into a single head-attached skin BufferGeometry
+  const neckGeoRaw = buildSculptedNeckGeometry();
+  const leftEarGeoRaw = buildSculptedEarGeometry(-1);
+  const rightEarGeoRaw = buildSculptedEarGeometry(1);
+  const earY = FACE_LANDMARKS.HEAD_CENTER_Y - 0.008;
+  const neckAndEarsGeo = mergeGeometryEntries(
+    [
+      { geo: neckGeoRaw },
+      {
+        geo: leftEarGeoRaw,
+        matrix: new THREE.Matrix4().makeTranslation(-FACE_LANDMARKS.HEAD_RX * 0.99, earY, -0.006),
+      },
+      {
+        geo: rightEarGeoRaw,
+        matrix: new THREE.Matrix4().makeTranslation(FACE_LANDMARKS.HEAD_RX * 0.99, earY, -0.006),
+      },
+    ],
+    { includeColor: true, markShared: true },
+  );
+  neckGeoRaw.dispose();
+  leftEarGeoRaw.dispose();
+  rightEarGeoRaw.dispose();
+
+  // Fuse torso + ribbed collar trim for both tank top and t-shirt
+  const tankTorsoRaw = buildSculptedTorsoGeometry(true);
+  const tankCollarRaw = buildSculptedCollarBandGeometry(true);
+  const tankTorsoWithCollarGeo = mergeGeometryEntries(
+    [{ geo: tankTorsoRaw }, { geo: tankCollarRaw }],
+    { includeColor: true, markShared: true },
+  );
+  tankTorsoRaw.dispose();
+  tankCollarRaw.dispose();
+
+  const teeTorsoRaw = buildSculptedTorsoGeometry(false);
+  const teeCollarRaw = buildSculptedCollarBandGeometry(false);
+  const teeTorsoWithCollarGeo = mergeGeometryEntries(
+    [{ geo: teeTorsoRaw }, { geo: teeCollarRaw }],
+    { includeColor: true, markShared: true },
+  );
+  teeTorsoRaw.dispose();
+  teeCollarRaw.dispose();
+
+  // Fuse forearm + 5-fingered hand into a single rigid lower-arm skin BufferGeometry per side
+  const leftForearmRaw = buildSculptedForearmGeometry(-1);
+  const leftHandRaw = buildSculptedHandGeometry(-1);
+  const leftForearmAndHandGeo = mergeGeometryEntries(
+    [{ geo: leftForearmRaw }, { geo: leftHandRaw }],
+    { includeColor: true, markShared: true },
+  );
+  leftForearmRaw.dispose();
+  leftHandRaw.dispose();
+
+  const rightForearmRaw = buildSculptedForearmGeometry(1);
+  const rightHandRaw = buildSculptedHandGeometry(1);
+  const rightForearmAndHandGeo = mergeGeometryEntries(
+    [{ geo: rightForearmRaw }, { geo: rightHandRaw }],
+    { includeColor: true, markShared: true },
+  );
+  rightForearmRaw.dispose();
+  rightHandRaw.dispose();
 
   const shades = buildSculptedShadesGeometries();
 
@@ -2670,16 +2737,12 @@ function getMasterCharacterAssets(mats: HyperrealMaterialLibrary): MasterCharact
 
   cachedMasterAssets = {
     headGeo: buildSculptedHeadGeometry(),
-    leftEarGeo: buildSculptedEarGeometry(-1),
-    rightEarGeo: buildSculptedEarGeometry(1),
+    neckAndEarsGeo,
     hairGeo: buildSculptedHairGeometry(),
-    eyeGeo,
-    neckGeo: buildSculptedNeckGeometry(),
+    eyesPairGeo,
     upperYokeSkinGeo: buildSculptedUpperYokeSkinGeometry(),
-    tankTorsoGeo: buildSculptedTorsoGeometry(true),
-    teeTorsoGeo: buildSculptedTorsoGeometry(false),
-    tankCollarGeo: buildSculptedCollarBandGeometry(true),
-    teeCollarGeo: buildSculptedCollarBandGeometry(false),
+    tankTorsoWithCollarGeo,
+    teeTorsoWithCollarGeo,
     pelvisGeo: buildSculptedPelvisGeometry(),
     beltAndLoopsGeo: buildSculptedBeltAndLoopsGeometry(),
     buckleGeo: buildSculptedBuckleGeometry(),
@@ -2687,10 +2750,8 @@ function getMasterCharacterAssets(mats: HyperrealMaterialLibrary): MasterCharact
     rightUpperArmGeo: buildSculptedUpperArmGeometry(1),
     leftSleeveGeo: buildSculptedSleeveGeometry(-1),
     rightSleeveGeo: buildSculptedSleeveGeometry(1),
-    leftForearmGeo: buildSculptedForearmGeometry(-1),
-    rightForearmGeo: buildSculptedForearmGeometry(1),
-    leftHandGeo: buildSculptedHandGeometry(-1),
-    rightHandGeo: buildSculptedHandGeometry(1),
+    leftForearmAndHandGeo,
+    rightForearmAndHandGeo,
     leftThighGeo: buildSculptedThighGeometry(-1),
     rightThighGeo: buildSculptedThighGeometry(1),
     leftCalfGeo: buildSculptedCalfGeometry(-1),
@@ -2985,100 +3046,85 @@ export function buildHyperrealCharacterRig(
     ca.shoeUpperMats.set(defaultShoeHex, shoeUpperMat);
   }
 
+  const freezeChild = (m: THREE.Mesh): THREE.Mesh => {
+    m.matrixAutoUpdate = false;
+    m.updateMatrix();
+    return m;
+  };
+
   // 3. Sculpted Pelvis, Full-Grain Leather Belt with 6 Loops & Metallic Buckle
   const pelvis = new THREE.Mesh(ca.pelvisGeo, pantsMat);
   pelvis.castShadow = true;
   pelvis.receiveShadow = true;
-  root.add(pelvis);
+  root.add(freezeChild(pelvis));
 
   const belt = new THREE.Mesh(ca.beltAndLoopsGeo, ca.beltMat);
   belt.castShadow = true;
-  root.add(belt);
+  root.add(freezeChild(belt));
 
   const buckle = new THREE.Mesh(
     ca.buckleGeo,
     opts.isProtagonist || opts.isPolice ? ca.goldMat : mats.brushedMetal,
   );
-  root.add(buckle);
+  root.add(freezeChild(buckle));
 
-  // 4. Sculpted Athletic Torso (pivoted at waist y = 0.99 for natural breathing & gait twist)
+  // 4. Sculpted Athletic Torso + Ribbed Collar (fused into 1 mesh; pivoted at waist y = 0.99)
   const torso = new THREE.Group();
   torso.position.y = 0.99;
   root.add(torso);
 
   const torsoMesh = new THREE.Mesh(
-    opts.isProtagonist ? ca.tankTorsoGeo : ca.teeTorsoGeo,
+    opts.isProtagonist ? ca.tankTorsoWithCollarGeo : ca.teeTorsoWithCollarGeo,
     shirtMat,
   );
   torsoMesh.castShadow = true;
   torsoMesh.receiveShadow = true;
-  torso.add(torsoMesh);
-
-  // Ribbed neckline collar trim
-  const collarMesh = new THREE.Mesh(
-    opts.isProtagonist ? ca.tankCollarGeo : ca.teeCollarGeo,
-    shirtMat,
-  );
-  torso.add(collarMesh);
+  torso.add(freezeChild(torsoMesh));
 
   // Exposed clavicles, upper pectorals & muscular trapezius yoke for CJ's iconic tank top
   if (opts.isProtagonist) {
     const yokeSkin = new THREE.Mesh(ca.upperYokeSkinGeo, bodySkinMat);
     yokeSkin.castShadow = true;
-    torso.add(yokeSkin);
+    torso.add(freezeChild(yokeSkin));
 
     const chain = new THREE.Mesh(ca.chainGeo, ca.goldMat);
-    torso.add(chain);
+    torso.add(freezeChild(chain));
   }
 
   if (opts.isPolice) {
     const badge = new THREE.Mesh(ca.badgeGeo, ca.goldMat);
     badge.position.set(-0.088, 0.385, 0.136);
     badge.rotation.y = -0.22;
-    torso.add(badge);
+    torso.add(freezeChild(badge));
   }
 
   if (opts.hasBackpack) {
     const pack = new THREE.Mesh(ca.backpackGeo, ca.backpackMat);
     pack.castShadow = true;
-    torso.add(pack);
+    torso.add(freezeChild(pack));
   }
 
-  // 5. Sculpted Anatomical Neck, FLAME-Inspired Head, Recessed Physical Eyes, 3D Ears & Fade Hair
+  // 5. Sculpted Anatomical Neck + Ears (fused), FLAME Head, Corneal Eyes Pair (fused) & Fade Hair
   const head = new THREE.Group();
   head.position.y = 0.56;
   torso.add(head);
 
-  const neck = new THREE.Mesh(ca.neckGeo, bodySkinMat);
-  neck.castShadow = true;
-  head.add(neck);
+  const neckAndEars = new THREE.Mesh(ca.neckAndEarsGeo, bodySkinMat);
+  neckAndEars.castShadow = true;
+  head.add(freezeChild(neckAndEars));
 
   const cranium = new THREE.Mesh(ca.headGeo, faceSkinMat);
   cranium.castShadow = true;
   cranium.receiveShadow = true;
-  head.add(cranium);
+  head.add(freezeChild(cranium));
 
-  // Sculpted 3D Ears positioned accurately on skull temples
-  const earY = FACE_LANDMARKS.HEAD_CENTER_Y - 0.008;
-  const leftEar = new THREE.Mesh(ca.leftEarGeo, bodySkinMat);
-  leftEar.position.set(-FACE_LANDMARKS.HEAD_RX * 0.99, earY, -0.006);
-  const rightEar = new THREE.Mesh(ca.rightEarGeo, bodySkinMat);
-  rightEar.position.set(FACE_LANDMARKS.HEAD_RX * 0.99, earY, -0.006);
-  head.add(leftEar, rightEar);
-
-  // Recessed Physical Corneal Eyeballs nestled inside the sculpted orbital sockets
-  const eyePhi = (FACE_LANDMARKS.EYE_V - 0.5) * Math.PI * 0.985;
-  const eyeY = FACE_LANDMARKS.HEAD_CENTER_Y + FACE_LANDMARKS.HEAD_RY * Math.sin(eyePhi);
-  for (const sx of [-1, 1]) {
-    const eye = new THREE.Mesh(ca.eyeGeo, ca.eyeMat);
-    eye.position.set(sx * 0.0365, eyeY, 0.0885);
-    head.add(eye);
-  }
+  const eyesPair = new THREE.Mesh(ca.eyesPairGeo, ca.eyeMat);
+  head.add(freezeChild(eyesPair));
 
   // Sculpted Textured Barber-Fade Hair Cap
   const hairCap = new THREE.Mesh(ca.hairGeo, ca.hairMat);
   hairCap.castShadow = true;
-  head.add(hairCap);
+  head.add(freezeChild(hairCap));
 
   // Optional 6-Panel Baseball Cap
   if (opts.hatColor !== undefined) {
@@ -3098,17 +3144,17 @@ export function buildHyperrealCharacterRig(
     }
     const cap = new THREE.Mesh(ca.capGeo, hatMat);
     cap.castShadow = true;
-    head.add(cap);
+    head.add(freezeChild(cap));
   }
 
   // Optional Sculpted Aviator/Wayfarer Sunglasses (with real wireframe bridge, ear temples & dark mirrored lenses!)
   if (opts.isRival || opts.isPolice || opts.hasShades) {
     const frame = new THREE.Mesh(ca.shadesFrameGeo, ca.shadesFrameMat);
     const lenses = new THREE.Mesh(ca.shadesLensGeo, ca.shadesLensMat);
-    head.add(frame, lenses);
+    head.add(freezeChild(frame), freezeChild(lenses));
   }
 
-  // 6. Sculpted Muscular Arms & Articulated 5-Fingered Hands
+  // 6. Sculpted Muscular Arms & Articulated 5-Fingered Hands (forearm + hand fused per side)
   const makeArm = (side: -1 | 1): { arm: THREE.Group; forearm: THREE.Group } => {
     const arm = new THREE.Group();
     arm.position.set(side * 0.222, 0.452, 0);
@@ -3118,7 +3164,7 @@ export function buildHyperrealCharacterRig(
       bodySkinMat,
     );
     upper.castShadow = true;
-    arm.add(upper);
+    arm.add(freezeChild(upper));
 
     if (!opts.isProtagonist) {
       const sleeve = new THREE.Mesh(
@@ -3126,32 +3172,25 @@ export function buildHyperrealCharacterRig(
         shirtMat,
       );
       sleeve.castShadow = true;
-      arm.add(sleeve);
+      arm.add(freezeChild(sleeve));
     }
 
     const forearm = new THREE.Group();
     forearm.position.set(0, -0.265, 0);
     arm.add(forearm);
 
-    const lower = new THREE.Mesh(
-      side < 0 ? ca.leftForearmGeo : ca.rightForearmGeo,
+    const lowerAndHand = new THREE.Mesh(
+      side < 0 ? ca.leftForearmAndHandGeo : ca.rightForearmAndHandGeo,
       bodySkinMat,
     );
-    lower.castShadow = true;
-    forearm.add(lower);
+    lowerAndHand.castShadow = true;
+    forearm.add(freezeChild(lowerAndHand));
 
     if (opts.isProtagonist && side === -1) {
       const watch = new THREE.Mesh(ca.watchGeo, ca.goldMat);
       watch.position.y = -0.222;
-      forearm.add(watch);
+      forearm.add(freezeChild(watch));
     }
-
-    const hand = new THREE.Mesh(
-      side < 0 ? ca.leftHandGeo : ca.rightHandGeo,
-      bodySkinMat,
-    );
-    hand.castShadow = true;
-    forearm.add(hand);
 
     return { arm, forearm };
   };
@@ -3171,7 +3210,7 @@ export function buildHyperrealCharacterRig(
     );
     thigh.castShadow = true;
     thigh.receiveShadow = true;
-    leg.add(thigh);
+    leg.add(freezeChild(thigh));
 
     const shin = new THREE.Group();
     shin.position.set(0, -0.42, 0);
@@ -3183,24 +3222,24 @@ export function buildHyperrealCharacterRig(
     );
     calf.castShadow = true;
     calf.receiveShadow = true;
-    shin.add(calf);
+    shin.add(freezeChild(calf));
 
     const sole = new THREE.Mesh(
       side < 0 ? ca.leftSoleGeo : ca.rightSoleGeo,
       ca.shoeSoleMat,
     );
     sole.castShadow = true;
-    shin.add(sole);
+    shin.add(freezeChild(sole));
 
     const shoeUpper = new THREE.Mesh(
       side < 0 ? ca.leftShoeUpperGeo : ca.rightShoeUpperGeo,
       shoeUpperMat,
     );
     shoeUpper.castShadow = true;
-    shin.add(shoeUpper);
+    shin.add(freezeChild(shoeUpper));
 
     const laces = new THREE.Mesh(ca.lacesGeo, ca.lacesMat);
-    shin.add(laces);
+    shin.add(freezeChild(laces));
 
     return { leg, shin };
   };
@@ -3214,7 +3253,7 @@ export function buildHyperrealCharacterRig(
   cShadow.name = 'contact_shadow';
   cShadow.rotation.x = -Math.PI * 0.5;
   cShadow.position.y = 0.056;
-  root.add(cShadow);
+  root.add(freezeChild(cShadow));
 
   // 9. Hostile Combat Windup Telegraph Ring (Ballas / LSPD)
   let telegraphRing: THREE.Mesh | undefined;

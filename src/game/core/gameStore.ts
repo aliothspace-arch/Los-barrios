@@ -3,10 +3,10 @@ import type {
   GamePhase,
   HUDState,
   PlayerOutfitId,
+  RobberyDialogueLine,
   RobberyHUDState,
   RunSummary,
   ShopSpec,
-  TimePreset,
   WeatherType,
 } from '../types';
 
@@ -16,6 +16,9 @@ export interface TelemetrySlice {
   rpmRatio: number;
   nitro: number;
   vehicleHealth: number;
+  tractionSlip: boolean;
+  absActive: boolean;
+  shiftFlash: boolean;
   fps: number;
 }
 
@@ -37,14 +40,15 @@ export interface PlayerHudSlice {
 export interface WorldUiSlice {
   phase: GamePhase;
   weather: WeatherType;
-  timePreset: TimePreset;
   clockText: string;
   cameraMode: CameraMode;
   muted: boolean;
   bannerText: string | null;
   nearShop: ShopSpec | null;
+  nearShopCooldown: number;
   activeShop: ShopSpec | null;
   activeShopCooldown: number;
+  ambientDialogue: RobberyDialogueLine | null;
   touchControlsVisible: boolean;
   runSummary: RunSummary | null;
 }
@@ -71,6 +75,9 @@ function extractTelemetry(hud: HUDState): TelemetrySlice {
     rpmRatio: hud.rpmRatio,
     nitro: hud.nitro,
     vehicleHealth: hud.vehicleHealth,
+    tractionSlip: hud.tractionSlip,
+    absActive: hud.absActive,
+    shiftFlash: hud.shiftFlash,
     fps: hud.fps,
   };
 }
@@ -96,14 +103,15 @@ function extractWorldUi(hud: HUDState): WorldUiSlice {
   return {
     phase: hud.phase,
     weather: hud.weather,
-    timePreset: hud.timePreset,
     clockText: hud.clockText,
     cameraMode: hud.cameraMode,
     muted: hud.muted,
     bannerText: hud.bannerText,
     nearShop: hud.nearShop,
+    nearShopCooldown: hud.nearShopCooldown,
     activeShop: hud.activeShop,
     activeShopCooldown: hud.activeShopCooldown,
+    ambientDialogue: hud.ambientDialogue,
     touchControlsVisible: hud.touchControlsVisible,
     runSummary: hud.runSummary,
   };
@@ -118,8 +126,8 @@ function extractActivity(hud: HUDState): ActivityHudSlice {
 /**
  * Selective external store compatible with React's `useSyncExternalStore`.
  * Isolates high-frequency vehicle telemetry (speed/RPM/nitro) from low-frequency
- * UI state (shops, pause modal, title screen, robbery overlay) so driving at
- * 60 FPS never triggers wasted React tree reconciliation in modals.
+ * UI state (shops, pause modal, robbery overlay) so driving at 60 FPS never
+ * triggers wasted React tree reconciliation in modals.
  */
 export class GameHudStore {
   private fullHud: HUDState;

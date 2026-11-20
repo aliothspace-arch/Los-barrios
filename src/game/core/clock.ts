@@ -26,6 +26,11 @@ export class SimulationClock {
     return this.frameCount;
   }
 
+  /** Fractional progress (0..1) toward the next fixed simulation step for smooth presentation interpolation. */
+  public get alpha(): number {
+    return Math.min(1, Math.max(0, this.accumulator / this.fixedDt));
+  }
+
   public reset(): void {
     this.accumulator = 0;
     this.simTimeSec = 0;

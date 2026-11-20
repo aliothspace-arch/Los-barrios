@@ -1,7 +1,11 @@
 import * as THREE from 'three';
 import type { BuildingBlueprint } from './types';
 import type { HyperrealMaterialLibrary } from './textures';
-import { BUILDINGS } from './worldLayout';
+import {
+  BUILDINGS,
+  getWalkInShopRoomProfile,
+  WALK_IN_BUILDING_IDS,
+} from './worldLayout';
 import { BuildingMeshBatcher } from './world/buildingBatcher';
 
 // Deterministic string hash for reproducible architectural variation per building ID
@@ -665,6 +669,55 @@ function buildGroveHouseBatched(
 // 2. COMMERCIAL STOREFRONTS — 4 UNMISTAKABLE LOS SANTOS RETAIL ARCHETYPES
 // ============================================================================
 
+function addWalkInGroundShell(
+  batch: BuildingMeshBatcher,
+  b: BuildingBlueprint,
+  wallMat: THREE.Material,
+  plinthMat: THREE.Material,
+  splitCeilingY = 3.68,
+): void {
+  const prof = getWalkInShopRoomProfile(b);
+  const halfBW = b.w * 0.5;
+  const halfBD = b.d * 0.5;
+  const roomH = Math.min(b.h, splitCeilingY);
+
+  // Rear solid mass behind walk-in interior (lz in [-halfBD, prof.roomBackZ])
+  const rearD = prof.roomBackZ - -halfBD;
+  if (rearD > 0.2) {
+    batch.addBox(b.w, roomH, rearD, wallMat, 0, roomH * 0.5, -halfBD + rearD * 0.5, {
+      castShadow: true,
+      uvMeters: 3.4,
+    });
+    batch.addBox(b.w + 0.28, 0.62, rearD + 0.12, plinthMat, 0, 0.31, -halfBD + rearD * 0.5, {
+      uvMeters: 2.2,
+    });
+  }
+
+  // Left & Right wing walls beside the 9.6m walk-in showroom
+  const wingW = Math.max(0.4, halfBW - prof.roomHalfW);
+  const sideD = halfBD - prof.roomBackZ;
+  const sideCenterZ = prof.roomBackZ + sideD * 0.5;
+  for (const side of [-1, 1]) {
+    const cx = side * (prof.roomHalfW + wingW * 0.5);
+    batch.addBox(wingW, roomH, sideD, wallMat, cx, roomH * 0.5, sideCenterZ, {
+      castShadow: true,
+      uvMeters: 3.4,
+    });
+    batch.addBox(wingW + 0.16, 0.62, sideD + 0.14, plinthMat, cx, 0.31, sideCenterZ, {
+      uvMeters: 2.2,
+    });
+  }
+
+  // Full upper-story volume above ceiling height
+  const upperH = b.h - roomH;
+  if (upperH > 0.2) {
+    batch.addBox(b.w, upperH, b.d, wallMat, 0, roomH + upperH * 0.5, 0, {
+      castShadow: true,
+      uvMeters: 3.4,
+    });
+  }
+}
+
 function buildCommercialBatched(
   b: BuildingBlueprint,
   mats: HyperrealMaterialLibrary,
@@ -673,6 +726,8 @@ function buildCommercialBatched(
   const h = hashId(b.id);
   const wallMat = mats.commercialWalls[b.paletteIndex % mats.commercialWalls.length];
   const awningMat = mats.awningPalettes[(b.paletteIndex + (h % 3)) % mats.awningPalettes.length];
+  const walkIn = WALK_IN_BUILDING_IDS.has(b.id);
+  const walkProf = walkIn ? getWalkInShopRoomProfile(b) : null;
 
   // Assign purposeful architectural archetype matching each Los Santos business!
   const isDiner =
@@ -691,12 +746,16 @@ function buildCommercialBatched(
   if (isDiner) {
     // --- ARCHETYPE A: Mid-Century California Googie Diner / Fast-Food Pavilion ---
     const mainH = Math.min(b.h, 6.2);
-    // Ceramic/stone lower bulkhead wall + crisp plaster upper body
-    batch.addBox(b.w + 0.24, 1.15, b.d + 0.24, mats.stoneMasonry, 0, 0.575, 0, { uvMeters: 2.2 });
-    batch.addBox(b.w, mainH - 1.15, b.d, wallMat, 0, 1.15 + (mainH - 1.15) * 0.5, 0, {
-      castShadow: true,
-      uvMeters: 3.6,
-    });
+    if (walkIn && walkProf) {
+      addWalkInGroundShell(batch, { ...b, h: mainH }, wallMat, mats.stoneMasonry, 3.68);
+    } else {
+      // Ceramic/stone lower bulkhead wall + crisp plaster upper body
+      batch.addBox(b.w + 0.24, 1.15, b.d + 0.24, mats.stoneMasonry, 0, 0.575, 0, { uvMeters: 2.2 });
+      batch.addBox(b.w, mainH - 1.15, b.d, wallMat, 0, 1.15 + (mainH - 1.15) * 0.5, 0, {
+        castShadow: true,
+        uvMeters: 3.6,
+      });
+    }
 
     // Iconic Sweeping Cantilevered Upswept Googie Wing Roof + Polished Chrome Fascia Edge!
     const wingRoof = makeGoogieWingRoofGeo(b.w + 2.4, b.d + 0.8, 1.55, 0.48);
@@ -713,18 +772,28 @@ function buildCommercialBatched(
       });
     }
 
-    // Wraparound Floor-to-Ceiling Recessed Interior-Mapped Diner Glazing (Front + Both Corner Flanks!)
-    batch.addBox(b.w * 0.86, 2.85, 0.16, mats.interiorWindowStore, 0, 2.52, b.d * 0.5 + 0.04);
+    // Wraparound Floor-to-Ceiling Recessed Interior-Mapped Diner Glazing (flank wings when walk-in!)
+    if (walkIn && walkProf) {
+      const flankSpan = Math.max(1.2, b.w * 0.5 - walkProf.roomHalfW - 0.8);
+      const flankX = walkProf.roomHalfW + 0.4 + flankSpan * 0.5;
+      for (const side of [-1, 1]) {
+        batch.addBox(flankSpan, 2.85, 0.16, mats.interiorWindowStore, side * flankX, 2.25, b.d * 0.5 + 0.04);
+        batch.addBox(0.11, 2.96, 0.24, mats.brushedMetal, side * (walkProf.roomHalfW + 0.2), 2.25, b.d * 0.5 + 0.08);
+        batch.addBox(0.11, 2.96, 0.24, mats.brushedMetal, side * (b.w * 0.46), 2.25, b.d * 0.5 + 0.08);
+      }
+      batch.addBox(b.w * 0.9, 0.14, 0.24, mats.brushedMetal, 0, 3.74, b.d * 0.5 + 0.08);
+    } else {
+      batch.addBox(b.w * 0.86, 2.85, 0.16, mats.interiorWindowStore, 0, 2.52, b.d * 0.5 + 0.04);
+      const bays = Math.max(4, Math.round(b.w / 3.4));
+      for (let i = 0; i <= bays; i++) {
+        const mx = -b.w * 0.43 + (i / bays) * b.w * 0.86;
+        batch.addBox(0.11, 2.96, 0.24, mats.brushedMetal, mx, 2.52, b.d * 0.5 + 0.08);
+      }
+      batch.addBox(b.w * 0.88, 0.14, 0.24, mats.brushedMetal, 0, 3.96, b.d * 0.5 + 0.08);
+    }
     for (const side of [-1, 1]) {
       batch.addBox(0.16, 2.85, b.d * 0.46, mats.interiorWindowStore, side * (b.w * 0.5 + 0.04), 2.52, b.d * 0.22);
     }
-    // Crisp brushed aluminum diagonal/vertical diner mullions
-    const bays = Math.max(4, Math.round(b.w / 3.4));
-    for (let i = 0; i <= bays; i++) {
-      const mx = -b.w * 0.43 + (i / bays) * b.w * 0.86;
-      batch.addBox(0.11, 2.96, 0.24, mats.brushedMetal, mx, 2.52, b.d * 0.5 + 0.08);
-    }
-    batch.addBox(b.w * 0.88, 0.14, 0.24, mats.brushedMetal, 0, 3.96, b.d * 0.5 + 0.08);
 
     // Recessed warm soffit downlights under cantilevered roof overhang
     for (let l = -2; l <= 2; l++) {
@@ -747,11 +816,15 @@ function buildCommercialBatched(
     }
   } else if (isGarage) {
     // --- ARCHETYPE B: Industrial Roll-Up Garage / LS Customs / Ammu-Nation Bunker ---
-    batch.addBox(b.w + 0.34, 0.75, b.d + 0.34, mats.darkChrome, 0, 0.375, 0);
-    batch.addBox(b.w, b.h, b.d, wallMat, 0, b.h * 0.5, 0, {
-      castShadow: true,
-      uvMeters: 3.4,
-    });
+    if (walkIn && walkProf) {
+      addWalkInGroundShell(batch, b, wallMat, mats.darkChrome, 3.68);
+    } else {
+      batch.addBox(b.w + 0.34, 0.75, b.d + 0.34, mats.darkChrome, 0, 0.375, 0);
+      batch.addBox(b.w, b.h, b.d, wallMat, 0, b.h * 0.5, 0, {
+        castShadow: true,
+        uvMeters: 3.4,
+      });
+    }
 
     // Corrugated steel upper mechanical clerestory & heavy steel parapet coping
     batch.addBox(b.w + 0.58, 0.5, b.d + 0.58, mats.darkChrome, 0, b.h + 0.15, 0, { castShadow: true });
@@ -760,40 +833,53 @@ function buildCommercialBatched(
       uvMeters: 2.6,
     });
 
-    // Heavy structural steel I-beam pilasters dividing service bays
-    const bayCount = b.w >= 21 ? 3 : 2;
-    const serviceSpanW = b.w * 0.62;
-    const bayStartX = -b.w * 0.44;
-    const bayW = serviceSpanW / bayCount;
+    if (walkIn && walkProf) {
+      // Flank architectural industrial details on the solid side piers outside the central 9.6m doorway
+      const wingSpan = Math.max(1.2, b.w * 0.5 - walkProf.roomHalfW - 0.8);
+      const leftX = -(walkProf.roomHalfW + 0.4 + wingSpan * 0.5);
+      const rightX = walkProf.roomHalfW + 0.4 + wingSpan * 0.5;
 
-    for (let i = 0; i < bayCount; i++) {
-      const bx = bayStartX + (i + 0.5) * bayW;
-      // Heavy steel lintel header & dark jamb surround
-      batch.addBox(bayW - 0.35, 3.65, 0.24, mats.darkChrome, bx, 1.88, b.d * 0.5 + 0.04);
-      // Recessed corrugated galvanized steel roll-up garage door
-      batch.addBox(bayW - 0.65, 3.38, 0.18, mats.corrugatedMetal, bx, 1.76, b.d * 0.5 + 0.08, {
-        uvMeters: 2.2,
-      });
-      // Overhead steel I-beam canopy hood + caged industrial bay light
-      batch.addBox(bayW - 0.2, 0.32, 0.92, mats.darkChrome, bx, 3.88, b.d * 0.5 + 0.38, { castShadow: true });
-      batch.addBox(0.65, 0.16, 0.24, mats.warmLampGlow, bx, 3.66, b.d * 0.5 + 0.62);
+      batch.addBox(wingSpan, 3.4, 0.2, mats.corrugatedMetal, leftX, 1.85, b.d * 0.5 + 0.05, { uvMeters: 2.2 });
+      batch.addBox(wingSpan + 0.25, 0.28, 0.95, mats.darkChrome, leftX, 3.74, b.d * 0.5 + 0.42, { castShadow: true });
+
+      batch.addBox(wingSpan, 2.85, 0.16, mats.interiorWindowStore, rightX, 1.9, b.d * 0.5 + 0.05);
+      batch.addBox(wingSpan + 0.25, 0.24, 1.15, mats.darkChrome, rightX, 3.65, b.d * 0.5 + 0.52, { castShadow: true });
+
+      for (const bx of [-walkProf.roomHalfW - 0.18, walkProf.roomHalfW + 0.18]) {
+        batch.addBox(0.36, b.h, 0.34, mats.darkChrome, bx, b.h * 0.5, b.d * 0.5 + 0.09);
+        batch.addCylinder(0.11, 0.11, 1.05, 8, mats.brassTrim, bx, 0.54, b.d * 0.5 + 0.72);
+      }
+    } else {
+      // Heavy structural steel I-beam pilasters dividing service bays
+      const bayCount = b.w >= 21 ? 3 : 2;
+      const serviceSpanW = b.w * 0.62;
+      const bayStartX = -b.w * 0.44;
+      const bayW = serviceSpanW / bayCount;
+
+      for (let i = 0; i < bayCount; i++) {
+        const bx = bayStartX + (i + 0.5) * bayW;
+        batch.addBox(bayW - 0.35, 3.65, 0.24, mats.darkChrome, bx, 1.88, b.d * 0.5 + 0.04);
+        batch.addBox(bayW - 0.65, 3.38, 0.18, mats.corrugatedMetal, bx, 1.76, b.d * 0.5 + 0.08, {
+          uvMeters: 2.2,
+        });
+        batch.addBox(bayW - 0.2, 0.32, 0.92, mats.darkChrome, bx, 3.88, b.d * 0.5 + 0.38, { castShadow: true });
+        batch.addBox(0.65, 0.16, 0.24, mats.warmLampGlow, bx, 3.66, b.d * 0.5 + 0.62);
+      }
+
+      for (let i = 0; i <= bayCount; i++) {
+        const px = bayStartX + i * bayW;
+        batch.addBox(0.42, b.h, 0.34, mats.darkChrome, px, b.h * 0.5, b.d * 0.5 + 0.09);
+        batch.addCylinder(0.11, 0.11, 1.05, 8, mats.brassTrim, px, 0.54, b.d * 0.5 + 0.72);
+        batch.addCylinder(0.115, 0.115, 0.16, 8, mats.darkChrome, px, 1.05, b.d * 0.5 + 0.72);
+      }
+
+      const shopW = b.w * 0.28;
+      const shopX = b.w * 0.32;
+      batch.addBox(shopW, 2.85, 0.16, mats.interiorWindowStore, shopX, 1.9, b.d * 0.5 + 0.05);
+      batch.addBox(shopW + 0.28, 0.24, 1.45, mats.darkChrome, shopX, 3.55, b.d * 0.5 + 0.68, { castShadow: true });
+      batch.addBox(0.12, 2.95, 0.24, mats.darkChrome, shopX - shopW * 0.5, 1.9, b.d * 0.5 + 0.09);
+      batch.addBox(0.12, 2.95, 0.24, mats.darkChrome, shopX + shopW * 0.5, 1.9, b.d * 0.5 + 0.09);
     }
-
-    // Yellow-and-black painted steel crash bollards protecting every service bay pier!
-    for (let i = 0; i <= bayCount; i++) {
-      const px = bayStartX + i * bayW;
-      batch.addBox(0.42, b.h, 0.34, mats.darkChrome, px, b.h * 0.5, b.d * 0.5 + 0.09);
-      batch.addCylinder(0.11, 0.11, 1.05, 8, mats.brassTrim, px, 0.54, b.d * 0.5 + 0.72);
-      batch.addCylinder(0.115, 0.115, 0.16, 8, mats.darkChrome, px, 1.05, b.d * 0.5 + 0.72);
-    }
-
-    // Separate Glazed Customer Showroom / Counter Wing on the Right Side
-    const shopW = b.w * 0.28;
-    const shopX = b.w * 0.32;
-    batch.addBox(shopW, 2.85, 0.16, mats.interiorWindowStore, shopX, 1.9, b.d * 0.5 + 0.05);
-    batch.addBox(shopW + 0.28, 0.24, 1.45, mats.darkChrome, shopX, 3.55, b.d * 0.5 + 0.68, { castShadow: true });
-    batch.addBox(0.12, 2.95, 0.24, mats.darkChrome, shopX - shopW * 0.5, 1.9, b.d * 0.5 + 0.09);
-    batch.addBox(0.12, 2.95, 0.24, mats.darkChrome, shopX + shopW * 0.5, 1.9, b.d * 0.5 + 0.09);
 
     // Side industrial clerestory windows + external galvanized conduit pipes
     for (const side of [-1, 1]) {
@@ -817,13 +903,17 @@ function buildCommercialBatched(
     }
   } else if (isModernist) {
     // --- ARCHETYPE D: Rodeo / Coastal Modernist Boutique (Timber Brise-Soleil & Glass Showroom) ---
-    batch.addBox(b.w + 0.28, 0.55, b.d + 0.28, mats.stoneMasonry, 0, 0.275, 0, { uvMeters: 2.6 });
-    batch.addBox(b.w, b.h, b.d, wallMat, 0, b.h * 0.5, 0, {
-      castShadow: true,
-      uvMeters: 3.4,
-    });
+    if (walkIn && walkProf) {
+      addWalkInGroundShell(batch, b, wallMat, mats.stoneMasonry, 3.68);
+    } else {
+      batch.addBox(b.w + 0.28, 0.55, b.d + 0.28, mats.stoneMasonry, 0, 0.275, 0, { uvMeters: 2.6 });
+      batch.addBox(b.w, b.h, b.d, wallMat, 0, b.h * 0.5, 0, {
+        castShadow: true,
+        uvMeters: 3.4,
+      });
+    }
 
-    // Dramatic travertine stone vertical feature fin framing the entrance asymmetrically
+    // Dramatic travertine stone vertical feature fin framing the entrance asymmetrically (at -6.8m, clear of doorway!)
     const finX = -b.w * 0.34;
     batch.addBox(2.35, b.h + 1.35, 1.25, mats.mazeBankMarble, finX, (b.h + 1.35) * 0.5, b.d * 0.5 + 0.32, {
       castShadow: true,
@@ -841,13 +931,21 @@ function buildCommercialBatched(
       batch.addBox(0.14, 0.32, 2.42, mats.woodPorch, sx, canY + 0.14, b.d * 0.5 + 1.18);
     }
 
-    // Double-height frameless boutique showroom glass wrapping right corner!
-    batch.addBox(b.w * 0.72, 3.45, 0.16, mats.interiorWindowStore, b.w * 0.1, 2.05, b.d * 0.5 + 0.04);
-    batch.addBox(0.16, 3.45, b.d * 0.52, mats.interiorWindowStore, b.w * 0.5 + 0.04, 2.05, b.d * 0.18);
-    for (let m = 0; m <= 4; m++) {
-      const mx = -b.w * 0.25 + (m / 4) * b.w * 0.7;
-      batch.addBox(0.09, 3.55, 0.24, mats.darkChrome, mx, 2.05, b.d * 0.5 + 0.08);
+    if (walkIn && walkProf) {
+      // Right-wing showroom glass window clear of the central walk-in glass storefront
+      const flankSpan = Math.max(1.2, b.w * 0.5 - walkProf.roomHalfW - 0.8);
+      const rightX = walkProf.roomHalfW + 0.4 + flankSpan * 0.5;
+      batch.addBox(flankSpan, 3.2, 0.16, mats.interiorWindowStore, rightX, 1.95, b.d * 0.5 + 0.04);
+      batch.addBox(0.1, 3.3, 0.24, mats.darkChrome, walkProf.roomHalfW + 0.18, 1.95, b.d * 0.5 + 0.08);
+      batch.addBox(0.1, 3.3, 0.24, mats.darkChrome, b.w * 0.46, 1.95, b.d * 0.5 + 0.08);
+    } else {
+      batch.addBox(b.w * 0.72, 3.45, 0.16, mats.interiorWindowStore, b.w * 0.1, 2.05, b.d * 0.5 + 0.04);
+      for (let m = 0; m <= 4; m++) {
+        const mx = -b.w * 0.25 + (m / 4) * b.w * 0.7;
+        batch.addBox(0.09, 3.55, 0.24, mats.darkChrome, mx, 2.05, b.d * 0.5 + 0.08);
+      }
     }
+    batch.addBox(0.16, 3.45, b.d * 0.52, mats.interiorWindowStore, b.w * 0.5 + 0.04, 2.05, b.d * 0.18);
 
     // Upper ribbon window with cantilevered brushed-steel sun-shade louver
     if (b.h >= 7.2) {
@@ -869,11 +967,15 @@ function buildCommercialBatched(
     }
   } else {
     // --- ARCHETYPE C: Historic Los Santos Brick Main-Street Corner Block (24/7, Binco, Ganton Gym) ---
-    batch.addBox(b.w + 0.36, 0.68, b.d + 0.36, mats.stoneMasonry, 0, 0.34, 0, { uvMeters: 2.2 });
-    batch.addBox(b.w, b.h, b.d, wallMat, 0, b.h * 0.5, 0, {
-      castShadow: true,
-      uvMeters: 3.2,
-    });
+    if (walkIn && walkProf) {
+      addWalkInGroundShell(batch, b, wallMat, mats.stoneMasonry, 3.68);
+    } else {
+      batch.addBox(b.w + 0.36, 0.68, b.d + 0.36, mats.stoneMasonry, 0, 0.34, 0, { uvMeters: 2.2 });
+      batch.addBox(b.w, b.h, b.d, wallMat, 0, b.h * 0.5, 0, {
+        castShadow: true,
+        uvMeters: 3.2,
+      });
+    }
 
     // Ornamental stepped cornice + dentil molding + raised central historic parapet pediment!
     batch.addBox(b.w + 0.78, 0.44, b.d + 0.78, mats.trimPaintWhite, 0, b.h - 0.08, 0, { castShadow: true });
@@ -882,12 +984,20 @@ function buildCommercialBatched(
     batch.addBox(b.w * 0.5, 0.22, 0.66, mats.trimPaintWhite, 0, b.h + 1.84, b.d * 0.5 + 0.05);
 
     // Brick pilasters with carved limestone capitals along front facade
-    const pilCount = Math.max(4, Math.round(b.w / 4.8));
-    for (let i = 0; i < pilCount; i++) {
-      const px = -b.w * 0.48 + (i / (pilCount - 1)) * b.w * 0.96;
-      batch.addBox(0.52, b.h, 0.34, wallMat, px, b.h * 0.5, b.d * 0.5 + 0.1, { uvMeters: 3.0 });
-      batch.addBox(0.68, 0.34, 0.46, mats.trimPaintWhite, px, b.h - 0.35, b.d * 0.5 + 0.14);
-      batch.addBox(0.62, 0.28, 0.42, mats.trimPaintWhite, px, 3.85, b.d * 0.5 + 0.12);
+    if (walkIn && walkProf) {
+      for (const px of [-b.w * 0.46, -walkProf.roomHalfW - 0.22, walkProf.roomHalfW + 0.22, b.w * 0.46]) {
+        batch.addBox(0.52, b.h, 0.34, wallMat, px, b.h * 0.5, b.d * 0.5 + 0.1, { uvMeters: 3.0 });
+        batch.addBox(0.68, 0.34, 0.46, mats.trimPaintWhite, px, b.h - 0.35, b.d * 0.5 + 0.14);
+        batch.addBox(0.62, 0.28, 0.42, mats.trimPaintWhite, px, 3.85, b.d * 0.5 + 0.12);
+      }
+    } else {
+      const pilCount = Math.max(4, Math.round(b.w / 4.8));
+      for (let i = 0; i < pilCount; i++) {
+        const px = -b.w * 0.48 + (i / (pilCount - 1)) * b.w * 0.96;
+        batch.addBox(0.52, b.h, 0.34, wallMat, px, b.h * 0.5, b.d * 0.5 + 0.1, { uvMeters: 3.0 });
+        batch.addBox(0.68, 0.34, 0.46, mats.trimPaintWhite, px, b.h - 0.35, b.d * 0.5 + 0.14);
+        batch.addBox(0.62, 0.28, 0.42, mats.trimPaintWhite, px, 3.85, b.d * 0.5 + 0.12);
+      }
     }
 
     // Color-matched Sloped Fabric Awning with Side Gussets & Angled Steel Tension Rods
@@ -895,22 +1005,30 @@ function buildCommercialBatched(
       rotX: 0.22,
       castShadow: true,
     });
-    // Vertical scalloped valance apron along front edge of awning
     batch.addBox(b.w * 0.88, 0.36, 0.08, awningMat, 0, 3.36, b.d * 0.5 + 1.98);
     for (const rx of [-b.w * 0.38, 0, b.w * 0.38]) {
       batch.addCylinder(0.032, 0.032, 2.15, 6, mats.darkChrome, rx, 4.22, b.d * 0.5 + 0.9, { rotX: 0.95 });
     }
 
-    // Recessed Interior-Mapped Glass Storefront + Aluminum Mullions + Transom Grid
-    batch.addBox(b.w * 0.82, 2.68, 0.16, mats.interiorWindowStore, 0, 1.92, b.d * 0.5 + 0.04);
-    const mullCount = Math.max(4, Math.round(b.w / 3.2));
-    for (let m = 0; m <= mullCount; m++) {
-      const mx = -b.w * 0.41 + (m / mullCount) * b.w * 0.82;
-      batch.addBox(0.11, 2.78, 0.24, mats.darkChrome, mx, 1.92, b.d * 0.5 + 0.08);
+    // Recessed Interior-Mapped Glass Storefront (flank wings only when walk-in!)
+    if (walkIn && walkProf) {
+      const flankSpan = Math.max(1.2, b.w * 0.5 - walkProf.roomHalfW - 0.85);
+      const flankX = walkProf.roomHalfW + 0.45 + flankSpan * 0.5;
+      for (const side of [-1, 1]) {
+        batch.addBox(flankSpan, 2.68, 0.16, mats.interiorWindowStore, side * flankX, 1.92, b.d * 0.5 + 0.04);
+        batch.addBox(flankSpan + 0.1, 0.14, 0.24, mats.darkChrome, side * flankX, 3.28, b.d * 0.5 + 0.08);
+      }
+    } else {
+      batch.addBox(b.w * 0.82, 2.68, 0.16, mats.interiorWindowStore, 0, 1.92, b.d * 0.5 + 0.04);
+      const mullCount = Math.max(4, Math.round(b.w / 3.2));
+      for (let m = 0; m <= mullCount; m++) {
+        const mx = -b.w * 0.41 + (m / mullCount) * b.w * 0.82;
+        batch.addBox(0.11, 2.78, 0.24, mats.darkChrome, mx, 1.92, b.d * 0.5 + 0.08);
+      }
+      batch.addBox(b.w * 0.84, 0.14, 0.24, mats.darkChrome, 0, 3.28, b.d * 0.5 + 0.08);
     }
-    batch.addBox(b.w * 0.84, 0.14, 0.24, mats.darkChrome, 0, 3.28, b.d * 0.5 + 0.08);
 
-    // Side display & upper office windows (breaks up side elevations completely!)
+    // Side display & upper office windows
     for (const side of [-1, 1]) {
       addFramedWindow(batch, mats, {
         x: side * b.w * 0.5, y: 2.15, z: b.d * 0.22, rotY: side * Math.PI * 0.5,
@@ -949,7 +1067,6 @@ function buildCommercialBatched(
       const signMat = mats.createSignMaterial(b.signText, b.signColor ?? '#ff9933');
       batch.addDirectMesh(new THREE.BoxGeometry(signW, 1.98, 0.44), signMat, 0, signY, b.d * 0.5 + 0.26);
 
-      // Projecting corner vertical neon blade sign on twin steel brackets
       const bladeX = b.w * 0.46;
       const bladeZ = b.d * 0.5 + 0.95;
       const bladeY = Math.min(b.h - 0.4, 5.6);

@@ -1,5 +1,11 @@
 import * as THREE from 'three';
 import type { VehicleSpec } from '../types';
+import {
+  downsampleParametricGrid,
+  mergeGeometryEntries,
+  type GeometryMergeEntry,
+  type ParametricGridMeta,
+} from './geometryFusion';
 
 /**
  * ============================================================================
@@ -173,6 +179,7 @@ export function buildParametricSurface(
   }
   normals.needsUpdate = true;
   geo.userData.shared = true;
+  geo.userData.grid = { uSegs, vSegs, flipWinding } satisfies ParametricGridMeta;
   return geo;
 }
 
@@ -429,6 +436,14 @@ function mirrorGeometryX(sourceGeo: THREE.BufferGeometry): THREE.BufferGeometry 
     geo.computeVertexNormals();
   }
   geo.userData.shared = true;
+  const srcGrid = sourceGeo.userData?.grid as ParametricGridMeta | undefined;
+  if (srcGrid) {
+    geo.userData.grid = {
+      uSegs: srcGrid.uSegs,
+      vSegs: srcGrid.vSegs,
+      flipWinding: !srcGrid.flipWinding,
+    } satisfies ParametricGridMeta;
+  }
   return geo;
 }
 
@@ -498,6 +513,7 @@ interface HypercarProceduralTextures {
   goldFoilBump: THREE.CanvasTexture;
   clusterMap: THREE.CanvasTexture;
   shadowMap: THREE.CanvasTexture;
+  headlightBeamTex: THREE.CanvasTexture;
 }
 
 interface HypercarSharedMaterials {
@@ -1071,6 +1087,36 @@ function createHypercarTextures(anisotropy = 8): HypercarProceduralTextures {
 
   const shadowMap = new THREE.CanvasTexture(shC);
 
+  const beamC = document.createElement('canvas');
+  beamC.width = beamC.height = 256;
+  const beamCtx = beamC.getContext('2d')!;
+  const beamImg = beamCtx.createImageData(256, 256);
+  const ss = (e0: number, e1: number, x: number) => {
+    const t = clamp((x - e0) / (e1 - e0), 0, 1);
+    return t * t * (3 - 2 * t);
+  };
+  for (let py = 0; py < 256; py++) {
+    const v = py / 255; // 0 = near bumper, 1 = far ahead
+    const longFade = Math.pow(Math.max(0, 1 - v), 1.45) * ss(0.0, 0.14, v);
+    const halfSpread = 0.09 + v * 0.34;
+    for (let px = 0; px < 256; px++) {
+      const u = px / 255;
+      const beamL = Math.exp(-Math.pow((u - (0.37 - v * 0.08)) / halfSpread, 2) * 2.6);
+      const beamR = Math.exp(-Math.pow((u - (0.63 + v * 0.08)) / halfSpread, 2) * 2.6);
+      const sideEdge = ss(0.0, 0.16, u) * ss(1.0, 0.84, u);
+      const val = clamp((beamL + beamR) * longFade * sideEdge * 0.82, 0, 1);
+      const cVal = Math.round(val * 255);
+      const idx = (py * 256 + px) * 4;
+      beamImg.data[idx] = cVal;
+      beamImg.data[idx + 1] = Math.round(cVal * 0.97);
+      beamImg.data[idx + 2] = Math.round(cVal * 0.91);
+      beamImg.data[idx + 3] = 255;
+    }
+  }
+  beamCtx.putImageData(beamImg, 0, 0);
+  const headlightBeamTex = new THREE.CanvasTexture(beamC);
+  headlightBeamTex.colorSpace = THREE.SRGBColorSpace;
+
   return {
     flakeNormal,
     flakeRough,
@@ -1089,6 +1135,7 @@ function createHypercarTextures(anisotropy = 8): HypercarProceduralTextures {
     goldFoilBump,
     clusterMap,
     shadowMap,
+    headlightBeamTex,
   };
 }
 
@@ -1585,7 +1632,7 @@ function createFrontSurfaceEvaluator() {
 // MASTER GEOMETRY CACHE & BLUEPRINT TEMPLATES
 // ============================================================================
 
-type MatSlot =
+export type MatSlot =
   | 'paint'
   | 'doorPaint'
   | 'ledWhite'
@@ -1595,7 +1642,7 @@ type MatSlot =
   | 'sirenBlue'
   | keyof HypercarSharedMaterials;
 
-interface MeshTemplate {
+export interface MeshTemplate {
   geo: THREE.BufferGeometry;
   mat: MatSlot;
   castShadow?: boolean;
@@ -1603,6 +1650,167 @@ interface MeshTemplate {
   renderOrder?: number;
   position?: [number, number, number];
   rotation?: [number, number, number];
+}
+
+const EXTERIOR_SHADOW_SLOTS = new Set<MatSlot>([
+  'paint',
+  'doorPaint',
+  'carbon',
+  'matteCarbon',
+  'voidBlack',
+  'tire',
+  'sirenRed',
+  'sirenBlue',
+]);
+
+// Exterior-only material slots visible on a closed hypercar beyond 20m (drops occluded cabin/engine/luggage detail)
+const LOD1_EXTERIOR_BODY_SLOTS = new Set<MatSlot>([
+  'paint',
+  'doorPaint',
+  'carbon',
+  'matteCarbon',
+  'voidBlack',
+  'glass',
+  'ledWhite',
+  'ledRed',
+  'titanium',
+]);
+
+// Ultra-light distant exterior slots beyond 52m (~6-7 draw calls & ~3K tris including fused tires)
+const LOD2_EXTERIOR_BODY_SLOTS = new Set<MatSlot>([
+  'paint',
+  'doorPaint',
+  'glass',
+  'voidBlack',
+  'ledWhite',
+  'ledRed',
+]);
+
+const LOD1_EXTERIOR_WHEEL_SLOTS = new Set<MatSlot>(['tire', 'wheelAlloy']);
+const LOD2_EXTERIOR_WHEEL_SLOTS = new Set<MatSlot>(['tire']);
+
+function buildDownsampledLodTemplates(
+  sourceTemplates: readonly MeshTemplate[],
+  allowedSlots: ReadonlySet<MatSlot>,
+  stride: number,
+  outGeos: THREE.BufferGeometry[],
+  allowPaintShadow = true,
+): MeshTemplate[] {
+  const downsampled: MeshTemplate[] = [];
+  const tempGeos: THREE.BufferGeometry[] = [];
+  for (let i = 0; i < sourceTemplates.length; i++) {
+    const t = sourceTemplates[i];
+    if (!allowedSlots.has(t.mat)) continue;
+    const dsGeo = downsampleParametricGrid(t.geo, stride);
+    tempGeos.push(dsGeo);
+    downsampled.push({
+      ...t,
+      geo: dsGeo,
+      castShadow: allowPaintShadow && (t.mat === 'paint' || t.mat === 'doorPaint'),
+      receiveShadow: false,
+    });
+  }
+  const merged = mergeMeshTemplatesByMaterial(downsampled, outGeos, true);
+  const kept = new Set(outGeos);
+  for (let i = 0; i < tempGeos.length; i++) {
+    if (!kept.has(tempGeos[i])) {
+      tempGeos[i].dispose();
+    }
+  }
+  return merged;
+}
+
+const _tmplPos = new THREE.Vector3();
+const _tmplEuler = new THREE.Euler();
+const _tmplQuat = new THREE.Quaternion();
+const _tmplScale = new THREE.Vector3(1, 1, 1);
+
+/**
+ * Fuses rigid sub-assembly MeshTemplates by `(mat, castShadow, receiveShadow, renderOrder)`
+ * into single indexed BufferGeometries, collapsing ~250+ sub-meshes per hypercar down to
+ * ~25 draw calls with zero visual or geometric loss.
+ */
+export function mergeMeshTemplatesByMaterial(
+  templates: readonly MeshTemplate[],
+  outGeos?: THREE.BufferGeometry[],
+  restrictShadowSlots = true,
+): MeshTemplate[] {
+  if (templates.length <= 1) {
+    return templates.map((t) => {
+      const effCast = restrictShadowSlots
+        ? Boolean(t.castShadow) && EXTERIOR_SHADOW_SLOTS.has(t.mat)
+        : Boolean(t.castShadow);
+      outGeos?.push(t.geo);
+      return { ...t, castShadow: effCast };
+    });
+  }
+
+  interface Bucket {
+    mat: MatSlot;
+    castShadow: boolean;
+    receiveShadow: boolean;
+    renderOrder: number;
+    items: MeshTemplate[];
+  }
+
+  const buckets = new Map<string, Bucket>();
+  for (let i = 0; i < templates.length; i++) {
+    const t = templates[i];
+    const effCast = restrictShadowSlots
+      ? Boolean(t.castShadow) && EXTERIOR_SHADOW_SLOTS.has(t.mat)
+      : Boolean(t.castShadow);
+    const recv = Boolean(t.receiveShadow);
+    const ro = t.renderOrder ?? 0;
+    const key = `${t.mat}|${effCast ? 1 : 0}|${recv ? 1 : 0}|${ro}`;
+    let bucket = buckets.get(key);
+    if (!bucket) {
+      bucket = { mat: t.mat, castShadow: effCast, receiveShadow: recv, renderOrder: ro, items: [] };
+      buckets.set(key, bucket);
+    }
+    bucket.items.push(t);
+  }
+
+  const fused: MeshTemplate[] = [];
+  for (const bucket of buckets.values()) {
+    if (bucket.items.length === 1 && !bucket.items[0].position && !bucket.items[0].rotation) {
+      const only = bucket.items[0];
+      outGeos?.push(only.geo);
+      fused.push({
+        geo: only.geo,
+        mat: bucket.mat,
+        castShadow: bucket.castShadow,
+        receiveShadow: bucket.receiveShadow,
+        renderOrder: bucket.renderOrder || undefined,
+      });
+      continue;
+    }
+
+    const entries: GeometryMergeEntry[] = new Array(bucket.items.length);
+    for (let i = 0; i < bucket.items.length; i++) {
+      const it = bucket.items[i];
+      if (it.position || it.rotation) {
+        _tmplPos.set(it.position?.[0] ?? 0, it.position?.[1] ?? 0, it.position?.[2] ?? 0);
+        _tmplEuler.set(it.rotation?.[0] ?? 0, it.rotation?.[1] ?? 0, it.rotation?.[2] ?? 0);
+        _tmplQuat.setFromEuler(_tmplEuler);
+        const m = new THREE.Matrix4().compose(_tmplPos, _tmplQuat, _tmplScale);
+        entries[i] = { geo: it.geo, matrix: m };
+      } else {
+        entries[i] = { geo: it.geo };
+      }
+    }
+
+    const mergedGeo = mergeGeometryEntries(entries, { markShared: true });
+    outGeos?.push(mergedGeo);
+    fused.push({
+      geo: mergedGeo,
+      mat: bucket.mat,
+      castShadow: bucket.castShadow,
+      receiveShadow: bucket.receiveShadow,
+      renderOrder: bucket.renderOrder || undefined,
+    });
+  }
+
+  return fused;
 }
 
 interface WheelCornerTemplates {
@@ -1620,6 +1828,7 @@ interface MasterHypercarAssets {
   textures: HypercarProceduralTextures;
   materials: HypercarSharedMaterials;
   staticBodyMeshes: MeshTemplate[];
+  frunkBayMeshes: MeshTemplate[];
   policeRoofBarMeshes: MeshTemplate[];
   frunkLidMeshes: MeshTemplate[];
   frunkHingePos: [number, number, number];
@@ -1646,9 +1855,20 @@ interface MasterHypercarAssets {
     rearLeft: WheelCornerTemplates;
     rearRight: WheelCornerTemplates;
   };
+  lod1BodyMeshes: MeshTemplate[];
+  lod1PoliceRoofBarMeshes: MeshTemplate[];
+  lod1Wheels: {
+    frontLeft: MeshTemplate[];
+    frontRight: MeshTemplate[];
+    rearLeft: MeshTemplate[];
+    rearRight: MeshTemplate[];
+  };
+  lod2BodyMeshes: MeshTemplate[];
+  lod2PoliceRoofBarMeshes: MeshTemplate[];
   contactShadowGeo: THREE.BufferGeometry;
   headlightBeamGeo: THREE.PlaneGeometry;
   nitroFlameGeo: THREE.ConeGeometry;
+  nitroFlameMat: THREE.MeshBasicMaterial;
   allGeometries: THREE.BufferGeometry[];
 }
 
@@ -1728,6 +1948,29 @@ function buildMasterHypercarAssets(anisotropy = 8): MasterHypercarAssets {
   ) => {
     trackGeo(geo);
     staticBodyMeshes.push({
+      geo,
+      mat,
+      castShadow,
+      receiveShadow,
+      renderOrder,
+      position,
+      rotation,
+    });
+  };
+
+  // Opaque-occluded front trunk bay + Weekender bag templates (hidden automatically when frunk lid is closed)
+  const frunkBayMeshes: MeshTemplate[] = [];
+  const addFrunkBay = (
+    geo: THREE.BufferGeometry,
+    mat: MatSlot,
+    castShadow = false,
+    receiveShadow = true,
+    renderOrder = 0,
+    position?: [number, number, number],
+    rotation?: [number, number, number],
+  ) => {
+    trackGeo(geo);
+    frunkBayMeshes.push({
       geo,
       mat,
       castShadow,
@@ -2063,7 +2306,7 @@ function buildMasterHypercarAssets(anisotropy = 8): MasterHypercarAssets {
       };
     }),
   );
-  frunkLidMeshes.push({ geo: sdVaneGeo, mat: 'carbon', castShadow: true, receiveShadow: true });
+  frunkLidMeshes.push({ geo: sdVaneGeo, mat: 'carbon', castShadow: false, receiveShadow: true });
 
   const frunkLidAnchorLPos: [number, number, number] = [
     0.41,
@@ -2076,7 +2319,7 @@ function buildMasterHypercarAssets(anisotropy = 8): MasterHypercarAssets {
     1.24,
   ];
 
-  // Frunk Luggage Compartment + Weekender Duffel Bag
+  // Frunk Luggage Compartment + Weekender Duffel Bag (hidden when frunk lid is closed)
   const tubWallGeo = buildParametricSurface(
     24,
     14,
@@ -2097,7 +2340,7 @@ function buildMasterHypercarAssets(anisotropy = 8): MasterHypercarAssets {
     },
     { closedU: true, worldUV: true, flipWinding: true },
   );
-  addStatic(tubWallGeo, 'carbon', false, true);
+  addFrunkBay(tubWallGeo, 'carbon', false, true);
 
   const bayFloorGeo = buildParametricSurface(
     14,
@@ -2111,7 +2354,7 @@ function buildMasterHypercarAssets(anisotropy = 8): MasterHypercarAssets {
     },
     { flipWinding: false },
   );
-  addStatic(bayFloorGeo, 'alcantara', false, true);
+  addFrunkBay(bayFloorGeo, 'alcantara', false, true);
 
   const stitchPts: [number, number, number][] = [];
   for (let i = 0; i < 24; i++) {
@@ -2122,7 +2365,7 @@ function buildMasterHypercarAssets(anisotropy = 8): MasterHypercarAssets {
     const halfW = lerp(0.34, 0.26, smoothstep(1.08, 1.78, z));
     stitchPts.push([sx * halfW, 0.249, z]);
   }
-  addStatic(
+  addFrunkBay(
     buildVariableTube(stitchPts, 0.0028, 32, 8, { closed: true }),
     'seatTrimRed',
     false,
@@ -2155,11 +2398,11 @@ function buildMasterHypercarAssets(anisotropy = 8): MasterHypercarAssets {
     ),
   );
   [-1, 1].forEach((side) => {
-    addStatic(strutCapGeo, 'machinedAlu', false, false, 0, [side * 0.42, 0.56, 1.38]);
-    addStatic(strutNutGeo, 'anodizedRed', false, false, 0, [side * 0.42, 0.56, 1.38]);
+    addFrunkBay(strutCapGeo, 'machinedAlu', false, false, 0, [side * 0.42, 0.56, 1.38]);
+    addFrunkBay(strutNutGeo, 'anodizedRed', false, false, 0, [side * 0.42, 0.56, 1.38]);
   });
 
-  addStatic(
+  addFrunkBay(
     buildVariableTube(
       [
         [-0.44, 0.595, 1.05],
@@ -2200,10 +2443,10 @@ function buildMasterHypercarAssets(anisotropy = 8): MasterHypercarAssets {
     }
     duffelStations.push(pts);
   }
-  addStatic(
+  addFrunkBay(
     buildSplineLoft(duffelStations, 24, 18, { closedV: true, worldUV: true }),
     'alcantara',
-    true,
+    false,
     true,
   );
 
@@ -2219,7 +2462,7 @@ function buildMasterHypercarAssets(anisotropy = 8): MasterHypercarAssets {
         1.48 + cz * 0.146 * (1.0 - 0.14 * Math.max(0, sy)),
       ]);
     }
-    addStatic(
+    addFrunkBay(
       buildVariableTube(strapPts, [0.014, 0.0045], 24, 8, {
         closed: true,
         worldUV: true,
@@ -2230,7 +2473,7 @@ function buildMasterHypercarAssets(anisotropy = 8): MasterHypercarAssets {
     );
   });
 
-  addStatic(
+  addFrunkBay(
     buildVariableTube(
       [
         [-0.2, 0.416, 1.48],
@@ -2247,7 +2490,7 @@ function buildMasterHypercarAssets(anisotropy = 8): MasterHypercarAssets {
   );
 
   [-1, 1].forEach((side) => {
-    addStatic(
+    addFrunkBay(
       buildVariableTube(
         [
           [-0.1, 0.405, 1.48 + side * 0.055],
@@ -2266,7 +2509,7 @@ function buildMasterHypercarAssets(anisotropy = 8): MasterHypercarAssets {
     );
   });
 
-  addStatic(
+  addFrunkBay(
     buildVariableTube(
       [
         [-0.22, 0.565, 1.07],
@@ -4328,7 +4571,7 @@ function buildMasterHypercarAssets(anisotropy = 8): MasterHypercarAssets {
     knuckleMeshes.push({
       geo: calGeo,
       mat: 'caliperGold',
-      castShadow: true,
+      castShadow: false,
       receiveShadow: false,
     });
 
@@ -4399,20 +4642,163 @@ function buildMasterHypercarAssets(anisotropy = 8): MasterHypercarAssets {
   const nitroFlameGeo = trackGeo(new THREE.ConeGeometry(0.085, 0.88, 8));
   nitroFlameGeo.rotateX(-Math.PI * 0.5);
 
+  // Build shared Class-A Parametric LOD1 (>20m) & LOD2 (>52m) templates BEFORE disposing raw grids!
+  // LOD1: ~15 draw calls & ~16K tris with spinning wheels.
+  // LOD2: ~7 draw calls & ~3-4K tris with all 4 tires statically fused into the body.
+  const retainedGeos: THREE.BufferGeometry[] = [];
+  const closedExteriorSource = [
+    ...staticBodyMeshes,
+    ...frunkLidMeshes,
+    ...doorLMeshes,
+    ...doorRMeshes,
+  ];
+  const lod1BodyMeshes = buildDownsampledLodTemplates(
+    closedExteriorSource,
+    LOD1_EXTERIOR_BODY_SLOTS,
+    3,
+    retainedGeos,
+    true,
+  );
+  const lod1PoliceRoofBarMeshes = buildDownsampledLodTemplates(
+    policeRoofBarMeshes,
+    new Set<MatSlot>(['sirenRed', 'sirenBlue', 'carbon', 'matteCarbon']),
+    2,
+    retainedGeos,
+    false,
+  );
+  const lod1Wheels = {
+    frontLeft: buildDownsampledLodTemplates(
+      wheels.frontLeft.spinMeshes,
+      LOD1_EXTERIOR_WHEEL_SLOTS,
+      3,
+      retainedGeos,
+      false,
+    ),
+    frontRight: buildDownsampledLodTemplates(
+      wheels.frontRight.spinMeshes,
+      LOD1_EXTERIOR_WHEEL_SLOTS,
+      3,
+      retainedGeos,
+      false,
+    ),
+    rearLeft: buildDownsampledLodTemplates(
+      wheels.rearLeft.spinMeshes,
+      LOD1_EXTERIOR_WHEEL_SLOTS,
+      3,
+      retainedGeos,
+      false,
+    ),
+    rearRight: buildDownsampledLodTemplates(
+      wheels.rearRight.spinMeshes,
+      LOD1_EXTERIOR_WHEEL_SLOTS,
+      3,
+      retainedGeos,
+      false,
+    ),
+  };
+
+  // LOD2: stride-6 exterior hull + all 4 stride-6 tires placed at wheel corners and fused by material
+  const lod2TireTemplates: MeshTemplate[] = [];
+  const pushLod2Corner = (
+    spinMeshes: readonly MeshTemplate[],
+    pos: [number, number, number],
+  ) => {
+    for (let i = 0; i < spinMeshes.length; i++) {
+      const t = spinMeshes[i];
+      if (!LOD2_EXTERIOR_WHEEL_SLOTS.has(t.mat)) continue;
+      lod2TireTemplates.push({
+        ...t,
+        position: pos,
+        castShadow: false,
+        receiveShadow: false,
+      });
+    }
+  };
+  pushLod2Corner(wheels.frontLeft.spinMeshes, [HYPERCAR_SPEC.fTrack, HYPERCAR_SPEC.fR, HYPERCAR_SPEC.fZ]);
+  pushLod2Corner(wheels.frontRight.spinMeshes, [-HYPERCAR_SPEC.fTrack, HYPERCAR_SPEC.fR, HYPERCAR_SPEC.fZ]);
+  pushLod2Corner(wheels.rearLeft.spinMeshes, [HYPERCAR_SPEC.rTrack, HYPERCAR_SPEC.rR, HYPERCAR_SPEC.rZ]);
+  pushLod2Corner(wheels.rearRight.spinMeshes, [-HYPERCAR_SPEC.rTrack, HYPERCAR_SPEC.rR, HYPERCAR_SPEC.rZ]);
+
+  const lod2BodyMeshes = buildDownsampledLodTemplates(
+    [...closedExteriorSource, ...lod2TireTemplates],
+    new Set<MatSlot>([...LOD2_EXTERIOR_BODY_SLOTS, ...LOD2_EXTERIOR_WHEEL_SLOTS]),
+    6,
+    retainedGeos,
+    false,
+  );
+  const lod2PoliceRoofBarMeshes = buildDownsampledLodTemplates(
+    policeRoofBarMeshes,
+    new Set<MatSlot>(['sirenRed', 'sirenBlue']),
+    3,
+    retainedGeos,
+    false,
+  );
+
+  // Fuse every rigid LOD0 sub-assembly by material to collapse sub-meshes into minimal draw calls
+  // and dispose all intermediate unmerged source geometries to free ~220 GPU buffers.
+  const fusedStaticBodyMeshes = mergeMeshTemplatesByMaterial(staticBodyMeshes, retainedGeos);
+  const fusedFrunkBayMeshes = mergeMeshTemplatesByMaterial(frunkBayMeshes, retainedGeos);
+  const fusedPoliceRoofBarMeshes = mergeMeshTemplatesByMaterial(policeRoofBarMeshes, retainedGeos);
+  const fusedFrunkLidMeshes = mergeMeshTemplatesByMaterial(frunkLidMeshes, retainedGeos);
+  const fusedDoorLMeshes = mergeMeshTemplatesByMaterial(doorLMeshes, retainedGeos);
+  const fusedDoorRMeshes = mergeMeshTemplatesByMaterial(doorRMeshes, retainedGeos);
+  const fusedSteeringWheelMeshes = mergeMeshTemplatesByMaterial(steeringWheelMeshes, retainedGeos);
+
+  const fuseCorner = (corner: WheelCornerTemplates): WheelCornerTemplates => ({
+    spinMeshes: mergeMeshTemplatesByMaterial(corner.spinMeshes, retainedGeos),
+    knuckleMeshes: mergeMeshTemplatesByMaterial(corner.knuckleMeshes, retainedGeos),
+  });
+  const fusedWheels = {
+    frontLeft: fuseCorner(wheels.frontLeft),
+    frontRight: fuseCorner(wheels.frontRight),
+    rearLeft: fuseCorner(wheels.rearLeft),
+    rearRight: fuseCorner(wheels.rearRight),
+  };
+
+  retainedGeos.push(
+    frunkStrutGeos.cylGeo,
+    frunkStrutGeos.collarGeo,
+    frunkStrutGeos.rodGeo,
+    doorStrutGeos.cylGeo,
+    doorStrutGeos.collarGeo,
+    doorStrutGeos.rodGeo,
+    contactShadowGeo,
+    headlightBeamGeo,
+    nitroFlameGeo,
+  );
+  const retainedSet = new Set(retainedGeos);
+  for (let i = 0; i < allGeometries.length; i++) {
+    const g = allGeometries[i];
+    if (!retainedSet.has(g)) {
+      g.dispose();
+    }
+  }
+  const finalGeometries = Array.from(retainedSet);
+
+  const nitroFlameMat = new THREE.MeshBasicMaterial({
+    color: 0x45baff,
+    transparent: true,
+    opacity: 0.88,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+  });
+  nitroFlameMat.userData.shared = true;
+
   masterHypercarCache = {
     textures,
     materials,
-    staticBodyMeshes,
-    policeRoofBarMeshes,
-    frunkLidMeshes,
+    staticBodyMeshes: fusedStaticBodyMeshes,
+    frunkBayMeshes: fusedFrunkBayMeshes,
+    policeRoofBarMeshes: fusedPoliceRoofBarMeshes,
+    frunkLidMeshes: fusedFrunkLidMeshes,
     frunkHingePos,
     frunkLidAnchorLPos,
     frunkLidAnchorRPos,
     frunkChassisAnchorLPos,
     frunkChassisAnchorRPos,
     frunkStrutGeos,
-    doorLMeshes,
-    doorRMeshes,
+    doorLMeshes: fusedDoorLMeshes,
+    doorRMeshes: fusedDoorRMeshes,
     doorLPivotPos,
     doorRPivotPos,
     doorLStrutAnchorPos,
@@ -4420,14 +4806,20 @@ function buildMasterHypercarAssets(anisotropy = 8): MasterHypercarAssets {
     chassisStrutAnchorLPos,
     chassisStrutAnchorRPos,
     doorStrutGeos,
-    steeringWheelMeshes,
+    steeringWheelMeshes: fusedSteeringWheelMeshes,
     steeringColumnPos,
     steeringColumnRotX,
-    wheels,
+    wheels: fusedWheels,
+    lod1BodyMeshes,
+    lod1PoliceRoofBarMeshes,
+    lod1Wheels,
+    lod2BodyMeshes,
+    lod2PoliceRoofBarMeshes,
     contactShadowGeo,
     headlightBeamGeo,
     nitroFlameGeo,
-    allGeometries,
+    nitroFlameMat,
+    allGeometries: finalGeometries,
   };
   return masterHypercarCache;
 }
@@ -4443,6 +4835,7 @@ export function disposeMasterHypercarAssets(): void {
   for (const mat of Object.values(masterHypercarCache.materials)) {
     mat.dispose();
   }
+  masterHypercarCache.nitroFlameMat.dispose();
   masterHypercarCache = null;
 }
 
@@ -4465,6 +4858,7 @@ export interface TelescopicStrutInstance {
   rodMesh: THREE.Mesh;
   anchorA: THREE.Object3D;
   anchorB: THREE.Object3D;
+  setVisible: (visible: boolean) => void;
   update: (spaceParent: THREE.Object3D) => void;
 }
 
@@ -4496,14 +4890,18 @@ export function stepHydraulic(
   maxSpeed = 0.56,
 ): number {
   let rem = Math.min(Math.max(dt, 0), 1.5);
+  const speedScale = Math.max(1, maxSpeed / 0.56);
+  const kp = 2.8 * Math.min(3.5, speedScale);
+  const accel = 6.5 * Math.min(3.2, speedScale);
+  const minRate = 0.1 * Math.min(2.6, speedScale);
   while (rem > 0.0001) {
     const step = Math.min(rem, 1 / 60);
     const diff = state.target - state.value;
     const dist = Math.abs(diff);
     const cushion = smootherstep(0.0, 0.24, dist);
-    const rateLimit = lerp(0.1, maxSpeed, cushion);
-    const desiredVel = clamp(diff * 2.8, -rateLimit, rateLimit);
-    state.vel = lerp(state.vel, desiredVel, clamp(step * 6.5, 0, 1));
+    const rateLimit = lerp(minRate, maxSpeed, cushion);
+    const desiredVel = clamp(diff * kp, -rateLimit, rateLimit);
+    state.vel = lerp(state.vel, desiredVel, clamp(step * accel, 0, 1));
     state.value = clamp(state.value + state.vel * step, 0, 1);
     if (dist < 0.0006 && Math.abs(state.vel) < 0.0015) {
       state.value = state.target;
@@ -4532,6 +4930,9 @@ function instantiateTelescopicStrut(
   const cylMesh = new THREE.Mesh(geos.cylGeo, mats.matteCarbon);
   cylMesh.add(new THREE.Mesh(geos.collarGeo, mats.machinedAlu));
   const rodMesh = new THREE.Mesh(geos.rodGeo, mats.machinedAlu);
+  // Hydraulic struts are 100% sealed inside closed jambs/frunk until opened
+  cylMesh.visible = false;
+  rodMesh.visible = false;
   parentGroup.add(cylMesh, rodMesh);
 
   const safeAlign = (mesh: THREE.Mesh, v: THREE.Vector3) => {
@@ -4548,6 +4949,12 @@ function instantiateTelescopicStrut(
     rodMesh,
     anchorA,
     anchorB,
+    setVisible(visible: boolean) {
+      if (cylMesh.visible !== visible) {
+        cylMesh.visible = visible;
+        rodMesh.visible = visible;
+      }
+    },
     update(spaceParent: THREE.Object3D) {
       anchorA.getWorldPosition(_pA);
       anchorB.getWorldPosition(_pB);
@@ -4597,8 +5004,17 @@ export function computeAckermannSteer(steerAngle: number): {
 export interface BuiltHypercarRig {
   root: THREE.Group;
   bodyGroup: THREE.Group;
+  frunkBayGroup: THREE.Group;
+  wheelsGroup: THREE.Group;
+  lod1Group: THREE.Group;
+  lod1BodyGroup: THREE.Group;
+  lod1Wheels: THREE.Group[];
+  lod2Group: THREE.Group;
+  setLodMode: (useLod1: boolean) => void;
+  setLodLevel: (level: 0 | 1 | 2) => void;
   frontLeftPivot: THREE.Group;
   frontRightPivot: THREE.Group;
+  wheelCornerRoots: [THREE.Group, THREE.Group, THREE.Group, THREE.Group];
   wheels: THREE.Group[];
   headlightMat: THREE.MeshStandardMaterial;
   taillightMat: THREE.MeshStandardMaterial;
@@ -4609,6 +5025,7 @@ export interface BuiltHypercarRig {
   nitroFlameLeft: THREE.Mesh;
   nitroFlameRight: THREE.Mesh;
   hypercar: HypercarArticulation;
+  shadowCastMeshes: THREE.Mesh[];
 }
 
 export function buildHypercarRigInstance(
@@ -4703,6 +5120,7 @@ export function buildHypercarRigInstance(
     return materials[slot];
   };
 
+  const shadowCastMeshes: THREE.Mesh[] = [];
   const spawnTemplateList = (parent: THREE.Object3D, list: MeshTemplate[]) => {
     for (let i = 0; i < list.length; i++) {
       const t = list[i];
@@ -4712,12 +5130,23 @@ export function buildHypercarRigInstance(
       if (t.renderOrder) m.renderOrder = t.renderOrder;
       if (t.position) m.position.set(t.position[0], t.position[1], t.position[2]);
       if (t.rotation) m.rotation.set(t.rotation[0], t.rotation[1], t.rotation[2]);
+      m.matrixAutoUpdate = false;
+      m.updateMatrix();
+      if (m.castShadow) shadowCastMeshes.push(m);
       parent.add(m);
     }
   };
 
   // 1. Static Bodywork, Chassis, V12 Engine Bay & Cockpit
   spawnTemplateList(bodyGroup, master.staticBodyMeshes);
+
+  // 1b. Opaque-occluded Frunk Luggage Bay (hidden while frunk lid is closed to save draw calls & tris)
+  const frunkBayGroup = new THREE.Group();
+  frunkBayGroup.visible = false;
+  frunkBayGroup.matrixAutoUpdate = false;
+  frunkBayGroup.updateMatrix();
+  spawnTemplateList(frunkBayGroup, master.frunkBayMeshes);
+  bodyGroup.add(frunkBayGroup);
 
   if (spec.isPolice) {
     spawnTemplateList(bodyGroup, master.policeRoofBarMeshes);
@@ -4872,17 +5301,76 @@ export function buildHypercarRigInstance(
     HYPERCAR_SPEC.rZ,
   );
 
+  // 5b. Seamless Distant Class-A Exterior LOD1 Group (>32m closed AI/parked vehicles)
+  const lod1Group = new THREE.Group();
+  lod1Group.visible = false;
+  const lod1BodyGroup = new THREE.Group();
+  lod1Group.add(lod1BodyGroup);
+  spawnTemplateList(lod1BodyGroup, master.lod1BodyMeshes);
+  if (spec.isPolice) {
+    spawnTemplateList(lod1BodyGroup, master.lod1PoliceRoofBarMeshes);
+  }
+
+  const buildLod1Wheel = (
+    list: MeshTemplate[],
+    x: number,
+    y: number,
+    z: number,
+  ): THREE.Group => {
+    const wg = new THREE.Group();
+    wg.position.set(x, y, z);
+    spawnTemplateList(wg, list);
+    lod1Group.add(wg);
+    return wg;
+  };
+  const lod1Wheels = [
+    buildLod1Wheel(master.lod1Wheels.frontLeft, HYPERCAR_SPEC.fTrack, HYPERCAR_SPEC.fR, HYPERCAR_SPEC.fZ),
+    buildLod1Wheel(master.lod1Wheels.frontRight, -HYPERCAR_SPEC.fTrack, HYPERCAR_SPEC.fR, HYPERCAR_SPEC.fZ),
+    buildLod1Wheel(master.lod1Wheels.rearLeft, HYPERCAR_SPEC.rTrack, HYPERCAR_SPEC.rR, HYPERCAR_SPEC.rZ),
+    buildLod1Wheel(master.lod1Wheels.rearRight, -HYPERCAR_SPEC.rTrack, HYPERCAR_SPEC.rR, HYPERCAR_SPEC.rZ),
+  ];
+  lod1Group.matrixAutoUpdate = false;
+  lod1Group.updateMatrix();
+  root.add(lod1Group);
+
+  // 5c. Ultra-Light Distant Class-A Exterior LOD2 Group (>52m closed traffic/parked vehicles)
+  const lod2Group = new THREE.Group();
+  lod2Group.visible = false;
+  spawnTemplateList(lod2Group, master.lod2BodyMeshes);
+  if (spec.isPolice) {
+    spawnTemplateList(lod2Group, master.lod2PoliceRoofBarMeshes);
+  }
+  lod2Group.matrixAutoUpdate = false;
+  lod2Group.updateMatrix();
+  root.add(lod2Group);
+
+  let currentLodLevel: 0 | 1 | 2 = 0;
+  const setLodLevel = (level: 0 | 1 | 2): void => {
+    if (currentLodLevel === level) return;
+    currentLodLevel = level;
+    bodyGroup.visible = level === 0;
+    wheelsGroup.visible = level === 0;
+    lod1Group.visible = level === 1;
+    lod2Group.visible = level === 2;
+  };
+  const setLodMode = (useLod1: boolean): void => {
+    setLodLevel(useLod1 ? 1 : 0);
+  };
+
   // 6. Multilayer 6-Ellipse Contact Shadow on Ground
   const contactShadowMesh = new THREE.Mesh(
     master.contactShadowGeo,
     materials.contactShadow,
   );
   contactShadowMesh.renderOrder = -1;
+  contactShadowMesh.matrixAutoUpdate = false;
+  contactShadowMesh.updateMatrix();
   root.add(contactShadowMesh);
 
-  // 7. Ground-projected Headlight Beam & Quad-Exhaust Nitro Plasma Flames
+  // 7. Ground-projected Headlight Beam (on root so night AI cars keep ground cones in LOD1) & Nitro Flames
   const beamMat = new THREE.MeshBasicMaterial({
-    color: 0xffecc2,
+    color: 0xf4f8ff,
+    map: master.textures.headlightBeamTex,
     transparent: true,
     opacity: 0.0,
     depthWrite: false,
@@ -4890,22 +5378,38 @@ export function buildHypercarRigInstance(
   });
   const headlightBeam = new THREE.Mesh(master.headlightBeamGeo, beamMat);
   headlightBeam.position.set(0, 0.07, 2.34 + 6.5);
-  bodyGroup.add(headlightBeam);
+  headlightBeam.visible = false;
+  headlightBeam.matrixAutoUpdate = false;
+  headlightBeam.updateMatrix();
+  root.add(headlightBeam);
 
-  const flameMat = new THREE.MeshBasicMaterial({
-    color: 0x45baff,
-    transparent: true,
-    opacity: 0.88,
-    blending: THREE.AdditiveBlending,
-    depthWrite: false,
-  });
-  const nitroFlameLeft = new THREE.Mesh(master.nitroFlameGeo, flameMat);
+  const nitroFlameLeft = new THREE.Mesh(master.nitroFlameGeo, master.nitroFlameMat);
   nitroFlameLeft.position.set(-0.172, 0.531, -2.55);
   nitroFlameLeft.visible = false;
-  const nitroFlameRight = new THREE.Mesh(master.nitroFlameGeo, flameMat);
+  const nitroFlameRight = new THREE.Mesh(master.nitroFlameGeo, master.nitroFlameMat);
   nitroFlameRight.position.set(0.172, 0.531, -2.55);
   nitroFlameRight.visible = false;
   bodyGroup.add(nitroFlameLeft, nitroFlameRight);
+
+  // Freeze static container groups whose local transforms never change after build
+  frunkContent.matrixAutoUpdate = false;
+  frunkContent.updateMatrix();
+  doorLContent.matrixAutoUpdate = false;
+  doorLContent.updateMatrix();
+  doorRContent.matrixAutoUpdate = false;
+  doorRContent.updateMatrix();
+  steeringColGroup.matrixAutoUpdate = false;
+  steeringColGroup.updateMatrix();
+  wheelsGroup.matrixAutoUpdate = false;
+  wheelsGroup.updateMatrix();
+  wFL.cornerRoot.matrixAutoUpdate = false;
+  wFL.cornerRoot.updateMatrix();
+  wFR.cornerRoot.matrixAutoUpdate = false;
+  wFR.cornerRoot.updateMatrix();
+  wRL.cornerRoot.matrixAutoUpdate = false;
+  wRL.cornerRoot.updateMatrix();
+  wRR.cornerRoot.matrixAutoUpdate = false;
+  wRR.cornerRoot.updateMatrix();
 
   const hypercar: HypercarArticulation = {
     doorL: { value: 0, target: 0, vel: 0 },
@@ -4939,8 +5443,17 @@ export function buildHypercarRigInstance(
   return {
     root,
     bodyGroup,
+    frunkBayGroup,
+    wheelsGroup,
+    lod1Group,
+    lod1BodyGroup,
+    lod1Wheels,
+    lod2Group,
+    setLodMode,
+    setLodLevel,
     frontLeftPivot: wFL.knuckleGroup,
     frontRightPivot: wFR.knuckleGroup,
+    wheelCornerRoots: [wFL.cornerRoot, wFR.cornerRoot, wRL.cornerRoot, wRR.cornerRoot],
     wheels: [wFL.spinHub, wFR.spinHub, wRL.spinHub, wRR.spinHub],
     headlightMat,
     taillightMat,
@@ -4951,5 +5464,6 @@ export function buildHypercarRigInstance(
     nitroFlameLeft,
     nitroFlameRight,
     hypercar,
+    shadowCastMeshes,
   };
 }

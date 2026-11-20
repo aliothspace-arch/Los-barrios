@@ -1,5 +1,6 @@
 import type { CheckpointObjective, GamePhase, PlayerState, VehicleState } from '../types';
 import { BUILDINGS, CUL_DE_SAC, ROAD_SEGMENTS, SHOPS } from '../worldLayout';
+import { shouldRedrawMinimap } from '../simulation/renderInterpolation';
 
 /**
  * Decoupled 2D Canvas radar minimap renderer with a pre-baked static city map
@@ -8,9 +9,18 @@ import { BUILDINGS, CUL_DE_SAC, ROAD_SEGMENTS, SHOPS } from '../worldLayout';
 export class MinimapRenderer {
   private canvas: HTMLCanvasElement | null = null;
   private staticLayer: HTMLCanvasElement | null = null;
+  private lastDrawMs = -Infinity;
+  private lastPx = NaN;
+  private lastPz = NaN;
+  private lastYaw = NaN;
+  private lastHeading = NaN;
+  private lastBlink = false;
 
   public setCanvas(canvas: HTMLCanvasElement | null): void {
-    this.canvas = canvas;
+    if (this.canvas !== canvas) {
+      this.canvas = canvas;
+      this.lastDrawMs = -Infinity;
+    }
   }
 
   private getStaticLayer(scale: number): HTMLCanvasElement {
@@ -68,11 +78,40 @@ export class MinimapRenderer {
     nowMs: number;
   }): void {
     const canvas = this.canvas;
-    if (!canvas || params.phase === 'title') return;
+    if (!canvas) return;
+
+    const { player, cameraYaw, vehicles, activeCheckpoint, nowMs } = params;
+    const blink = Math.floor(nowMs / 180) % 2 === 0;
+    const movedSq =
+      (player.x - this.lastPx) * (player.x - this.lastPx) +
+      (player.z - this.lastPz) * (player.z - this.lastPz);
+    const yawDiff = Math.abs(cameraYaw - this.lastYaw);
+    const headDiff = Math.abs(player.heading - this.lastHeading);
+
+    if (
+      !shouldRedrawMinimap({
+        nowMs,
+        lastDrawMs: this.lastDrawMs,
+        inVehicle: player.inVehicleId !== null,
+        movedSq,
+        yawDiff,
+        headDiff,
+        blinkChanged: blink !== this.lastBlink,
+      })
+    ) {
+      return;
+    }
+
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const { player, cameraYaw, vehicles, activeCheckpoint, nowMs } = params;
+    this.lastDrawMs = nowMs;
+    this.lastPx = player.x;
+    this.lastPz = player.z;
+    this.lastYaw = cameraYaw;
+    this.lastHeading = player.heading;
+    this.lastBlink = blink;
+
     const w = canvas.width;
     const h = canvas.height;
     const cx = w * 0.5;
@@ -98,7 +137,6 @@ export class MinimapRenderer {
     const halfStatic = staticMap.width * 0.5;
     ctx.drawImage(staticMap, -halfStatic - px * scale, -halfStatic - pz * scale);
 
-    const blink = Math.floor(nowMs / 180) % 2 === 0;
     for (let i = 0; i < vehicles.length; i++) {
       const v = vehicles[i];
       if (v.id === player.inVehicleId) continue;

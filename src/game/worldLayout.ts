@@ -16,12 +16,13 @@ export const VEHICLE_SPECS: Record<VehicleKind, VehicleSpec> = {
   greenwood: {
     kind: 'greenwood',
     name: 'GREENWOOD V8',
+    drivetrain: 'RWD',
     mass: 1580,
     maxEngineForce: 29,
     maxBrakeForce: 38,
     maxSpeed: 38,
     reverseSpeed: 12,
-    steerRate: 4.4,
+    steerRate: 4.6,
     maxSteerAngle: 0.56,
     lateralGrip: 9.2,
     driftGrip: 3.1,
@@ -29,6 +30,19 @@ export const VEHICLE_SPECS: Record<VehicleKind, VehicleSpec> = {
     length: 4.88,
     width: 1.98,
     radius: 1.85,
+    wheelbase: 2.86,
+    trackWidth: 1.66,
+    frontWeightBias: 0.53,
+    cgHeight: 0.52,
+    tireGripMu: 1.18,
+    cornerStiffness: 7.4,
+    gearRatios: [3.38, 2.12, 1.48, 1.12, 0.88, 0.72],
+    reverseGearRatio: 3.25,
+    finalDrive: 3.55,
+    redlineRpm: 6900,
+    suspensionFreq: 3.0,
+    suspensionDamping: 0.62,
+    assistStrength: 0.52,
     primaryColor: 0x1d4a2b, // Deep metallic Grove emerald
     secondaryColor: 0xc9bfa8, // Weathered cream vinyl roof
     interiorColor: 0x261e19,
@@ -36,19 +50,33 @@ export const VEHICLE_SPECS: Record<VehicleKind, VehicleSpec> = {
   infernus: {
     kind: 'infernus',
     name: 'INFERNUS GT',
+    drivetrain: 'AWD',
     mass: 1320,
-    maxEngineForce: 40,
-    maxBrakeForce: 48,
+    maxEngineForce: 42,
+    maxBrakeForce: 49,
     maxSpeed: 52,
     reverseSpeed: 14,
-    steerRate: 5.2,
+    steerRate: 5.5,
     maxSteerAngle: 0.54,
     lateralGrip: 11.4,
     driftGrip: 3.8,
-    dragCoeff: 0.009,
+    dragCoeff: 0.0085,
     length: 4.66,
     width: 2.06,
     radius: 1.8,
+    wheelbase: 2.72,
+    trackWidth: 1.72,
+    frontWeightBias: 0.45,
+    cgHeight: 0.41,
+    tireGripMu: 1.44,
+    cornerStiffness: 9.6,
+    gearRatios: [3.45, 2.24, 1.58, 1.19, 0.94, 0.77],
+    reverseGearRatio: 3.3,
+    finalDrive: 3.85,
+    redlineRpm: 7800,
+    suspensionFreq: 4.1,
+    suspensionDamping: 0.74,
+    assistStrength: 0.44,
     primaryColor: 0x9c1618, // Deep anodized Rosso Corsa metallic
     secondaryColor: 0x16181d, // Carbon fiber aero trim
     interiorColor: 0x1b1716,
@@ -56,19 +84,33 @@ export const VEHICLE_SPECS: Record<VehicleKind, VehicleSpec> = {
   sabre: {
     kind: 'sabre',
     name: 'SABRE TURBO',
+    drivetrain: 'RWD',
     mass: 1510,
-    maxEngineForce: 34,
+    maxEngineForce: 35,
     maxBrakeForce: 42,
     maxSpeed: 44,
     reverseSpeed: 13,
-    steerRate: 4.6,
+    steerRate: 4.8,
     maxSteerAngle: 0.58,
     lateralGrip: 8.6,
     driftGrip: 2.7,
-    dragCoeff: 0.0105,
+    dragCoeff: 0.0102,
     length: 4.82,
     width: 1.98,
     radius: 1.82,
+    wheelbase: 2.8,
+    trackWidth: 1.66,
+    frontWeightBias: 0.54,
+    cgHeight: 0.49,
+    tireGripMu: 1.24,
+    cornerStiffness: 7.8,
+    gearRatios: [3.42, 2.18, 1.52, 1.14, 0.9, 0.74],
+    reverseGearRatio: 3.25,
+    finalDrive: 3.68,
+    redlineRpm: 7300,
+    suspensionFreq: 3.3,
+    suspensionDamping: 0.64,
+    assistStrength: 0.54,
     primaryColor: 0x163659, // Midnight Pacific metallic navy
     secondaryColor: 0xcdd3da, // Brushed silver racing stripes
     interiorColor: 0x1f1d1c,
@@ -76,19 +118,33 @@ export const VEHICLE_SPECS: Record<VehicleKind, VehicleSpec> = {
   savanna: {
     kind: 'savanna',
     name: 'SAVANNA LOWRIDER',
+    drivetrain: 'RWD',
     mass: 1680,
     maxEngineForce: 26,
     maxBrakeForce: 35,
     maxSpeed: 35,
     reverseSpeed: 11,
-    steerRate: 4.1,
+    steerRate: 4.2,
     maxSteerAngle: 0.6,
     lateralGrip: 8.1,
     driftGrip: 2.8,
-    dragCoeff: 0.012,
+    dragCoeff: 0.0118,
     length: 5.12,
     width: 2.02,
     radius: 1.92,
+    wheelbase: 2.96,
+    trackWidth: 1.68,
+    frontWeightBias: 0.52,
+    cgHeight: 0.54,
+    tireGripMu: 1.12,
+    cornerStiffness: 6.7,
+    gearRatios: [3.25, 2.05, 1.44, 1.08, 0.85, 0.7],
+    reverseGearRatio: 3.15,
+    finalDrive: 3.42,
+    redlineRpm: 6600,
+    suspensionFreq: 2.4,
+    suspensionDamping: 0.54,
+    assistStrength: 0.5,
     primaryColor: 0x753512, // Deep burnt copper bronze metallic
     secondaryColor: 0xdccaa8, // Tan leather soft trim
     interiorColor: 0x4f2c19,
@@ -96,19 +152,33 @@ export const VEHICLE_SPECS: Record<VehicleKind, VehicleSpec> = {
   police: {
     kind: 'police',
     name: 'LSPD INTERCEPTOR',
+    drivetrain: 'AWD',
     mass: 1640,
-    maxEngineForce: 36,
-    maxBrakeForce: 45,
+    maxEngineForce: 37,
+    maxBrakeForce: 46,
     maxSpeed: 47,
     reverseSpeed: 14,
-    steerRate: 5.0,
+    steerRate: 5.2,
     maxSteerAngle: 0.57,
     lateralGrip: 10.2,
     driftGrip: 3.4,
-    dragCoeff: 0.01,
+    dragCoeff: 0.0096,
     length: 4.94,
     width: 2.0,
     radius: 1.88,
+    wheelbase: 2.88,
+    trackWidth: 1.68,
+    frontWeightBias: 0.51,
+    cgHeight: 0.48,
+    tireGripMu: 1.34,
+    cornerStiffness: 8.7,
+    gearRatios: [3.48, 2.22, 1.56, 1.16, 0.91, 0.75],
+    reverseGearRatio: 3.3,
+    finalDrive: 3.76,
+    redlineRpm: 7400,
+    suspensionFreq: 3.8,
+    suspensionDamping: 0.7,
+    assistStrength: 0.48,
     primaryColor: 0x101215, // LSPD gloss obsidian black
     secondaryColor: 0xdadfe3, // LSPD satin white doors/roof
     interiorColor: 0x191b1f,
@@ -799,14 +869,93 @@ export const BUILDINGS: BuildingBlueprint[] = [
   },
 ];
 
-// 7 Interactive Buy & Rob Storefronts across Los Santos
+export const WALK_IN_BUILDING_IDS = new Set<string>([
+  'ganton_247',
+  'ganton_binco',
+  'ammunation_east',
+  'west_commerce_2',
+  'vinewood_suburban',
+]);
+
+export function shopLocalToWorld(
+  originX: number,
+  originZ: number,
+  facingHeading: number,
+  lx: number,
+  lz: number,
+): { x: number; z: number } {
+  const c = Math.cos(facingHeading);
+  const s = Math.sin(facingHeading);
+  return {
+    x: originX + lx * c + lz * s,
+    z: originZ - lx * s + lz * c,
+  };
+}
+
+function makeWalkInShopCoords(
+  buildingId: string,
+  originX: number,
+  originZ: number,
+  buildingDepth: number,
+  facingHeading: number,
+) {
+  const door = shopLocalToWorld(originX, originZ, facingHeading, 0, buildingDepth * 0.5);
+  const register = shopLocalToWorld(originX, originZ, facingHeading, 0, 0.85);
+  const clerk = shopLocalToWorld(originX, originZ, facingHeading, 0, -1.45);
+  return {
+    venueMode: 'indoor' as const,
+    buildingId,
+    originX,
+    originZ,
+    facingHeading,
+    doorX: door.x,
+    doorZ: door.z,
+    counterLocalZ: -0.35,
+    counterHalfW: 2.35,
+    counterHalfD: 0.47,
+    registerX: register.x,
+    registerZ: register.z,
+    clerkX: clerk.x,
+    clerkZ: clerk.z,
+    x: register.x,
+    z: register.z,
+  };
+}
+
+function makeOutdoorShopCoords(
+  venueMode: 'street_cart' | 'outdoor_bay',
+  originX: number,
+  originZ: number,
+  facingHeading: number,
+  counterHalfW: number,
+  counterHalfD: number,
+) {
+  const register = shopLocalToWorld(originX, originZ, facingHeading, 0, 1.15);
+  const clerk = shopLocalToWorld(originX, originZ, facingHeading, 0, -1.15);
+  return {
+    venueMode,
+    originX,
+    originZ,
+    facingHeading,
+    counterLocalZ: 0,
+    counterHalfW,
+    counterHalfD,
+    registerX: register.x,
+    registerZ: register.z,
+    clerkX: clerk.x,
+    clerkZ: clerk.z,
+    x: register.x,
+    z: register.z,
+  };
+}
+
+// 7 Interactive Buy & Rob Venues across Los Santos (5 walk-in storefronts + 1 street cart + 1 open mechanic bay)
 export const SHOPS: ShopSpec[] = [
   {
     id: 'shop_247',
     name: '24/7 MARKET GANTON',
     category: 'market',
-    x: -32,
-    z: -34.2,
+    ...makeWalkInShopCoords('ganton_247', -32, -26, 13, Math.PI),
     accentHex: '#ff5232',
     robMin: 380,
     robMax: 640,
@@ -840,8 +989,7 @@ export const SHOPS: ShopSpec[] = [
     id: 'shop_binco',
     name: 'BINCO CLOTHING',
     category: 'clothing',
-    x: 32,
-    z: -34.2,
+    ...makeWalkInShopCoords('ganton_binco', 32, -26, 13, Math.PI),
     accentHex: '#45d483',
     robMin: 320,
     robMax: 560,
@@ -879,10 +1027,9 @@ export const SHOPS: ShopSpec[] = [
   },
   {
     id: 'shop_cluckin',
-    name: "CLUCKIN' BELL",
+    name: "CLUCKIN' BELL CARRITO",
     category: 'food',
-    x: 36,
-    z: -53.2,
+    ...makeOutdoorShopCoords('street_cart', 34, -52.8, 0, 1.55, 0.52),
     accentHex: '#ffcf38',
     robMin: 260,
     robMax: 480,
@@ -908,8 +1055,7 @@ export const SHOPS: ShopSpec[] = [
     id: 'shop_ammunation',
     name: 'AMMU-NATION EAST LS',
     category: 'weapons',
-    x: 80.5,
-    z: -20,
+    ...makeWalkInShopCoords('ammunation_east', 95, -20, 16, -Math.PI * 0.5),
     accentHex: '#ff4238',
     robMin: 720,
     robMax: 1180,
@@ -935,8 +1081,7 @@ export const SHOPS: ShopSpec[] = [
     id: 'shop_lscustoms',
     name: 'LOS SANTOS CUSTOMS',
     category: 'customs',
-    x: 80.5,
-    z: 14,
+    ...makeOutdoorShopCoords('outdoor_bay', 82.8, 14, -Math.PI * 0.5, 2.0, 0.48),
     accentHex: '#ff7b29',
     robMin: 520,
     robMax: 890,
@@ -972,8 +1117,7 @@ export const SHOPS: ShopSpec[] = [
     id: 'shop_burgershot',
     name: 'BURGER SHOT COMMERCE',
     category: 'food',
-    x: -80.5,
-    z: 24,
+    ...makeWalkInShopCoords('west_commerce_2', -95, 24, 18, Math.PI * 0.5),
     accentHex: '#ff9032',
     robMin: 290,
     robMax: 520,
@@ -999,8 +1143,7 @@ export const SHOPS: ShopSpec[] = [
     id: 'shop_suburban',
     name: 'SUB URBAN VINEWOOD',
     category: 'clothing',
-    x: -36,
-    z: -156.8,
+    ...makeWalkInShopCoords('vinewood_suburban', -36, -166, 14, 0),
     accentHex: '#58e090',
     robMin: 410,
     robMax: 720,
@@ -1394,14 +1537,14 @@ export const INITIAL_PEDS: PedSpawnConfig[] = [
   { id: 'grove_17', role: 'civilian', x: -1.5, z: 20.5, shirt: 0x6b4b5c, pants: 0x23252a, skin: 0xaa7c5b, activity: 'stroll', walkAxis: 'x', walkSpan: 7.5, heightScale: 0.94 },
   { id: 'grove_18', role: 'civilian', x: 13.5, z: 1.5, shirt: 0x4b5663, pants: 0x222429, skin: 0xbd9170, activity: 'wait', faceAngle: -1.55, hasBackpack: true },
 
-  // === 2. SEVEN STORE CLERKS STATIONED NEAR EVERY INTERACTIVE SHOP (7) ===
-  { id: 'clerk_247', role: 'clerk', x: -29.5, z: -33.6, shirt: 0x9c382a, pants: 0x25282e, skin: 0xb58867 },
-  { id: 'clerk_binco', role: 'clerk', x: 29.5, z: -33.6, shirt: 0x296142, pants: 0x222428, skin: 0x8f6246 },
-  { id: 'clerk_cluckin', role: 'clerk', x: 33.5, z: -53.8, shirt: 0xb5882a, pants: 0x2c2a29, skin: 0xc79e7c, hatColor: 0xb5882a },
-  { id: 'clerk_ammu', role: 'clerk', x: 81.4, z: -18, shirt: 0x3b3e36, pants: 0x242622, skin: 0xc9a384, hasShades: true },
-  { id: 'clerk_customs', role: 'clerk', x: 81.4, z: 16, shirt: 0x2c4259, pants: 0x1f2226, skin: 0xa87856, hatColor: 0x1e2226 },
-  { id: 'clerk_burger', role: 'clerk', x: -81.4, z: 22, shirt: 0xb85e25, pants: 0x262422, skin: 0xbd9170, hatColor: 0xb85e25 },
-  { id: 'clerk_suburban', role: 'clerk', x: -33.5, z: -156.4, shirt: 0x264d38, pants: 0x1e2024, skin: 0xd1aa8a },
+  // === 2. SEVEN STORE CLERKS STATIONED BEHIND THEIR REAL COUNTERS / CARTS (7) ===
+  { id: 'clerk_247', role: 'clerk', x: -32, z: -24.55, shirt: 0x9c382a, pants: 0x25282e, skin: 0xb58867, faceAngle: Math.PI },
+  { id: 'clerk_binco', role: 'clerk', x: 32, z: -24.55, shirt: 0x296142, pants: 0x222428, skin: 0x8f6246, faceAngle: Math.PI },
+  { id: 'clerk_cluckin', role: 'clerk', x: 34, z: -53.95, shirt: 0xb5882a, pants: 0x2c2a29, skin: 0xc79e7c, hatColor: 0xb5882a, faceAngle: 0 },
+  { id: 'clerk_ammu', role: 'clerk', x: 96.45, z: -20, shirt: 0x3b3e36, pants: 0x242622, skin: 0xc9a384, hasShades: true, faceAngle: -Math.PI * 0.5 },
+  { id: 'clerk_customs', role: 'clerk', x: 83.95, z: 14, shirt: 0x2c4259, pants: 0x1f2226, skin: 0xa87856, hatColor: 0x1e2226, faceAngle: -Math.PI * 0.5 },
+  { id: 'clerk_burger', role: 'clerk', x: -96.45, z: 24, shirt: 0xb85e25, pants: 0x262422, skin: 0xbd9170, hatColor: 0xb85e25, faceAngle: Math.PI * 0.5 },
+  { id: 'clerk_suburban', role: 'clerk', x: -36, z: -167.45, shirt: 0x264d38, pants: 0x1e2024, skin: 0xd1aa8a, faceAngle: 0 },
 
   // === 3. GANTON COMMERCIAL BLVD & CENTRAL INTERSECTION (22 NPCs — bustling storefronts & bus shelters) ===
   { id: 'civ_1', role: 'civilian', x: -12, z: -34, shirt: 0x945937, pants: 0x293342, skin: 0xc29876, activity: 'stroll', walkAxis: 'x', walkSpan: 11.0 },
@@ -1638,10 +1781,10 @@ export const STREETLAMP_POSITIONS: Array<{ x: number; z: number; rotY: number }>
   { x: 8.2, z: -24, rotY: -Math.PI * 0.5 },
   { x: -8.2, z: -64, rotY: Math.PI * 0.5 },
   { x: 8.2, z: -82, rotY: -Math.PI * 0.5 },
-  { x: -34, z: -34.2, rotY: Math.PI },
-  { x: 34, z: -34.2, rotY: Math.PI },
+  { x: -41, z: -34.2, rotY: Math.PI },
+  { x: 41, z: -34.2, rotY: Math.PI },
   { x: -34, z: -49.8, rotY: 0 },
-  { x: 34, z: -49.8, rotY: 0 },
+  { x: 26, z: -49.8, rotY: 0 },
   { x: -34, z: -88.2, rotY: Math.PI },
   { x: 34, z: -88.2, rotY: Math.PI },
   { x: -34, z: -140.2, rotY: Math.PI },
@@ -1666,10 +1809,92 @@ export const STREETLAMP_POSITIONS: Array<{ x: number; z: number; rotY: number }>
   { x: 14, z: 14, rotY: -Math.PI * 0.25 },
 ];
 
+function pushLocalAABB(
+  colliders: ColliderAABB[],
+  id: string,
+  originX: number,
+  originZ: number,
+  rotY: number,
+  minLx: number,
+  maxLx: number,
+  minLz: number,
+  maxLz: number,
+  height: number,
+  category: ColliderAABB['category'],
+): void {
+  const p1 = shopLocalToWorld(originX, originZ, rotY, minLx, minLz);
+  const p2 = shopLocalToWorld(originX, originZ, rotY, maxLx, maxLz);
+  const p3 = shopLocalToWorld(originX, originZ, rotY, minLx, maxLz);
+  const p4 = shopLocalToWorld(originX, originZ, rotY, maxLx, minLz);
+  colliders.push({
+    id,
+    minX: Math.min(p1.x, p2.x, p3.x, p4.x),
+    maxX: Math.max(p1.x, p2.x, p3.x, p4.x),
+    minZ: Math.min(p1.z, p2.z, p3.z, p4.z),
+    maxZ: Math.max(p1.z, p2.z, p3.z, p4.z),
+    height,
+    category,
+  });
+}
+
+export function getWalkInShopRoomProfile(b: BuildingBlueprint) {
+  const roomHalfW = 4.8;
+  const roomBackZ = -2.6;
+  const roomFrontZ = b.d * 0.5;
+  const doorHalfW = 1.7;
+  return { roomHalfW, roomBackZ, roomFrontZ, doorHalfW };
+}
+
+/**
+ * Returns a camera ceiling clamp height (<= 3.35m) whenever a world coordinate is inside
+ * one of the 5 walk-in retail interiors, or null outside.
+ */
+export function getShopRoofCeilingClampY(wx: number, wz: number): number | null {
+  for (let i = 0; i < SHOPS.length; i++) {
+    const s = SHOPS[i];
+    if (s.venueMode !== 'indoor' || !s.buildingId) continue;
+    const b = BUILDINGS.find((bld) => bld.id === s.buildingId);
+    if (!b) continue;
+    const dx = wx - s.originX;
+    const dz = wz - s.originZ;
+    const c = Math.cos(s.facingHeading);
+    const sn = Math.sin(s.facingHeading);
+    const lx = dx * c - dz * sn;
+    const lz = dx * sn + dz * c;
+    const prof = getWalkInShopRoomProfile(b);
+    if (
+      Math.abs(lx) <= prof.roomHalfW + 0.4 &&
+      lz >= prof.roomBackZ - 0.4 &&
+      lz <= prof.roomFrontZ + 0.35
+    ) {
+      return 3.35;
+    }
+  }
+  return null;
+}
+
 export function buildStaticColliders(): ColliderAABB[] {
   const colliders: ColliderAABB[] = [];
 
   for (const b of BUILDINGS) {
+    if (WALK_IN_BUILDING_IDS.has(b.id)) {
+      const prof = getWalkInShopRoomProfile(b);
+      const halfBW = b.w * 0.5;
+      const halfBD = b.d * 0.5;
+      // 1. Rear solid core behind walk-in retail interior
+      pushLocalAABB(colliders, `${b.id}_rear`, b.x, b.z, b.rotY, -halfBW, halfBW, -halfBD, prof.roomBackZ, b.h, 'building');
+      // 2. Left & right building flanks beside retail interior
+      pushLocalAABB(colliders, `${b.id}_left_wing`, b.x, b.z, b.rotY, -halfBW, -prof.roomHalfW, prof.roomBackZ, halfBD, b.h, 'building');
+      pushLocalAABB(colliders, `${b.id}_right_wing`, b.x, b.z, b.rotY, prof.roomHalfW, halfBW, prof.roomBackZ, halfBD, b.h, 'building');
+      // 3. Front-left & front-right glass wall piers framing the 3.4m automatic doorway
+      pushLocalAABB(colliders, `${b.id}_front_l`, b.x, b.z, b.rotY, -prof.roomHalfW, -prof.doorHalfW, halfBD - 0.36, halfBD + 0.14, 3.6, 'building');
+      pushLocalAABB(colliders, `${b.id}_front_r`, b.x, b.z, b.rotY, prof.doorHalfW, prof.roomHalfW, halfBD - 0.36, halfBD + 0.14, 3.6, 'building');
+      // 4. Side display shelving aisles inside the store
+      pushLocalAABB(colliders, `${b.id}_shelf_l`, b.x, b.z, b.rotY, -prof.roomHalfW, -3.75, -2.2, halfBD - 1.5, 2.2, 'prop');
+      pushLocalAABB(colliders, `${b.id}_shelf_r`, b.x, b.z, b.rotY, 3.75, prof.roomHalfW, -2.2, halfBD - 1.5, 2.2, 'prop');
+      continue;
+    }
+
     const cos = Math.abs(Math.cos(b.rotY));
     const sin = Math.abs(Math.sin(b.rotY));
     const halfW = (b.w * cos + b.d * sin) * 0.5;
@@ -1683,6 +1908,23 @@ export function buildStaticColliders(): ColliderAABB[] {
       height: b.h,
       category: 'building',
     });
+  }
+
+  // Register counters, street cart, and outdoor mechanic counter colliders
+  for (const s of SHOPS) {
+    pushLocalAABB(
+      colliders,
+      `${s.id}_counter`,
+      s.originX,
+      s.originZ,
+      s.facingHeading,
+      -s.counterHalfW,
+      s.counterHalfW,
+      s.counterLocalZ - s.counterHalfD,
+      s.counterLocalZ + s.counterHalfD,
+      s.venueMode === 'street_cart' ? 2.3 : 1.08,
+      'prop',
+    );
   }
 
   for (let i = 0; i < PALM_POSITIONS.length; i++) {

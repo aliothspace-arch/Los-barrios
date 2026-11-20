@@ -9,7 +9,6 @@ interface StatusModalProps {
   runSummary: RunSummary | null;
   onResume: () => void;
   onRestart: () => void;
-  onReturnTitle: () => void;
 }
 
 export const StatusModal: React.FC<StatusModalProps> = ({
@@ -20,7 +19,6 @@ export const StatusModal: React.FC<StatusModalProps> = ({
   runSummary,
   onResume,
   onRestart,
-  onReturnTitle,
 }) => {
   if (phase !== 'paused' && phase !== 'gameover') return null;
 
@@ -106,14 +104,6 @@ export const StatusModal: React.FC<StatusModalProps> = ({
             }`}
           >
             {isGameOver ? 'VOLVER A JUGAR' : 'REINICIAR EN GROVE ST'}
-          </button>
-
-          <button
-            type="button"
-            onClick={onReturnTitle}
-            className="w-full py-2 bg-transparent hover:bg-[#211c17] text-[#c8bda9] font-hud text-xs uppercase tracking-[0.18em] border border-[#f5ede0]/18 cursor-pointer"
-          >
-            MENÚ PRINCIPAL
           </button>
         </div>
       </div>
